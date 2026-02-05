@@ -128,6 +128,11 @@ impl Orchestrator {
         self.configs.keys().cloned().collect()
     }
 
+    /// Get the configured sleep level for a model
+    pub fn sleep_level_for(&self, model: &str) -> Option<u8> {
+        self.configs.get(model).map(|c| c.sleep_level)
+    }
+
     /// Ensure a model's process is running and ready
     ///
     /// This will:

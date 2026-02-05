@@ -374,9 +374,15 @@ impl ModelSwitcher {
             }
         }
 
-        // Sleep old model
+        // Sleep old model — use per-model sleep level from config, falling back
+        // to the global policy default if the model is somehow not in the config.
         if let Some(ref from) = from_model {
-            let sleep_level = SleepLevel::from(self.inner.policy.sleep_level());
+            let level_raw = self
+                .inner
+                .orchestrator
+                .sleep_level_for(from)
+                .unwrap_or_else(|| self.inner.policy.sleep_level());
+            let sleep_level = SleepLevel::from(level_raw);
             debug!(model = %from, level = ?sleep_level, "Sleeping model");
 
             if let Err(e) = self.inner.orchestrator.sleep_model(from, sleep_level).await {
