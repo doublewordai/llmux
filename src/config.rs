@@ -30,10 +30,6 @@ pub struct Config {
     /// Can be overridden for testing with mock-vllm
     #[serde(default = "default_vllm_command")]
     pub vllm_command: String,
-
-    /// Whether to capture and log vLLM process output (default: false)
-    #[serde(default)]
-    pub vllm_logging: bool,
 }
 
 fn default_vllm_command() -> String {
@@ -107,19 +103,7 @@ pub struct ModelConfig {
     /// Port for this model's vLLM instance
     pub port: u16,
 
-    /// GPU memory utilization (0.0 - 1.0)
-    #[serde(default = "default_gpu_memory_utilization")]
-    pub gpu_memory_utilization: f32,
-
-    /// Tensor parallel size
-    #[serde(default = "default_tensor_parallel_size")]
-    pub tensor_parallel_size: usize,
-
-    /// Data type (auto, float16, bfloat16, float32)
-    #[serde(default = "default_dtype")]
-    pub dtype: String,
-
-    /// Additional vLLM arguments
+    /// Additional vLLM CLI arguments (e.g. `["--gpu-memory-utilization", "0.8"]`)
     #[serde(default)]
     pub extra_args: Vec<String>,
 
@@ -129,18 +113,6 @@ pub struct ModelConfig {
     /// - 3: Stop the vLLM process entirely (slowest wake, frees all GPU memory)
     #[serde(default = "default_sleep_level")]
     pub sleep_level: u8,
-}
-
-fn default_gpu_memory_utilization() -> f32 {
-    0.9
-}
-
-fn default_tensor_parallel_size() -> usize {
-    1
-}
-
-fn default_dtype() -> String {
-    "auto".to_string()
 }
 
 fn default_sleep_level() -> u8 {
@@ -155,12 +127,6 @@ impl ModelConfig {
             self.model_path.clone(),
             "--port".to_string(),
             self.port.to_string(),
-            "--gpu-memory-utilization".to_string(),
-            self.gpu_memory_utilization.to_string(),
-            "--tensor-parallel-size".to_string(),
-            self.tensor_parallel_size.to_string(),
-            "--dtype".to_string(),
-            self.dtype.clone(),
             "--enable-sleep-mode".to_string(),
         ];
 
@@ -239,7 +205,7 @@ mod tests {
                 "mistral": {
                     "model_path": "mistralai/Mistral-7B-v0.1",
                     "port": 8002,
-                    "gpu_memory_utilization": 0.8
+                    "extra_args": ["--gpu-memory-utilization", "0.8"]
                 }
             },
             "policy": {
@@ -251,7 +217,7 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.models.len(), 2);
         assert_eq!(config.models["llama"].port, 8001);
-        assert_eq!(config.models["mistral"].gpu_memory_utilization, 0.8);
+        assert_eq!(config.models["mistral"].extra_args.len(), 2);
         assert_eq!(config.policy.request_timeout_secs, 30);
     }
 
@@ -260,10 +226,12 @@ mod tests {
         let config = ModelConfig {
             model_path: "meta-llama/Llama-2-7b".to_string(),
             port: 8001,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 2,
-            dtype: "float16".to_string(),
-            extra_args: vec!["--max-model-len".to_string(), "4096".to_string()],
+            extra_args: vec![
+                "--tensor-parallel-size".to_string(),
+                "2".to_string(),
+                "--max-model-len".to_string(),
+                "4096".to_string(),
+            ],
             sleep_level: 1,
         };
 

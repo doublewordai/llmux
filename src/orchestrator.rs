@@ -54,6 +54,25 @@ struct ManagedProcess {
     ready_notify: Arc<Notify>,
 }
 
+/// Strip ANSI escape sequences from a string.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip until we hit a letter (end of escape sequence)
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Orchestrator manages vLLM process lifecycle
 pub struct Orchestrator {
     /// Model configurations
@@ -68,29 +87,18 @@ pub struct Orchestrator {
     startup_timeout: Duration,
     /// Command to use for spawning processes (e.g., "vllm" or path to mock)
     vllm_command: String,
-    /// Whether to capture and log vLLM output
-    vllm_logging: bool,
 }
 
 impl Orchestrator {
     /// Create a new orchestrator with the given model configurations
     pub fn new(configs: HashMap<String, ModelConfig>) -> Self {
-        Self::with_options(configs, "vllm".to_string(), false)
+        Self::with_command(configs, "vllm".to_string())
     }
 
     /// Create a new orchestrator with a custom command for spawning processes
     ///
     /// This is useful for testing with mock-vllm
     pub fn with_command(configs: HashMap<String, ModelConfig>, vllm_command: String) -> Self {
-        Self::with_options(configs, vllm_command, false)
-    }
-
-    /// Create a new orchestrator with full options
-    pub fn with_options(
-        configs: HashMap<String, ModelConfig>,
-        vllm_command: String,
-        vllm_logging: bool,
-    ) -> Self {
         let processes = DashMap::new();
 
         for (name, config) in &configs {
@@ -112,7 +120,6 @@ impl Orchestrator {
             health_timeout: Duration::from_secs(5),
             startup_timeout: Duration::from_secs(300), // 5 minutes for large models
             vllm_command,
-            vllm_logging,
         }
     }
 
@@ -220,17 +227,12 @@ impl Orchestrator {
 
         // Spawn process in its own process group so we can kill the entire
         // tree (vLLM spawns child processes like EngineCore that hold GPU memory).
-        let (stdout_cfg, stderr_cfg) = if self.vllm_logging {
-            (Stdio::piped(), Stdio::piped())
-        } else {
-            (Stdio::null(), Stdio::null())
-        };
-
         let mut child = Command::new(&self.vllm_command)
             .args(&args)
             .env("VLLM_SERVER_DEV_MODE", "1") // Required for sleep mode endpoints
-            .stdout(stdout_cfg)
-            .stderr(stderr_cfg)
+            .env("NO_COLOR", "1") // Disable color codes in vLLM output
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .process_group(0)
             .spawn()
             .map_err(|e| OrchestratorError::SpawnFailed {
@@ -238,8 +240,9 @@ impl Orchestrator {
                 reason: e.to_string(),
             })?;
 
-        // Spawn log forwarding tasks if logging is enabled
-        if self.vllm_logging {
+        // Forward vLLM stdout/stderr as debug logs under the "vllm" target,
+        // filterable via RUST_LOG (e.g. RUST_LOG=info,vllm=debug).
+        {
             let model_name = model.to_string();
             if let Some(stdout) = child.stdout.take() {
                 let name = model_name.clone();
@@ -247,7 +250,8 @@ impl Orchestrator {
                     let reader = BufReader::new(stdout);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        info!(model = %name, stream = "stdout", "{}", line);
+                        let clean = strip_ansi(&line);
+                        debug!(target: "vllm", model = %name, stream = "stdout", "{}", clean);
                     }
                 });
             }
@@ -257,7 +261,8 @@ impl Orchestrator {
                     let reader = BufReader::new(stderr);
                     let mut lines = reader.lines();
                     while let Ok(Some(line)) = lines.next_line().await {
-                        info!(model = %name, stream = "stderr", "{}", line);
+                        let clean = strip_ansi(&line);
+                        debug!(target: "vllm", model = %name, stream = "stderr", "{}", clean);
                     }
                 });
             }
@@ -662,9 +667,6 @@ mod tests {
             ModelConfig {
                 model_path: "test/model".to_string(),
                 port: 8001,
-                gpu_memory_utilization: 0.9,
-                tensor_parallel_size: 1,
-                dtype: "auto".to_string(),
                 extra_args: vec![],
                 sleep_level: 1,
             },
@@ -672,5 +674,15 @@ mod tests {
 
         let orchestrator = Orchestrator::new(configs);
         assert_eq!(orchestrator.registered_models(), vec!["model-a"]);
+    }
+
+    #[test]
+    fn test_strip_ansi() {
+        assert_eq!(strip_ansi("hello"), "hello");
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(
+            strip_ansi("\x1b[1;32mgreen bold\x1b[0m text"),
+            "green bold text"
+        );
     }
 }

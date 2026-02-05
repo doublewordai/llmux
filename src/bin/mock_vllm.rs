@@ -47,7 +47,8 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// vLLM-compatible serve mode
+    /// vLLM-compatible serve mode.
+    /// Accepts and ignores vLLM-specific flags so it can stand in for real vLLM.
     Serve {
         /// Model to serve (positional, like vllm)
         model: String,
@@ -56,7 +57,7 @@ enum Commands {
         #[arg(long)]
         port: Option<u16>,
 
-        /// GPU memory utilization (ignored in mock, but accepted for compatibility)
+        /// GPU memory utilization (ignored in mock, accepted for compatibility)
         #[arg(long, default_value = "0.9")]
         gpu_memory_utilization: f32,
 

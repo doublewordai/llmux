@@ -105,10 +105,18 @@ curl http://localhost:3000/v1/chat/completions \
 | `model_path` | *required* | HuggingFace model ID or local path |
 | `port` | *required* | Port for this model's vLLM instance |
 | `sleep_level` | `3` | Sleep level (1, 2, or 3) |
-| `gpu_memory_utilization` | `0.9` | vLLM GPU memory fraction |
-| `tensor_parallel_size` | `1` | Number of GPUs for tensor parallelism |
-| `dtype` | `"auto"` | Data type (auto, float16, bfloat16) |
 | `extra_args` | `[]` | Additional vLLM CLI arguments |
+
+All vLLM-specific flags (e.g. `--gpu-memory-utilization`, `--tensor-parallel-size`,
+`--dtype`) should be passed via `extra_args`:
+
+```json
+{
+  "model_path": "Qwen/Qwen3-14B",
+  "port": 8001,
+  "extra_args": ["--gpu-memory-utilization", "0.9", "--tensor-parallel-size", "2"]
+}
+```
 
 ### Top-level options
 
@@ -117,7 +125,25 @@ curl http://localhost:3000/v1/chat/completions \
 | `port` | `3000` | Proxy listen port |
 | `metrics_port` | `9090` | Prometheus metrics port (0 to disable) |
 | `vllm_command` | `"vllm"` | vLLM binary path |
-| `vllm_logging` | `false` | Forward vLLM stdout/stderr to logs |
+
+### vLLM logging
+
+vLLM process output (stdout/stderr) is always captured and forwarded to the
+`vllm` tracing target at `debug` level. Use `RUST_LOG` to control visibility:
+
+```bash
+# Default: only llmux info logs, vLLM output hidden
+llmux --config config.json
+
+# Show vLLM output
+RUST_LOG=info,vllm=debug llmux --config config.json
+
+# --verbose includes vLLM output automatically
+llmux --config config.json --verbose
+```
+
+ANSI color codes are stripped from vLLM output. The `NO_COLOR=1` environment
+variable is also set on spawned vLLM processes.
 
 ### Policy options
 

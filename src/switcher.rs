@@ -507,9 +507,6 @@ mod tests {
             ModelConfig {
                 model_path: "test".to_string(),
                 port: 8001,
-                gpu_memory_utilization: 0.9,
-                tensor_parallel_size: 1,
-                dtype: "auto".to_string(),
                 extra_args: vec![],
                 sleep_level: 1,
             },
@@ -519,9 +516,6 @@ mod tests {
             ModelConfig {
                 model_path: "test".to_string(),
                 port: 8002,
-                gpu_memory_utilization: 0.9,
-                tensor_parallel_size: 1,
-                dtype: "auto".to_string(),
                 extra_args: vec![],
                 sleep_level: 1,
             },

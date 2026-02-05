@@ -52,10 +52,9 @@ pub async fn run_validation(
     let mut models = HashMap::new();
     models.insert(model_name.to_string(), model_config.clone());
 
-    let orchestrator = Arc::new(Orchestrator::with_options(
+    let orchestrator = Arc::new(Orchestrator::with_command(
         models,
         config.vllm_command.clone(),
-        config.vllm_logging,
     ));
 
     // Start the model

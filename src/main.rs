@@ -45,9 +45,11 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
+    // Initialize logging.
+    // vLLM process output is logged under the "vllm" target at debug level,
+    // so it can be enabled with e.g. RUST_LOG=info,vllm=debug.
     let filter = if args.verbose {
-        EnvFilter::new("llmux=debug,onwards=debug,tower_http=debug")
+        EnvFilter::new("llmux=debug,onwards=debug,tower_http=debug,vllm=debug")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };

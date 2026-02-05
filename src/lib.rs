@@ -62,10 +62,9 @@ pub async fn build_app(config: Config) -> Result<axum::Router> {
     info!("Building llmux with {} models", config.models.len());
 
     // Create orchestrator with configured command
-    let orchestrator = Arc::new(Orchestrator::with_options(
+    let orchestrator = Arc::new(Orchestrator::with_command(
         config.models.clone(),
         config.vllm_command.clone(),
-        config.vllm_logging,
     ));
 
     // Create policy

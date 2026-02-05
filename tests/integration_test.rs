@@ -270,9 +270,6 @@ async fn test_orchestrator_spawns_and_manages_process() {
         ModelConfig {
             model_path: "test-model".to_string(),
             port: 0, // Will use dynamic port, but orchestrator needs a fixed port
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -358,9 +355,6 @@ async fn test_orchestrator_multiple_models() {
         ModelConfig {
             model_path: "model-alpha".to_string(),
             port: port_alpha,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -370,9 +364,6 @@ async fn test_orchestrator_multiple_models() {
         ModelConfig {
             model_path: "model-beta".to_string(),
             port: port_beta,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -463,9 +454,6 @@ async fn test_switcher_basic_registration() {
         ModelConfig {
             model_path: "test".to_string(),
             port: 8001,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -475,9 +463,6 @@ async fn test_switcher_basic_registration() {
         ModelConfig {
             model_path: "test".to_string(),
             port: 8002,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -503,9 +488,6 @@ async fn test_switcher_unregistered_model_error() {
         ModelConfig {
             model_path: "test".to_string(),
             port: 8001,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -531,9 +513,6 @@ async fn test_switcher_in_flight_tracking() {
         ModelConfig {
             model_path: "test".to_string(),
             port: 8001,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -579,9 +558,6 @@ async fn test_switcher_initial_state() {
         ModelConfig {
             model_path: "test".to_string(),
             port: 8001,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -615,9 +591,6 @@ async fn test_switcher_ensure_model_ready() {
         ModelConfig {
             model_path: "test-model".to_string(),
             port,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -672,9 +645,6 @@ async fn test_switcher_model_switching() {
         ModelConfig {
             model_path: "model-a".to_string(),
             port: port_a,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -684,9 +654,6 @@ async fn test_switcher_model_switching() {
         ModelConfig {
             model_path: "model-b".to_string(),
             port: port_b,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -754,9 +721,6 @@ async fn test_switcher_same_model_no_switch() {
         ModelConfig {
             model_path: "model-a".to_string(),
             port,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -813,9 +777,6 @@ async fn test_orchestrator_unknown_model() {
         ModelConfig {
             model_path: "test".to_string(),
             port: 8001,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -866,9 +827,6 @@ async fn test_end_to_end_single_model() {
         ModelConfig {
             model_path: "test-model".to_string(),
             port: backend_port,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -880,7 +838,6 @@ async fn test_end_to_end_single_model() {
         port: proxy_port,
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
-        vllm_logging: false,
     };
 
     // Build the full app stack
@@ -966,9 +923,6 @@ async fn test_end_to_end_model_switching() {
         ModelConfig {
             model_path: "model-a".to_string(),
             port: port_a,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -978,9 +932,6 @@ async fn test_end_to_end_model_switching() {
         ModelConfig {
             model_path: "model-b".to_string(),
             port: port_b,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -992,7 +943,6 @@ async fn test_end_to_end_model_switching() {
         port: proxy_port,
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
-        vllm_logging: false,
     };
 
     // Build the full app stack
@@ -1108,9 +1058,6 @@ async fn test_end_to_end_unknown_model_passthrough() {
         ModelConfig {
             model_path: "known-model".to_string(),
             port: backend_port,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -1122,7 +1069,6 @@ async fn test_end_to_end_unknown_model_passthrough() {
         port: proxy_port,
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
-        vllm_logging: false,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(
@@ -1191,9 +1137,6 @@ async fn test_l3_fallback_on_sleep_failure() {
         ModelConfig {
             model_path: "model-a".to_string(),
             port: port_a,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -1203,9 +1146,6 @@ async fn test_l3_fallback_on_sleep_failure() {
         ModelConfig {
             model_path: "model-b".to_string(),
             port: port_b,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -1350,9 +1290,6 @@ async fn test_end_to_end_concurrent_requests() {
         ModelConfig {
             model_path: "test-model".to_string(),
             port: backend_port,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -1364,7 +1301,6 @@ async fn test_end_to_end_concurrent_requests() {
         port: proxy_port,
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
-        vllm_logging: false,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(
@@ -1446,9 +1382,6 @@ async fn test_switch_cooldown_enforced() {
         ModelConfig {
             model_path: "model-a".to_string(),
             port: port_a,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -1458,9 +1391,6 @@ async fn test_switch_cooldown_enforced() {
         ModelConfig {
             model_path: "model-b".to_string(),
             port: port_b,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -1536,9 +1466,6 @@ async fn test_zombie_process_recovery() {
         ModelConfig {
             model_path: "test-model".to_string(),
             port,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
@@ -1622,9 +1549,6 @@ async fn test_zombie_detection_on_wake() {
         ModelConfig {
             model_path: "test-model".to_string(),
             port,
-            gpu_memory_utilization: 0.9,
-            tensor_parallel_size: 1,
-            dtype: "auto".to_string(),
             extra_args: vec![],
             sleep_level: 1,
         },
