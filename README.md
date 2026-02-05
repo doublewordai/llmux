@@ -32,8 +32,8 @@ lifecycle. Only one model is active at a time - the rest are sleeping
 
 | Level | Sleep | Wake | GPU freed | CPU RAM | Use case |
 |-------|-------|------|-----------|---------|----------|
-| **L1** | Slow (offload to CPU) | Fast (~1s) | All | High (holds weights) | Frequent switching |
-| **L2** | Fast (~1s) | Slow (reload from disk) | All | None | Infrequent switching |
+| **L1** | Slow (offload to CPU) | Fast (~1s) | All | High (holds weights) | Model you expect to return to soon |
+| **L2** | Fast (~1s) | Slow (reload from disk) | All | None | Model you may not need for a while |
 | **L3** | Kill process | Cold start | All | None | Fallback / cleanup |
 
 If L1/L2 sleep fails, llmux automatically escalates to L3 (kill) to guarantee
@@ -197,9 +197,29 @@ Where `targets.json` maps model names to llmux with API keys:
 }
 ```
 
+## Known issues
+
+The `--validate` flag exists specifically to catch these kinds of problems
+before they hit production.
+
+### vLLM v0.13.0
+
+- **`openai/gpt-oss-20b` L2 reload fails.** The MXFP4 weight loader crashes on
+  wake with `default_weight_loader() got an unexpected keyword argument
+  'weight_name'`. L1 works fine (19.6s sleep, 0.6s wake). Use L1 for this
+  model.
+- L1 and L2 both work correctly for `Qwen/Qwen3-14B` and
+  `google/gemma-3-12b-it`.
+
+### vLLM v0.14+
+
+Sleep mode is broken entirely — weights are not discarded from GPU memory
+regardless of sleep level ([vllm#32714](https://github.com/vllm-project/vllm/issues/32714)).
+Stick with v0.13.x until this is fixed upstream.
+
 ## Compatibility
 
-Requires **vLLM v0.13.x**. Sleep mode is broken in v0.14+ ([vllm#32714](https://github.com/vllm-project/vllm/issues/32714)).
+Requires **vLLM v0.13.x** (see known issues above).
 
 ## License
 

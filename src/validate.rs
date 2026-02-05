@@ -35,16 +35,13 @@ pub async fn run_validation(
     model_name: &str,
     levels: Option<&[u8]>,
 ) -> Result<bool> {
-    let model_config = config
-        .models
-        .get(model_name)
-        .with_context(|| {
-            let available: Vec<_> = config.models.keys().collect();
-            format!(
-                "Model '{}' not found in config. Available: {:?}",
-                model_name, available
-            )
-        })?;
+    let model_config = config.models.get(model_name).with_context(|| {
+        let available: Vec<_> = config.models.keys().collect();
+        format!(
+            "Model '{}' not found in config. Available: {:?}",
+            model_name, available
+        )
+    })?;
 
     let port = model_config.port;
     let model_path = model_config.model_path.clone();
@@ -116,9 +113,7 @@ pub async fn run_validation(
 
     // Cleanup: stop the model
     println!("\nStopping model (L3)...");
-    let _ = orchestrator
-        .sleep_model(model_name, SleepLevel::Stop)
-        .await;
+    let _ = orchestrator.sleep_model(model_name, SleepLevel::Stop).await;
 
     // Print results table
     print_results(&results);
@@ -225,10 +220,7 @@ async fn run_deterministic_request(port: u16, model_path: &str) -> Result<String
         .context("inference request failed")?;
 
     if !response.status().is_success() {
-        bail!(
-            "inference request returned status {}",
-            response.status()
-        );
+        bail!("inference request returned status {}", response.status());
     }
 
     let json: serde_json::Value = response.json().await.context("failed to parse response")?;
@@ -298,7 +290,11 @@ fn print_results(results: &[LevelResult]) {
             r.gpu_before_sleep,
             r.gpu_after_sleep,
             r.gpu_after_wake,
-            if r.response_matches { "match" } else { "MISMATCH" },
+            if r.response_matches {
+                "match"
+            } else {
+                "MISMATCH"
+            },
             if r.pass { "OK" } else { "FAIL" },
         );
     }

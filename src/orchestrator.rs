@@ -389,12 +389,16 @@ impl Orchestrator {
         let base_url = format!("http://localhost:{}", config.port);
 
         // POST /wake_up
-        self.post_request(&format!("{}/wake_up", base_url), None, Duration::from_secs(30))
-            .await
-            .map_err(|e| OrchestratorError::WakeFailed {
-                model: model.to_string(),
-                reason: e,
-            })?;
+        self.post_request(
+            &format!("{}/wake_up", base_url),
+            None,
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| OrchestratorError::WakeFailed {
+            model: model.to_string(),
+            reason: e,
+        })?;
 
         // For L2 sleep, need to reload weights
         if actual_sleep_level == SleepLevel::L2 {
@@ -417,11 +421,11 @@ impl Orchestrator {
                 Duration::from_secs(30),
             )
             .await
-                .map_err(|e| {
-                    warn!(model = %model, error = %e, "Failed to reset prefix cache");
-                    // Don't fail on cache reset
-                })
-                .ok();
+            .map_err(|e| {
+                warn!(model = %model, error = %e, "Failed to reset prefix cache");
+                // Don't fail on cache reset
+            })
+            .ok();
         }
 
         // Update state

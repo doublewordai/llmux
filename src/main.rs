@@ -32,7 +32,12 @@ struct Args {
     validate: Option<String>,
 
     /// Sleep levels to validate (default: all). Comma-separated: 1,2
-    #[arg(long, value_name = "LEVELS", value_delimiter = ',', requires = "validate")]
+    #[arg(
+        long,
+        value_name = "LEVELS",
+        value_delimiter = ',',
+        requires = "validate"
+    )]
     levels: Vec<u8>,
 }
 
@@ -78,8 +83,7 @@ async fn main() -> Result<()> {
             Some(args.levels)
         };
         let success =
-            llmux::validate::run_validation(&config, &model_name, levels.as_deref())
-                .await?;
+            llmux::validate::run_validation(&config, &model_name, levels.as_deref()).await?;
         std::process::exit(if success { 0 } else { 1 });
     }
 

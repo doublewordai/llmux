@@ -1177,7 +1177,9 @@ async fn test_end_to_end_unknown_model_passthrough() {
 #[tokio::test]
 #[serial]
 async fn test_l3_fallback_on_sleep_failure() {
-    use llmux::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, ProcessState, SwitcherState};
+    use llmux::{
+        FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, ProcessState, SwitcherState,
+    };
     use std::sync::Arc;
 
     let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
