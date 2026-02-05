@@ -3,7 +3,6 @@
 //! These tests spawn actual mock-vllm processes and verify the full integration.
 //! All tests use event-driven synchronization (no polling).
 
-use reqwest;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::process::Stdio;
