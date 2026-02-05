@@ -384,27 +384,7 @@ impl ModelSwitcher {
                 .unwrap_or_else(|| self.inner.policy.sleep_level());
             let sleep_level = SleepLevel::from(level_raw);
             debug!(model = %from, level = ?sleep_level, "Sleeping model");
-
-            if let Err(e) = self.inner.orchestrator.sleep_model(from, sleep_level).await {
-                if sleep_level != SleepLevel::Stop {
-                    warn!(
-                        model = %from,
-                        error = %e,
-                        "Sleep failed at {:?}, escalating to L3 (Stop)",
-                        sleep_level,
-                    );
-                    if let Err(e2) = self
-                        .inner
-                        .orchestrator
-                        .sleep_model(from, SleepLevel::Stop)
-                        .await
-                    {
-                        error!(model = %from, error = %e2, "L3 fallback also failed");
-                    }
-                } else {
-                    error!(model = %from, error = %e, "Failed to sleep model");
-                }
-            }
+            self.inner.orchestrator.force_sleep(from, sleep_level).await;
         }
 
         // Wake new model
@@ -435,6 +415,11 @@ impl ModelSwitcher {
                     self.notify_pending(target_model, Ok(())).await;
                 } else {
                     error!(model = %target_model, "Model failed to become ready");
+                    // Clean up: force-sleep the partially-woken model to free GPU memory
+                    self.inner
+                        .orchestrator
+                        .force_sleep(target_model, SleepLevel::Stop)
+                        .await;
                     *self.inner.last_switch_failure.write().await = Some(Instant::now());
                     {
                         let mut state = self.inner.state.write().await;
@@ -449,6 +434,11 @@ impl ModelSwitcher {
             }
             Err(e) => {
                 error!(model = %target_model, error = %e, "Failed to wake model");
+                // Clean up: force-sleep in case the model partially woke
+                self.inner
+                    .orchestrator
+                    .force_sleep(target_model, SleepLevel::Stop)
+                    .await;
                 *self.inner.last_switch_failure.write().await = Some(Instant::now());
                 {
                     let mut state = self.inner.state.write().await;
