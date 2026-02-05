@@ -1,0 +1,28 @@
+{
+  "models": {
+    "llama-7b": {
+      "model_path": "meta-llama/Llama-2-7b-chat-hf",
+      "port": 8001,
+      "gpu_memory_utilization": 0.9,
+      "tensor_parallel_size": 1,
+      "dtype": "auto",
+      "sleep_level": 1
+    },
+    "mistral-7b": {
+      "model_path": "mistralai/Mistral-7B-Instruct-v0.2",
+      "port": 8002,
+      "gpu_memory_utilization": 0.9,
+      "tensor_parallel_size": 1,
+      "dtype": "auto",
+      "sleep_level": 1
+    }
+  },
+  "policy": {
+    "policy_type": "fifo",
+    "request_timeout_secs": 300,
+    "drain_before_switch": true,
+    "sleep_level": 1
+  },
+  "port": 3000,
+  "metrics_port": 9090
+}
