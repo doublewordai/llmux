@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/doublewordai/llmux/compare/v0.2.0...v0.2.1) - 2026-02-05
+
+### Fixed
+
+- use per-model sleep level instead of global policy default
+
 ## [0.2.0](https://github.com/doublewordai/llmux/compare/v0.1.0...v0.2.0) - 2026-02-05
 
 ### Fixed
