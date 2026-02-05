@@ -89,6 +89,8 @@ struct MockState {
     request_count: RwLock<u64>,
     /// When true, /sleep returns 500 (for testing L3 fallback)
     fail_sleep: RwLock<bool>,
+    /// When true, /wake_up returns 500 (for testing wake failure cleanup)
+    fail_wake: RwLock<bool>,
     /// Artificial sleep delay in milliseconds (for testing timeouts)
     sleep_delay_ms: RwLock<u64>,
 }
@@ -131,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         latency: Duration::from_millis(args.latency_ms),
         request_count: RwLock::new(0),
         fail_sleep: RwLock::new(false),
+        fail_wake: RwLock::new(false),
         sleep_delay_ms: RwLock::new(0),
     });
 
@@ -144,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(list_models))
         .route("/stats", get(stats))
         .route("/control/fail-sleep", post(control_fail_sleep))
+        .route("/control/fail-wake", post(control_fail_wake))
         .route("/control/sleep-delay", post(control_sleep_delay))
         .with_state(state);
 
@@ -211,6 +215,12 @@ async fn sleep(
 
 /// Wake up endpoint
 async fn wake_up(State(state): State<Arc<MockState>>) -> impl IntoResponse {
+    // Check if wake should fail (for testing wake failure cleanup)
+    if *state.fail_wake.read().await {
+        warn!("Wake forced to fail via /control/fail-wake");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
     info!("Waking up model");
     *state.sleeping.write().await = false;
     StatusCode::OK
@@ -439,6 +449,21 @@ async fn control_fail_sleep(
 #[derive(Deserialize)]
 struct ControlSleepDelay {
     delay_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct ControlFailWake {
+    enabled: bool,
+}
+
+/// Control endpoint: make /wake_up return 500
+async fn control_fail_wake(
+    State(state): State<Arc<MockState>>,
+    Json(body): Json<ControlFailWake>,
+) -> impl IntoResponse {
+    info!(enabled = body.enabled, "Setting fail_wake");
+    *state.fail_wake.write().await = body.enabled;
+    StatusCode::OK
 }
 
 /// Control endpoint: set artificial sleep delay

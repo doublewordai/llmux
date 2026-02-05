@@ -129,6 +129,19 @@ impl MockServer {
         client.post(&url).send().await.expect("Wake request failed");
     }
 
+    /// Set fail-wake mode (causes /wake_up to return 500).
+    #[allow(dead_code)]
+    async fn set_fail_wake(&self, enabled: bool) {
+        let client = reqwest::Client::new();
+        let url = format!("http://localhost:{}/control/fail-wake", self.port);
+        client
+            .post(&url)
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await
+            .expect("Failed to set fail-wake");
+    }
+
     /// Set fail-sleep mode (causes /sleep to return 500).
     #[allow(dead_code)]
     async fn set_fail_sleep(&self, enabled: bool) {
@@ -1615,4 +1628,117 @@ async fn test_zombie_detection_on_wake() {
         .expect("Request after zombie recovery failed");
 
     assert!(response.status().is_success());
+}
+
+// =============================================================================
+// Wake Failure Cleanup Tests
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_wake_failure_cleans_up_target_model() {
+    use llmux::{
+        FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, ProcessState, SwitcherState,
+    };
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+    configs.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        configs,
+        mock_vllm_path.to_string(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    // Step 1: Start model-a
+    switcher
+        .ensure_model_ready("model-a")
+        .await
+        .expect("Failed to start model-a");
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-a".to_string()
+        }
+    );
+
+    // Step 2: Start model-b's process so we can configure it to fail wake
+    orchestrator
+        .ensure_running("model-b")
+        .await
+        .expect("Failed to start model-b process");
+
+    // Configure model-b to fail on /wake_up
+    let client = reqwest::Client::new();
+    client
+        .post(format!("http://localhost:{}/control/fail-wake", port_b))
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .await
+        .expect("Failed to set fail-wake on model-b");
+
+    // Put model-b to sleep so the switcher will try to wake it
+    orchestrator
+        .sleep_model("model-b", llmux::SleepLevel::L1)
+        .await
+        .expect("Failed to sleep model-b");
+
+    // Step 3: Try to switch to model-b — wake should fail
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        switcher.ensure_model_ready("model-b"),
+    )
+    .await;
+
+    assert!(result.is_ok(), "Timeout waiting for switch");
+    assert!(result.unwrap().is_err(), "Switch should have failed");
+
+    // Step 4: Switcher should be Idle (not Active with model-b)
+    assert_eq!(switcher.state().await, SwitcherState::Idle);
+
+    // model-b should have been force-slept (killed) — state should be NotStarted
+    assert_eq!(
+        orchestrator.process_state("model-b").await,
+        Some(ProcessState::NotStarted)
+    );
+
+    // Step 5: Switch to model-a should succeed because GPU memory was freed
+    // Need to wait for backoff to expire
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    switcher
+        .ensure_model_ready("model-a")
+        .await
+        .expect("Failed to switch to model-a after wake failure cleanup");
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-a".to_string()
+        }
+    );
 }

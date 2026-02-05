@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Kill an entire process group by sending SIGKILL to -pgid.
 #[cfg(unix)]
@@ -449,16 +449,23 @@ impl Orchestrator {
         if actual_sleep_level == SleepLevel::L2 {
             debug!(model = %model, "L2 sleep: reloading weights");
 
-            self.post_request(
-                &format!("{}/collective_rpc", base_url),
-                Some(r#"{"method": "reload_weights"}"#),
-                Duration::from_secs(60),
-            )
-            .await
-            .map_err(|e| OrchestratorError::WakeFailed {
-                model: model.to_string(),
-                reason: e,
-            })?;
+            if let Err(e) = self
+                .post_request(
+                    &format!("{}/collective_rpc", base_url),
+                    Some(r#"{"method": "reload_weights"}"#),
+                    Duration::from_secs(60),
+                )
+                .await
+            {
+                // L2 reload failed — model is partially woken, consuming GPU memory.
+                // Force it back to sleep to free GPU memory before returning error.
+                warn!(model = %model, error = %e, "L2 reload failed, forcing model back to sleep");
+                self.force_sleep(model, SleepLevel::Stop).await;
+                return Err(OrchestratorError::WakeFailed {
+                    model: model.to_string(),
+                    reason: e,
+                });
+            }
 
             self.post_request(
                 &format!("{}/reset_prefix_cache", base_url),
@@ -502,15 +509,17 @@ impl Orchestrator {
             .get(model)
             .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
 
-        // Check if already sleeping or not running
+        // Check if already sleeping or not running.
+        // Allow Stop to proceed even if already sleeping — it kills the process
+        // to guarantee GPU memory is freed (e.g. after a failed wake).
         {
             let guard = process.lock().await;
             match &guard.state {
                 ProcessState::Running {
                     sleeping: Some(_), ..
-                } => return Ok(()),
-                ProcessState::Running { sleeping: None } => {
-                    // Proceed with sleep
+                } if level != SleepLevel::Stop => return Ok(()),
+                ProcessState::Running { .. } => {
+                    // Proceed with sleep (awake, or sleeping but Stop requested)
                 }
                 _ => return Ok(()), // Not running, nothing to sleep
             }
@@ -566,6 +575,24 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Force a model to sleep, escalating to Stop if the initial level fails.
+    ///
+    /// This is a guaranteed-cleanup method: it logs errors but **never returns `Err`**.
+    /// Used to clean up partially-woken models that hold GPU memory.
+    pub async fn force_sleep(&self, model: &str, level: SleepLevel) {
+        if let Err(e) = self.sleep_model(model, level).await {
+            if level == SleepLevel::Stop {
+                // Already at the highest level, nothing to escalate to
+                error!(model, error = %e, "force_sleep: Stop failed");
+            } else {
+                warn!(model, error = %e, "force_sleep: {:?} failed, escalating to Stop", level);
+                if let Err(e2) = self.sleep_model(model, SleepLevel::Stop).await {
+                    error!(model, error = %e2, "force_sleep: Stop escalation also failed");
+                }
+            }
+        }
+    }
+
     /// Check if a model is ready
     pub async fn is_ready(&self, model: &str) -> bool {
         let Some(process) = self.processes.get(model) else {
@@ -576,7 +603,12 @@ impl Orchestrator {
         matches!(guard.state, ProcessState::Running { sleeping: None })
     }
 
-    /// Helper to make POST requests
+    /// Helper to make POST requests with retries.
+    ///
+    /// All vLLM control endpoints (wake_up, sleep, collective_rpc, etc.) are
+    /// idempotent, so retries are safe. We retry on transient failures (connection
+    /// errors, timeouts, 5xx) to avoid escalating to drastic measures (like
+    /// killing the process) when the endpoint is just momentarily unresponsive.
     async fn post_request(
         &self,
         url: &str,
@@ -591,31 +623,43 @@ impl Orchestrator {
                 .build_http();
 
         let uri: hyper::Uri = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
-
         let has_body = body.is_some();
-        let body_bytes = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
-        let request_body = Full::new(bytes::Bytes::from(body_bytes));
+        let body_bytes: Vec<u8> = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
 
-        let mut req_builder = Request::builder().method("POST").uri(uri);
+        let mut last_err = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                warn!(url, attempt, delay = ?delay, "Retrying request");
+                tokio::time::sleep(delay).await;
+            }
 
-        if has_body {
-            req_builder = req_builder.header("Content-Type", "application/json");
+            let request_body = Full::new(bytes::Bytes::from(body_bytes.clone()));
+            let mut req_builder = Request::builder().method("POST").uri(uri.clone());
+            if has_body {
+                req_builder = req_builder.header("Content-Type", "application/json");
+            }
+
+            let request = match req_builder.body(request_body) {
+                Ok(r) => r,
+                Err(e) => return Err(format!("Failed to build request: {}", e)),
+            };
+
+            match tokio::time::timeout(timeout, client.request(request)).await {
+                Ok(Ok(response)) if response.status().is_success() => return Ok(()),
+                Ok(Ok(response)) => {
+                    last_err = format!("Request failed with status: {}", response.status());
+                }
+                Ok(Err(e)) => {
+                    last_err = format!("Request failed: {}", e);
+                }
+                Err(_) => {
+                    last_err = "Request timeout".to_string();
+                }
+            }
         }
 
-        let request = req_builder
-            .body(request_body)
-            .map_err(|e| format!("Failed to build request: {}", e))?;
-
-        let response = tokio::time::timeout(timeout, client.request(request))
-            .await
-            .map_err(|_| "Request timeout".to_string())?
-            .map_err(|e| format!("Request failed: {}", e))?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(format!("Request failed with status: {}", response.status()))
-        }
+        Err(last_err)
     }
 }
 
