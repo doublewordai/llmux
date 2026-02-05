@@ -94,6 +94,10 @@ struct SwitcherInner {
     state: RwLock<SwitcherState>,
     model_states: HashMap<String, Arc<ModelState>>,
     switch_lock: Mutex<()>,
+    /// When the currently active model was activated (for cooldown enforcement)
+    activated_at: RwLock<Option<Instant>>,
+    /// When the last switch failure occurred (for backoff)
+    last_switch_failure: RwLock<Option<Instant>>,
 }
 
 /// The model switcher coordinates wake/sleep transitions
@@ -125,6 +129,8 @@ impl ModelSwitcher {
                 state: RwLock::new(SwitcherState::Idle),
                 model_states,
                 switch_lock: Mutex::new(()),
+                activated_at: RwLock::new(None),
+                last_switch_failure: RwLock::new(None),
             }),
         }
     }
@@ -285,6 +291,21 @@ impl ModelSwitcher {
     async fn do_switch(&self, target_model: &str) {
         let _guard = self.inner.switch_lock.lock().await;
 
+        // Backoff: if the last switch failed recently, wait before retrying
+        {
+            let last_failure = self.inner.last_switch_failure.read().await;
+            if let Some(failed_at) = *last_failure {
+                let backoff = Duration::from_secs(2);
+                let elapsed = failed_at.elapsed();
+                if elapsed < backoff {
+                    let remaining = backoff - elapsed;
+                    info!(remaining = ?remaining, "Backing off after recent switch failure");
+                    drop(last_failure);
+                    tokio::time::sleep(remaining).await;
+                }
+            }
+        }
+
         // Double-check state
         {
             let state = self.inner.state.read().await;
@@ -334,6 +355,23 @@ impl ModelSwitcher {
             );
 
             self.inner.policy.prepare_switch(&mut switch_ctx).await;
+        }
+
+        // Cooldown: ensure the old model has been active long enough before sleeping
+        if from_model.is_some() {
+            let min_active = self.inner.policy.min_active_duration();
+            let activated_at = *self.inner.activated_at.read().await;
+            if let Some(activated) = activated_at {
+                let elapsed = activated.elapsed();
+                if elapsed < min_active {
+                    let remaining = min_active - elapsed;
+                    info!(
+                        remaining = ?remaining,
+                        "Waiting for cooldown before sleeping old model"
+                    );
+                    tokio::time::sleep(remaining).await;
+                }
+            }
         }
 
         // Sleep old model
@@ -386,9 +424,12 @@ impl ModelSwitcher {
                             model: target_model.to_string(),
                         };
                     }
+                    *self.inner.activated_at.write().await = Some(Instant::now());
+                    *self.inner.last_switch_failure.write().await = None;
                     self.notify_pending(target_model, Ok(())).await;
                 } else {
                     error!(model = %target_model, "Model failed to become ready");
+                    *self.inner.last_switch_failure.write().await = Some(Instant::now());
                     {
                         let mut state = self.inner.state.write().await;
                         *state = SwitcherState::Idle;
@@ -402,6 +443,7 @@ impl ModelSwitcher {
             }
             Err(e) => {
                 error!(model = %target_model, error = %e, "Failed to wake model");
+                *self.inner.last_switch_failure.write().await = Some(Instant::now());
                 {
                     let mut state = self.inner.state.write().await;
                     *state = SwitcherState::Idle;

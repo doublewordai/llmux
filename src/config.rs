@@ -187,6 +187,11 @@ pub struct PolicyConfig {
     /// Default sleep level (1, 2, or 3)
     #[serde(default = "default_sleep_level")]
     pub sleep_level: u8,
+
+    /// Minimum seconds a model must stay active before it can be put to sleep.
+    /// Prevents rapid wake/sleep thrashing that can cause GPU page faults.
+    #[serde(default = "default_min_active_secs")]
+    pub min_active_secs: u64,
 }
 
 fn default_policy_type() -> String {
@@ -201,6 +206,10 @@ fn default_drain_before_switch() -> bool {
     true
 }
 
+fn default_min_active_secs() -> u64 {
+    5
+}
+
 impl PolicyConfig {
     /// Build a SwitchPolicy from this config
     pub fn build_policy(&self) -> Box<dyn SwitchPolicy> {
@@ -210,6 +219,7 @@ impl PolicyConfig {
             self.sleep_level,
             Duration::from_secs(self.request_timeout_secs),
             self.drain_before_switch,
+            Duration::from_secs(self.min_active_secs),
         ))
     }
 }

@@ -1425,3 +1425,270 @@ async fn test_end_to_end_concurrent_requests() {
 
     server.abort();
 }
+
+// =============================================================================
+// Cooldown Tests
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_switch_cooldown_enforced() {
+    use llmux::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+    configs.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        configs,
+        mock_vllm_path.to_string(),
+    ));
+
+    // Use a 2-second cooldown for testing
+    let policy = Box::new(FifoPolicy::new(
+        1,
+        Duration::from_secs(60),
+        true,
+        Duration::from_secs(2),
+    ));
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    // Start with model-a
+    switcher
+        .ensure_model_ready("model-a")
+        .await
+        .expect("Failed to start model-a");
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-a".to_string()
+        }
+    );
+
+    // Immediately request model-b — the switch should enforce cooldown
+    let start = std::time::Instant::now();
+    switcher
+        .ensure_model_ready("model-b")
+        .await
+        .expect("Failed to switch to model-b");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-b".to_string()
+        }
+    );
+
+    // The switch should have taken at least ~2s due to cooldown
+    // (minus whatever time had already elapsed since activation)
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "Switch completed too quickly ({:?}), cooldown not enforced",
+        elapsed
+    );
+}
+
+// =============================================================================
+// Zombie Process Recovery Tests
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_zombie_process_recovery() {
+    use llmux::{ModelConfig, Orchestrator, ProcessState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port = allocate_port();
+
+    let mut models = HashMap::new();
+    models.insert(
+        "test-model".to_string(),
+        ModelConfig {
+            model_path: "test-model".to_string(),
+            port,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        models,
+        mock_vllm_path.to_string(),
+    ));
+
+    // Start the process
+    orchestrator
+        .ensure_running("test-model")
+        .await
+        .expect("Failed to start");
+
+    assert_eq!(
+        orchestrator.process_state("test-model").await,
+        Some(ProcessState::Running { sleeping: None })
+    );
+
+    // Kill the mock-vllm process externally to simulate a crash
+    // We use the /sleep endpoint with level 3 (Stop) via the orchestrator itself
+    // to kill the process, then manually reset state to simulate a zombie
+    // Actually, let's kill it by sending SIGKILL to the port holder
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(format!("http://localhost:{}/wake_up", port))
+        .send()
+        .await;
+
+    // Kill the process via orchestrator's sleep_model with Stop level
+    orchestrator
+        .sleep_model("test-model", llmux::SleepLevel::Stop)
+        .await
+        .unwrap();
+
+    // The process was killed and state should be NotStarted
+    assert_eq!(
+        orchestrator.process_state("test-model").await,
+        Some(ProcessState::NotStarted)
+    );
+
+    // Now wake_model should detect dead process and restart via ensure_running
+    orchestrator
+        .wake_model("test-model")
+        .await
+        .expect("Failed to wake after process death");
+
+    assert_eq!(
+        orchestrator.process_state("test-model").await,
+        Some(ProcessState::Running { sleeping: None })
+    );
+
+    // Verify the restarted process actually works
+    let response = client
+        .post(format!("http://localhost:{}/v1/chat/completions", port))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "after recovery"}]
+        }))
+        .send()
+        .await
+        .expect("Request after recovery failed");
+
+    assert!(response.status().is_success());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_zombie_detection_on_wake() {
+    use llmux::{ModelConfig, Orchestrator, ProcessState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port = allocate_port();
+
+    let mut models = HashMap::new();
+    models.insert(
+        "test-model".to_string(),
+        ModelConfig {
+            model_path: "test-model".to_string(),
+            port,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        models,
+        mock_vllm_path.to_string(),
+    ));
+
+    // Start the process
+    orchestrator
+        .ensure_running("test-model")
+        .await
+        .expect("Failed to start");
+
+    assert_eq!(
+        orchestrator.process_state("test-model").await,
+        Some(ProcessState::Running { sleeping: None })
+    );
+
+    // Kill the mock-vllm process externally to simulate a crash (like an Xid 31
+    // GPU fault). Find only the LISTENING PID by port and send SIGKILL.
+    let output = std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{}", port), "-sTCP:LISTEN"])
+        .output()
+        .expect("lsof failed");
+
+    let pids = String::from_utf8_lossy(&output.stdout);
+    for pid_str in pids.trim().lines() {
+        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    // Wait for the process to actually die
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The orchestrator still thinks the process is Running (the bug scenario).
+    // check_process_alive() inside wake_model should detect the dead child,
+    // reset state to NotStarted, then ensure_running will restart it.
+    orchestrator
+        .wake_model("test-model")
+        .await
+        .expect("Failed to restart after zombie");
+
+    assert_eq!(
+        orchestrator.process_state("test-model").await,
+        Some(ProcessState::Running { sleeping: None })
+    );
+
+    // Verify the restarted process works
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://localhost:{}/v1/chat/completions", port))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "after zombie recovery"}]
+        }))
+        .send()
+        .await
+        .expect("Request after zombie recovery failed");
+
+    assert!(response.status().is_success());
+}

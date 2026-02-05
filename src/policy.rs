@@ -79,6 +79,10 @@ pub trait SwitchPolicy: Send + Sync {
 
     /// Request timeout
     fn request_timeout(&self) -> Duration;
+
+    /// Minimum time a model must stay active before it can be put to sleep.
+    /// Prevents rapid wake/sleep thrashing that can cause GPU page faults.
+    fn min_active_duration(&self) -> Duration;
 }
 
 /// FIFO policy - switch immediately on first request
@@ -86,21 +90,28 @@ pub struct FifoPolicy {
     sleep_level: u8,
     request_timeout: Duration,
     drain_before_switch: bool,
+    min_active_duration: Duration,
 }
 
 impl FifoPolicy {
-    pub fn new(sleep_level: u8, request_timeout: Duration, drain_before_switch: bool) -> Self {
+    pub fn new(
+        sleep_level: u8,
+        request_timeout: Duration,
+        drain_before_switch: bool,
+        min_active_duration: Duration,
+    ) -> Self {
         Self {
             sleep_level,
             request_timeout,
             drain_before_switch,
+            min_active_duration,
         }
     }
 }
 
 impl Default for FifoPolicy {
     fn default() -> Self {
-        Self::new(1, Duration::from_secs(60), true)
+        Self::new(1, Duration::from_secs(60), true, Duration::from_secs(5))
     }
 }
 
@@ -122,5 +133,9 @@ impl SwitchPolicy for FifoPolicy {
 
     fn request_timeout(&self) -> Duration {
         self.request_timeout
+    }
+
+    fn min_active_duration(&self) -> Duration {
+        self.min_active_duration
     }
 }

@@ -354,8 +354,43 @@ impl Orchestrator {
         }
     }
 
+    /// Check if a model's process is still alive. If it has exited,
+    /// reset state to NotStarted so it can be restarted.
+    ///
+    /// This prevents the "zombie loop" where the orchestrator keeps trying
+    /// to send HTTP requests to a dead process.
+    async fn check_process_alive(&self, model: &str) {
+        let Some(process) = self.processes.get(model) else {
+            return;
+        };
+
+        let mut guard = process.lock().await;
+        if let Some(ref mut child) = guard.child {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    warn!(
+                        model = %model,
+                        status = %status,
+                        "Process found dead, resetting to NotStarted"
+                    );
+                    guard.child = None;
+                    guard.state = ProcessState::NotStarted;
+                }
+                Ok(None) => {
+                    // Still running
+                }
+                Err(e) => {
+                    warn!(model = %model, error = %e, "Failed to check process status");
+                }
+            }
+        }
+    }
+
     /// Wake a model from sleep
     pub async fn wake_model(&self, model: &str) -> Result<(), OrchestratorError> {
+        // Check if the process is still alive before trying to talk to it
+        self.check_process_alive(model).await;
+
         // First ensure the process is running
         self.ensure_running(model).await?;
 
@@ -444,6 +479,9 @@ impl Orchestrator {
         model: &str,
         level: SleepLevel,
     ) -> Result<(), OrchestratorError> {
+        // Check if the process is still alive before trying to talk to it
+        self.check_process_alive(model).await;
+
         let process = self
             .processes
             .get(model)
