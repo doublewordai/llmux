@@ -46,7 +46,10 @@ pub mod validate;
 pub use config::{Config, ModelConfig, PolicyConfig};
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
 pub use orchestrator::{Orchestrator, OrchestratorError, ProcessState};
-pub use policy::{FifoPolicy, PolicyContext, PolicyDecision, SwitchPolicy};
+pub use policy::{
+    CostAwarePolicy, FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy,
+    TimeSlicePolicy,
+};
 pub use switcher::{ModelSwitcher, SleepLevel, SwitchError, SwitcherState};
 
 use anyhow::Result;
@@ -55,10 +58,10 @@ use tracing::info;
 
 /// Build the complete llmux stack
 ///
-/// Returns an Axum router with:
-/// - Model switching middleware
-/// - Onwards proxy configured for all models
-pub async fn build_app(config: Config) -> Result<axum::Router> {
+/// Returns the main Axum router and an optional metrics router. When
+/// `config.metrics_port > 0`, the global metrics recorder is installed and a
+/// separate router serving `/metrics` is returned for the caller to bind.
+pub async fn build_app(config: Config) -> Result<(axum::Router, Option<axum::Router>)> {
     info!("Building llmux with {} models", config.models.len());
 
     // Create orchestrator with configured command
@@ -68,10 +71,14 @@ pub async fn build_app(config: Config) -> Result<axum::Router> {
     ));
 
     // Create policy
-    let policy = config.policy.build_policy();
+    let model_names: Vec<String> = config.models.keys().cloned().collect();
+    let policy = config.policy.build_policy(&model_names);
 
     // Create switcher
     let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    // Spawn background scheduler if the policy uses one
+    let _scheduler_handle = switcher.clone().spawn_scheduler();
 
     // Build onwards targets from model configs
     let targets = config.build_onwards_targets()?;
@@ -81,7 +88,17 @@ pub async fn build_app(config: Config) -> Result<axum::Router> {
     let onwards_router = onwards::build_router(onwards_state);
 
     // Wrap with model switcher middleware
-    let app = onwards_router.layer(ModelSwitcherLayer::new(switcher));
+    let mut app = onwards_router.layer(ModelSwitcherLayer::new(switcher));
 
-    Ok(app)
+    // Install metrics layer and build metrics router if enabled
+    let metrics_router = if config.metrics_port > 0 {
+        let (prometheus_layer, handle) =
+            onwards::build_metrics_layer_and_handle("llmux");
+        app = app.layer(prometheus_layer);
+        Some(onwards::build_metrics_router(handle))
+    } else {
+        None
+    };
+
+    Ok((app, metrics_router))
 }

@@ -3,13 +3,17 @@
 //! This layer intercepts requests, extracts the model name, ensures the model
 //! is ready, and then passes the request through to the inner service (onwards).
 
-use crate::switcher::{ModelSwitcher, SwitchError};
+use crate::switcher::{InFlightGuard, ModelSwitcher, SwitchError};
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
+use http_body::Frame;
 use http_body_util::BodyExt;
+use metrics::{counter, histogram};
+use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tower::{Layer, Service};
 use tracing::{debug, error, trace, warn};
 
@@ -97,20 +101,47 @@ where
                 return inner.call(req).await;
             }
 
-            // Ensure model is ready
-            if let Err(e) = switcher.ensure_model_ready(&model).await {
-                error!(model = %model, error = %e, "Failed to ensure model ready");
-                return Ok(switch_error_response(e));
-            }
+            // Ensure model is ready and acquire in-flight guard.
+            // If the model starts draining between the ready check and the
+            // guard acquisition, loop back through ensure_model_ready so the
+            // request waits for the next switch instead of getting a 503.
+            let queue_start = Instant::now();
+            let guard = loop {
+                if let Err(e) = switcher.ensure_model_ready(&model).await {
+                    error!(model = %model, error = %e, "Failed to ensure model ready");
+                    return Ok(switch_error_response(e));
+                }
 
-            // Acquire in-flight guard
-            let _guard = switcher.acquire_in_flight(&model);
+                match switcher.acquire_in_flight(&model) {
+                    Some(guard) => break guard,
+                    None => {
+                        debug!(model = %model, "Model draining, re-entering ensure_model_ready");
+                        continue;
+                    }
+                }
+            };
+            let queue_wait = queue_start.elapsed();
+
+            // Record request metrics
+            let waited = queue_wait > Duration::from_millis(1);
+            histogram!("llmux_request_queue_wait_seconds", "model" => model.clone())
+                .record(queue_wait.as_secs_f64());
+            counter!("llmux_requests_total", "model" => model.clone(), "waited" => if waited { "true" } else { "false" })
+                .increment(1);
 
             // Reconstruct request with body
             let req = Request::from_parts(parts, Body::from(body_bytes));
 
-            // Forward to inner service
-            inner.call(req).await
+            // Forward to inner service, then wrap the response body so the
+            // in-flight guard is held until the full response (including
+            // streamed body) is consumed — not just until headers arrive.
+            let response = inner.call(req).await?;
+            let (resp_parts, body) = response.into_parts();
+            let guarded = GuardedBody {
+                inner: body,
+                _guard: Some(guard),
+            };
+            Ok(Response::from_parts(resp_parts, Body::new(guarded)))
         })
     }
 }
@@ -173,6 +204,35 @@ fn switch_error_response(error: SwitchError) -> Response<Body> {
     };
 
     error_response(status, &message)
+}
+
+/// Response body wrapper that holds an [`InFlightGuard`] until the body is
+/// fully consumed. For streaming responses, this ensures the in-flight count
+/// stays accurate until vLLM finishes generating — not just until the response
+/// headers arrive.
+struct GuardedBody {
+    inner: Body,
+    _guard: Option<InFlightGuard>,
+}
+
+impl http_body::Body for GuardedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[cfg(test)]

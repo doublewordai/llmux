@@ -166,6 +166,19 @@ impl MockServer {
             .await
             .expect("Failed to set sleep-delay");
     }
+
+    /// Set request latency.
+    #[allow(dead_code)]
+    async fn set_latency(&self, latency_ms: u64) {
+        let client = reqwest::Client::new();
+        let url = format!("http://localhost:{}/control/latency", self.port);
+        client
+            .post(&url)
+            .json(&serde_json::json!({ "latency_ms": latency_ms }))
+            .send()
+            .await
+            .expect("Failed to set latency");
+    }
 }
 
 impl Drop for MockServer {
@@ -1241,6 +1254,126 @@ async fn test_l3_fallback_on_sleep_failure() {
         orchestrator.process_state("model-a").await,
         Some(ProcessState::Running { sleeping: None })
     );
+}
+
+// =============================================================================
+// Drain Race Condition Tests
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_drain_waits_for_in_flight_before_sleep() {
+    use llmux::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+    configs.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        configs,
+        mock_vllm_path.to_string(),
+    ));
+
+    // Zero cooldown, drain before switch
+    let policy = Box::new(FifoPolicy::new(
+        1,
+        Duration::from_secs(60),
+        true,
+        Duration::ZERO,
+    ));
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    // Step 1: Make model-a active
+    switcher
+        .ensure_model_ready("model-a")
+        .await
+        .expect("Failed to start model-a");
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-a".to_string()
+        }
+    );
+
+    // Step 2: Acquire in-flight guards to simulate requests being processed.
+    // These guards prevent the drain from completing.
+    let guard1 = switcher
+        .acquire_in_flight("model-a")
+        .expect("acquire_in_flight should succeed");
+    let guard2 = switcher
+        .acquire_in_flight("model-a")
+        .expect("acquire_in_flight should succeed");
+
+    assert_eq!(switcher.in_flight_count("model-a"), 2);
+
+    // Step 3: Trigger switch to model-b on a background task.
+    // The switch will drain model-a (waiting for in-flight to reach 0).
+    let switcher_bg = switcher.clone();
+    let switch_handle = tokio::spawn(async move {
+        switcher_bg.ensure_model_ready("model-b").await
+    });
+
+    // Give the switch task time to start the drain
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Step 4: While draining, new acquire_in_flight should be rejected
+    assert!(
+        switcher.acquire_in_flight("model-a").is_none(),
+        "acquire_in_flight should return None while draining"
+    );
+
+    // The switch should still be in progress (blocked on drain)
+    assert!(
+        matches!(switcher.state().await, SwitcherState::Switching { .. }),
+        "Expected Switching state while in-flight guards are held"
+    );
+
+    // Step 5: Release the guards — drain completes, switch proceeds
+    drop(guard1);
+    drop(guard2);
+
+    // Step 6: Wait for the switch to finish
+    let result = tokio::time::timeout(Duration::from_secs(15), switch_handle)
+        .await
+        .expect("Switch timed out")
+        .expect("Switch task panicked");
+
+    assert!(result.is_ok(), "Switch failed: {:?}", result.err());
+
+    // model-b should now be active
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-b".to_string()
+        }
+    );
+
+    // Draining flag should be cleared — acquire_in_flight for model-a should
+    // work again (though model-a is now sleeping, the flag itself is clear)
+    // Note: We just check in_flight_count is 0, confirming guards were properly drained.
+    assert_eq!(switcher.in_flight_count("model-a"), 0);
 }
 
 #[tokio::test]

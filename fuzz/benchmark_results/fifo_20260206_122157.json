@@ -1,0 +1,55 @@
+{
+  "label": "fifo",
+  "profiles": [
+    {
+      "profile": "single_model",
+      "wall_time_s": 3,
+      "switches": 0.0,
+      "switch_time_s": 0.0,
+      "requests": -18.0,
+      "gpu_serving_pct": "100.0",
+      "avg_wait_s": 0.0,
+      "failures": 0.0
+    },
+    {
+      "profile": "balanced",
+      "wall_time_s": 364,
+      "switches": 37.0,
+      "switch_time_s": 350.49,
+      "requests": 35.0,
+      "gpu_serving_pct": "3.7",
+      "avg_wait_s": 11.42,
+      "failures": 0.0
+    },
+    {
+      "profile": "bursty",
+      "wall_time_s": 38,
+      "switches": 4.0,
+      "switch_time_s": 34.58,
+      "requests": 40.0,
+      "gpu_serving_pct": "9.0",
+      "avg_wait_s": 8.64,
+      "failures": 0.0
+    },
+    {
+      "profile": "dominant",
+      "wall_time_s": 23,
+      "switches": 3.0,
+      "switch_time_s": 22.53,
+      "requests": 50.0,
+      "gpu_serving_pct": "2.0",
+      "avg_wait_s": 7.48,
+      "failures": 0.0
+    },
+    {
+      "profile": "interleave",
+      "wall_time_s": 16,
+      "switches": 2.0,
+      "switch_time_s": 14.95,
+      "requests": 60.0,
+      "gpu_serving_pct": "6.6",
+      "avg_wait_s": 11.39,
+      "failures": 0.0
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "label": "cost_aware_v3",
+  "profiles": [
+    {
+      "profile": "single_model",
+      "wall_time_s": 2,
+      "switches": 0.0,
+      "switch_time_s": 0.0,
+      "requests": 41.0,
+      "gpu_serving_pct": "100.0",
+      "avg_wait_s": 0.0,
+      "failures": 0.0
+    },
+    {
+      "profile": "balanced",
+      "wall_time_s": 356,
+      "switches": 20.0,
+      "switch_time_s": 117.91,
+      "requests": 40.0,
+      "gpu_serving_pct": "66.9",
+      "avg_wait_s": 8.78,
+      "failures": 0.0
+    },
+    {
+      "profile": "bursty",
+      "wall_time_s": 34,
+      "switches": 3.0,
+      "switch_time_s": 20.19,
+      "requests": 40.0,
+      "gpu_serving_pct": "40.6",
+      "avg_wait_s": 8.15,
+      "failures": 0.0
+    },
+    {
+      "profile": "dominant",
+      "wall_time_s": 41,
+      "switches": 5.0,
+      "switch_time_s": 40.81,
+      "requests": 50.0,
+      "gpu_serving_pct": "0.5",
+      "avg_wait_s": 9.2,
+      "failures": 0.0
+    },
+    {
+      "profile": "interleave",
+      "wall_time_s": 16,
+      "switches": 2.0,
+      "switch_time_s": 15.76,
+      "requests": 60.0,
+      "gpu_serving_pct": "1.5",
+      "avg_wait_s": 10.68,
+      "failures": 0.0
+    }
+  ]
+}

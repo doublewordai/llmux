@@ -3,10 +3,11 @@
 //! The switcher tracks which model is active and coordinates transitions.
 
 use crate::orchestrator::{Orchestrator, OrchestratorError};
-use crate::policy::{PolicyContext, PolicyDecision, SwitchContext, SwitchPolicy};
+use crate::policy::{PolicyContext, PolicyDecision, ScheduleContext, SwitchContext, SwitchPolicy};
+use metrics::{counter, gauge, histogram};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot};
 use tracing::{debug, error, info, trace, warn};
@@ -74,7 +75,11 @@ struct PendingRequest {
 struct ModelState {
     in_flight: AtomicUsize,
     pending: Mutex<Vec<PendingRequest>>,
-    in_flight_changed: Notify,
+    in_flight_changed: Arc<Notify>,
+    /// Set to `true` while draining in-flight requests before sleep.
+    /// When true, `acquire_in_flight` will refuse new guards so that
+    /// no requests sneak in between drain completion and the actual sleep call.
+    draining: AtomicBool,
 }
 
 impl Default for ModelState {
@@ -82,7 +87,8 @@ impl Default for ModelState {
         Self {
             in_flight: AtomicUsize::new(0),
             pending: Mutex::new(Vec::new()),
-            in_flight_changed: Notify::new(),
+            in_flight_changed: Arc::new(Notify::new()),
+            draining: AtomicBool::new(false),
         }
     }
 }
@@ -215,12 +221,30 @@ impl ModelSwitcher {
         }
     }
 
-    /// Acquire an in-flight guard
+    /// Acquire an in-flight guard.
+    ///
+    /// Returns `None` if the model is not registered **or** if the model is
+    /// currently draining (about to be put to sleep). Uses increment-then-check
+    /// to close the TOCTOU window between `notify_pending` and the drain in
+    /// `do_switch`.
     pub fn acquire_in_flight(&self, model: &str) -> Option<InFlightGuard> {
         let model_state = self.inner.model_states.get(model)?;
-        model_state.in_flight.fetch_add(1, Ordering::SeqCst);
+
+        // Increment first so the drain sees our count if it checks concurrently.
+        let new_count = model_state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // If draining started, back out — the model is about to sleep.
+        if model_state.draining.load(Ordering::SeqCst) {
+            model_state.in_flight.fetch_sub(1, Ordering::SeqCst);
+            model_state.in_flight_changed.notify_waiters();
+            return None;
+        }
+
+        gauge!("llmux_in_flight", "model" => model.to_owned()).set(new_count as f64);
+
         Some(InFlightGuard {
             model_state: Arc::clone(model_state),
+            model_name: model.to_owned(),
         })
     }
 
@@ -248,12 +272,21 @@ impl ModelSwitcher {
                 _ => (None, 0),
             };
 
+            let active_duration = self
+                .inner
+                .activated_at
+                .read()
+                .await
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::ZERO);
+
             PolicyContext {
                 target_model: target_model.to_string(),
                 active_model,
                 target_queue_depth: queue.len(),
                 oldest_waiting,
                 active_in_flight,
+                active_duration,
             }
         };
 
@@ -284,12 +317,16 @@ impl ModelSwitcher {
                     switcher.do_switch(&target).await;
                 });
             }
+            PolicyDecision::Skip => {
+                trace!(model = %target_model, "Policy: skip (switch already arranged)");
+            }
         }
     }
 
     /// Perform the actual switch
     async fn do_switch(&self, target_model: &str) {
         let _guard = self.inner.switch_lock.lock().await;
+        let switch_start = Instant::now();
 
         // Backoff: if the last switch failed recently, wait before retrying
         {
@@ -338,26 +375,14 @@ impl ModelSwitcher {
             };
         }
 
+        let from_str = from_model.as_deref().unwrap_or("");
         info!(from = ?from_model, to = %target_model, "Starting model switch");
 
-        // Prepare switch (drain in-flight if needed)
-        if let Some(ref from) = from_model
-            && let Some(from_state) = self.inner.model_states.get(from)
-        {
-            let in_flight_drained = Arc::new(Notify::new());
-            let from_state_clone = Arc::clone(from_state);
-
-            let mut switch_ctx = SwitchContext::new(
-                from_model.clone(),
-                target_model.to_string(),
-                Arc::clone(&in_flight_drained),
-                Box::new(move || from_state_clone.in_flight.load(Ordering::SeqCst)),
-            );
-
-            self.inner.policy.prepare_switch(&mut switch_ctx).await;
-        }
-
-        // Cooldown: ensure the old model has been active long enough before sleeping
+        // Phase 1: Cooldown — ensure the old model has been active long enough
+        // before sleeping. Requests can still flow to the old model during this
+        // wait, which minimises the window where requests are rejected by the
+        // draining flag below.
+        let cooldown_start = Instant::now();
         if from_model.is_some() {
             let min_active = self.inner.policy.min_active_duration();
             let activated_at = *self.inner.activated_at.read().await;
@@ -373,9 +398,45 @@ impl ModelSwitcher {
                 }
             }
         }
+        let cooldown_dur = cooldown_start.elapsed();
 
-        // Sleep old model — use per-model sleep level from config, falling back
-        // to the global policy default if the model is somehow not in the config.
+        // Phase 2: Drain — set draining flag and wait for in-flight to complete.
+        let drain_start = Instant::now();
+
+        // Set draining flag *before* drain so that `acquire_in_flight` rejects
+        // new guards. This closes the TOCTOU race where `notify_pending` sends Ok
+        // but the middleware task hasn't acquired its guard yet — when the drain
+        // sees in_flight == 0 it would complete instantly, then those tasks would
+        // acquire guards and send requests to a sleeping model.
+        if let Some(ref from) = from_model
+            && let Some(from_state) = self.inner.model_states.get(from)
+        {
+            from_state.draining.store(true, Ordering::SeqCst);
+        }
+
+        // Drain in-flight requests (policy decides whether to wait).
+        // Pass the model's own `in_flight_changed` Notify so the drain wakes
+        // when InFlightGuard::drop fires.
+        if let Some(ref from) = from_model
+            && let Some(from_state) = self.inner.model_states.get(from)
+        {
+            let in_flight_changed = Arc::clone(&from_state.in_flight_changed);
+            let from_state_clone = Arc::clone(from_state);
+
+            let mut switch_ctx = SwitchContext::new(
+                from_model.clone(),
+                target_model.to_string(),
+                in_flight_changed,
+                Box::new(move || from_state_clone.in_flight.load(Ordering::SeqCst)),
+            );
+
+            self.inner.policy.prepare_switch(&mut switch_ctx).await;
+        }
+        let drain_dur = drain_start.elapsed();
+
+        // Phase 3: Sleep old model — use per-model sleep level from config,
+        // falling back to the global policy default.
+        let sleep_start = Instant::now();
         if let Some(ref from) = from_model {
             let level_raw = self
                 .inner
@@ -387,7 +448,16 @@ impl ModelSwitcher {
             self.inner.orchestrator.force_sleep(from, sleep_level).await;
         }
 
-        // Wake new model
+        // Clear draining flag now that sleep is complete
+        if let Some(ref from) = from_model
+            && let Some(from_state) = self.inner.model_states.get(from)
+        {
+            from_state.draining.store(false, Ordering::SeqCst);
+        }
+        let sleep_dur = sleep_start.elapsed();
+
+        // Phase 4: Wake new model
+        let wake_start = Instant::now();
         debug!(model = %target_model, "Waking model");
         match self.inner.orchestrator.wake_model(target_model).await {
             Ok(()) => {
@@ -402,6 +472,8 @@ impl ModelSwitcher {
                     tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
                 }
 
+                let wake_dur = wake_start.elapsed();
+
                 if ready {
                     info!(model = %target_model, "Model is now active");
                     {
@@ -412,6 +484,29 @@ impl ModelSwitcher {
                     }
                     *self.inner.activated_at.write().await = Some(Instant::now());
                     *self.inner.last_switch_failure.write().await = None;
+
+                    // Record switch metrics
+                    let total_dur = switch_start.elapsed();
+                    histogram!("llmux_switch_phase_seconds", "phase" => "cooldown", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(cooldown_dur.as_secs_f64());
+                    histogram!("llmux_switch_phase_seconds", "phase" => "drain", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(drain_dur.as_secs_f64());
+                    histogram!("llmux_switch_phase_seconds", "phase" => "sleep", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(sleep_dur.as_secs_f64());
+                    histogram!("llmux_switch_phase_seconds", "phase" => "wake", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(wake_dur.as_secs_f64());
+                    histogram!("llmux_switch_total_seconds", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(total_dur.as_secs_f64());
+                    counter!("llmux_switches_total", "from" => from_str.to_owned(), "to" => target_model.to_owned()).increment(1);
+
+                    // Notify policy of empirical switch timing
+                    self.inner.policy.on_switch_complete(
+                        from_str,
+                        target_model,
+                        total_dur,
+                    );
+
+                    // Update active model gauge
+                    if let Some(ref from) = from_model {
+                        gauge!("llmux_active_model_info", "model" => from.clone()).set(0.0);
+                    }
+                    gauge!("llmux_active_model_info", "model" => target_model.to_owned()).set(1.0);
+
                     self.notify_pending(target_model, Ok(())).await;
                 } else {
                     error!(model = %target_model, "Model failed to become ready");
@@ -425,6 +520,7 @@ impl ModelSwitcher {
                         let mut state = self.inner.state.write().await;
                         *state = SwitcherState::Idle;
                     }
+                    counter!("llmux_switch_failures_total", "to" => target_model.to_owned()).increment(1);
                     self.notify_pending(
                         target_model,
                         Err(SwitchError::NotReady(target_model.to_string())),
@@ -444,10 +540,76 @@ impl ModelSwitcher {
                     let mut state = self.inner.state.write().await;
                     *state = SwitcherState::Idle;
                 }
+                counter!("llmux_switch_failures_total", "to" => target_model.to_owned()).increment(1);
                 self.notify_pending(target_model, Err(SwitchError::Orchestrator(e)))
                     .await;
             }
         }
+    }
+
+    /// Get the queue depth for every registered model.
+    pub async fn queue_depths(&self) -> HashMap<String, usize> {
+        let mut depths = HashMap::new();
+        for (model, state) in &self.inner.model_states {
+            let queue = state.pending.lock().await;
+            depths.insert(model.clone(), queue.len());
+        }
+        depths
+    }
+
+    /// Build a ScheduleContext from current switcher state.
+    async fn build_schedule_context(&self) -> ScheduleContext {
+        let (active_model, active_in_flight) = match &*self.inner.state.read().await {
+            SwitcherState::Active { model } => {
+                (Some(model.clone()), self.in_flight_count(model))
+            }
+            _ => (None, 0),
+        };
+
+        let active_duration = self
+            .inner
+            .activated_at
+            .read()
+            .await
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
+
+        let queue_depths = self.queue_depths().await;
+
+        ScheduleContext {
+            active_model,
+            active_duration,
+            queue_depths,
+            active_in_flight,
+        }
+    }
+
+    /// Spawn a background scheduler task if the policy requests one.
+    ///
+    /// Returns `Some(JoinHandle)` if the scheduler was spawned, `None`
+    /// if the policy does not use a scheduler (i.e. `scheduler_interval`
+    /// returns `None`).
+    pub fn spawn_scheduler(self) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = self.inner.policy.scheduler_interval()?;
+
+        info!(
+            interval_ms = interval.as_millis(),
+            "Spawning background scheduler"
+        );
+
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tick.tick().await;
+                let ctx = self.build_schedule_context().await;
+                if let Some(target) = self.inner.policy.schedule_tick(&ctx) {
+                    debug!(target = %target, "Scheduler: triggering switch");
+                    self.do_switch(&target).await;
+                }
+            }
+        }))
     }
 
     /// Notify pending requests
@@ -472,11 +634,13 @@ impl ModelSwitcher {
 /// Guard that tracks in-flight requests
 pub struct InFlightGuard {
     model_state: Arc<ModelState>,
+    model_name: String,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         let prev = self.model_state.in_flight.fetch_sub(1, Ordering::SeqCst);
+        gauge!("llmux_in_flight", "model" => self.model_name.clone()).set((prev - 1) as f64);
         if prev == 1 {
             self.model_state.in_flight_changed.notify_waiters();
         }
@@ -538,5 +702,37 @@ mod tests {
         }
 
         assert_eq!(switcher.in_flight_count("model-a"), 0);
+    }
+
+    #[test]
+    fn test_acquire_in_flight_rejected_while_draining() {
+        let orchestrator = make_test_orchestrator();
+        let policy = Box::new(FifoPolicy::default());
+        let switcher = ModelSwitcher::new(orchestrator, policy);
+
+        // Acquire should succeed when not draining
+        let guard = switcher.acquire_in_flight("model-a");
+        assert!(guard.is_some());
+        assert_eq!(switcher.in_flight_count("model-a"), 1);
+        drop(guard);
+
+        // Set draining flag
+        let model_state = switcher.inner.model_states.get("model-a").unwrap();
+        model_state.draining.store(true, Ordering::SeqCst);
+
+        // Acquire should now return None
+        let guard = switcher.acquire_in_flight("model-a");
+        assert!(guard.is_none());
+        // In-flight count should remain 0 (increment was backed out)
+        assert_eq!(switcher.in_flight_count("model-a"), 0);
+
+        // Clear draining flag
+        model_state.draining.store(false, Ordering::SeqCst);
+
+        // Acquire should succeed again
+        let guard = switcher.acquire_in_flight("model-a");
+        assert!(guard.is_some());
+        assert_eq!(switcher.in_flight_count("model-a"), 1);
+        drop(guard);
     }
 }

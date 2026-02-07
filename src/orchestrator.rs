@@ -429,25 +429,31 @@ impl Orchestrator {
             }
         };
 
-        info!(model = %model, "Waking model");
+        info!(model = %model, sleep_level = ?actual_sleep_level, "Waking model from sleep");
 
         let base_url = format!("http://localhost:{}", config.port);
 
-        // POST /wake_up
+        // Step 1: POST /wake_up
+        info!(model = %model, "Wake step 1/3: POST /wake_up");
         self.post_request(
             &format!("{}/wake_up", base_url),
             None,
             Duration::from_secs(30),
         )
         .await
-        .map_err(|e| OrchestratorError::WakeFailed {
-            model: model.to_string(),
-            reason: e,
+        .map_err(|e| {
+            error!(model = %model, error = %e, "Wake step 1/3 FAILED: /wake_up returned error");
+            OrchestratorError::WakeFailed {
+                model: model.to_string(),
+                reason: e,
+            }
         })?;
+        info!(model = %model, "Wake step 1/3: /wake_up succeeded");
 
         // For L2 sleep, need to reload weights
         if actual_sleep_level == SleepLevel::L2 {
-            debug!(model = %model, "L2 sleep: reloading weights");
+            // Step 2: POST /collective_rpc (reload_weights)
+            info!(model = %model, "Wake step 2/3: POST /collective_rpc (reload_weights)");
 
             if let Err(e) = self
                 .post_request(
@@ -459,14 +465,17 @@ impl Orchestrator {
             {
                 // L2 reload failed — model is partially woken, consuming GPU memory.
                 // Force it back to sleep to free GPU memory before returning error.
-                warn!(model = %model, error = %e, "L2 reload failed, forcing model back to sleep");
+                error!(model = %model, error = %e, "Wake step 2/3 FAILED: reload_weights returned error");
                 self.force_sleep(model, SleepLevel::Stop).await;
                 return Err(OrchestratorError::WakeFailed {
                     model: model.to_string(),
                     reason: e,
                 });
             }
+            info!(model = %model, "Wake step 2/3: reload_weights succeeded");
 
+            // Step 3: POST /reset_prefix_cache
+            info!(model = %model, "Wake step 3/3: POST /reset_prefix_cache");
             self.post_request(
                 &format!("{}/reset_prefix_cache", base_url),
                 None,
@@ -474,10 +483,11 @@ impl Orchestrator {
             )
             .await
             .map_err(|e| {
-                warn!(model = %model, error = %e, "Failed to reset prefix cache");
+                warn!(model = %model, error = %e, "Wake step 3/3: reset_prefix_cache failed (non-fatal)");
                 // Don't fail on cache reset
             })
             .ok();
+            info!(model = %model, "Wake step 3/3: reset_prefix_cache done");
         }
 
         // Update state
@@ -615,7 +625,7 @@ impl Orchestrator {
         body: Option<&str>,
         timeout: Duration,
     ) -> Result<(), String> {
-        use http_body_util::Full;
+        use http_body_util::{BodyExt, Full};
         use hyper::Request;
 
         let client: hyper_util::client::legacy::Client<_, Full<bytes::Bytes>> =
@@ -648,7 +658,25 @@ impl Orchestrator {
             match tokio::time::timeout(timeout, client.request(request)).await {
                 Ok(Ok(response)) if response.status().is_success() => return Ok(()),
                 Ok(Ok(response)) => {
-                    last_err = format!("Request failed with status: {}", response.status());
+                    let status = response.status();
+                    let body_str = match response.into_body().collect().await {
+                        Ok(collected) => {
+                            let bytes = collected.to_bytes();
+                            String::from_utf8_lossy(&bytes).into_owned()
+                        }
+                        Err(e) => format!("(failed to read body: {e})"),
+                    };
+                    let body_preview = if body_str.len() > 2000 {
+                        format!(
+                            "{}...[truncated, {} total]",
+                            &body_str[..2000],
+                            body_str.len()
+                        )
+                    } else {
+                        body_str
+                    };
+                    warn!(url, %status, body = %body_preview, "vLLM endpoint returned error");
+                    last_err = format!("HTTP {status}: {body_preview}");
                 }
                 Ok(Err(e)) => {
                     last_err = format!("Request failed: {}", e);

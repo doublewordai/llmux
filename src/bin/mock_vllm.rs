@@ -85,7 +85,7 @@ struct MockState {
     model: String,
     sleeping: RwLock<bool>,
     sleep_level: RwLock<u8>,
-    latency: Duration,
+    latency: RwLock<Duration>,
     request_count: RwLock<u64>,
     /// When true, /sleep returns 500 (for testing L3 fallback)
     fail_sleep: RwLock<bool>,
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         model: model.clone(),
         sleeping: RwLock::new(false),
         sleep_level: RwLock::new(0),
-        latency: Duration::from_millis(args.latency_ms),
+        latency: RwLock::new(Duration::from_millis(args.latency_ms)),
         request_count: RwLock::new(0),
         fail_sleep: RwLock::new(false),
         fail_wake: RwLock::new(false),
@@ -149,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/control/fail-sleep", post(control_fail_sleep))
         .route("/control/fail-wake", post(control_fail_wake))
         .route("/control/sleep-delay", post(control_sleep_delay))
+        .route("/control/latency", post(control_latency))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
@@ -316,7 +317,7 @@ async fn chat_completions(
     }
 
     // Simulate latency
-    tokio::time::sleep(state.latency).await;
+    tokio::time::sleep(*state.latency.read().await).await;
 
     // Increment request count
     {
@@ -473,5 +474,20 @@ async fn control_sleep_delay(
 ) -> impl IntoResponse {
     info!(delay_ms = body.delay_ms, "Setting sleep_delay_ms");
     *state.sleep_delay_ms.write().await = body.delay_ms;
+    StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct ControlLatency {
+    latency_ms: u64,
+}
+
+/// Control endpoint: set request latency
+async fn control_latency(
+    State(state): State<Arc<MockState>>,
+    Json(body): Json<ControlLatency>,
+) -> impl IntoResponse {
+    info!(latency_ms = body.latency_ms, "Setting latency");
+    *state.latency.write().await = Duration::from_millis(body.latency_ms);
     StatusCode::OK
 }

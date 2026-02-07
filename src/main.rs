@@ -90,9 +90,23 @@ async fn main() -> Result<()> {
     }
 
     // Build the application
-    let app = llmux::build_app(config.clone())
+    let (app, metrics_router) = llmux::build_app(config.clone())
         .await
         .context("Failed to build application")?;
+
+    // Spawn metrics server if enabled
+    if let Some(metrics_router) = metrics_router {
+        let metrics_addr = format!("0.0.0.0:{}", config.metrics_port);
+        let metrics_listener = TcpListener::bind(&metrics_addr)
+            .await
+            .with_context(|| format!("Failed to bind metrics to {}", metrics_addr))?;
+        info!(addr = %metrics_addr, "Serving metrics");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, metrics_router).await {
+                tracing::error!(error = %e, "Metrics server error");
+            }
+        });
+    }
 
     // Start server
     let addr = format!("0.0.0.0:{}", config.port);

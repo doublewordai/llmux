@@ -1,6 +1,6 @@
 //! Configuration for llmux
 
-use crate::policy::{FifoPolicy, SwitchPolicy};
+use crate::policy::{CostAwarePolicy, FifoPolicy, SwitchPolicy, TimeSlicePolicy};
 use anyhow::{Context, Result};
 use onwards::target::Targets;
 use serde::{Deserialize, Serialize};
@@ -136,9 +136,9 @@ impl ModelConfig {
 }
 
 /// Policy configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
-    /// Policy type: "fifo" (default) or "batching"
+    /// Policy type: "fifo" (default) or "cost_aware"
     #[serde(default = "default_policy_type")]
     pub policy_type: String,
 
@@ -158,6 +158,48 @@ pub struct PolicyConfig {
     /// Prevents rapid wake/sleep thrashing that can cause GPU page faults.
     #[serde(default = "default_min_active_secs")]
     pub min_active_secs: u64,
+
+    /// (cost_aware) Coalescing window in milliseconds. On the first request
+    /// for a non-active model, wait this long to collect more demand.
+    #[serde(default = "default_coalesce_window_ms")]
+    pub coalesce_window_ms: u64,
+
+    /// (cost_aware) Amortization factor. Higher values require more pending
+    /// requests before switching. 0.0 = always switch immediately.
+    #[serde(default = "default_amortization_factor")]
+    pub amortization_factor: f64,
+
+    /// (cost_aware) Maximum wait in seconds before forcing a switch,
+    /// regardless of cost calculations.
+    #[serde(default = "default_max_wait_secs")]
+    pub max_wait_secs: u64,
+
+    /// (time_slice) Scheduler tick interval in milliseconds. Controls how
+    /// often the background scheduler evaluates queue depths.
+    #[serde(default = "default_tick_interval_ms")]
+    pub tick_interval_ms: u64,
+
+    /// (time_slice) Minimum quantum in milliseconds. Each model gets at
+    /// least this much GPU time before the scheduler considers switching.
+    #[serde(default = "default_min_quantum_ms")]
+    pub min_quantum_ms: u64,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            policy_type: default_policy_type(),
+            request_timeout_secs: default_request_timeout(),
+            drain_before_switch: default_drain_before_switch(),
+            sleep_level: default_sleep_level(),
+            min_active_secs: default_min_active_secs(),
+            coalesce_window_ms: default_coalesce_window_ms(),
+            amortization_factor: default_amortization_factor(),
+            max_wait_secs: default_max_wait_secs(),
+            tick_interval_ms: default_tick_interval_ms(),
+            min_quantum_ms: default_min_quantum_ms(),
+        }
+    }
 }
 
 fn default_policy_type() -> String {
@@ -165,7 +207,7 @@ fn default_policy_type() -> String {
 }
 
 fn default_request_timeout() -> u64 {
-    60
+    300
 }
 
 fn default_drain_before_switch() -> bool {
@@ -176,17 +218,56 @@ fn default_min_active_secs() -> u64 {
     5
 }
 
+fn default_coalesce_window_ms() -> u64 {
+    2000
+}
+
+fn default_amortization_factor() -> f64 {
+    0.5
+}
+
+fn default_max_wait_secs() -> u64 {
+    15
+}
+
+fn default_tick_interval_ms() -> u64 {
+    500
+}
+
+fn default_min_quantum_ms() -> u64 {
+    2000
+}
+
 impl PolicyConfig {
-    /// Build a SwitchPolicy from this config
-    pub fn build_policy(&self) -> Box<dyn SwitchPolicy> {
-        // Currently only FIFO policy is implemented
-        // Future: add other policy types like "batching"
-        Box::new(FifoPolicy::new(
-            self.sleep_level,
-            Duration::from_secs(self.request_timeout_secs),
-            self.drain_before_switch,
-            Duration::from_secs(self.min_active_secs),
-        ))
+    /// Build a SwitchPolicy from this config.
+    /// `model_names` is needed for cost_aware policy to pre-populate timing tables.
+    pub fn build_policy(&self, model_names: &[String]) -> Box<dyn SwitchPolicy> {
+        match self.policy_type.as_str() {
+            "cost_aware" => Box::new(CostAwarePolicy::new(
+                self.sleep_level,
+                Duration::from_secs(self.request_timeout_secs),
+                Duration::from_secs(self.min_active_secs),
+                Duration::from_millis(self.coalesce_window_ms),
+                self.amortization_factor,
+                Duration::from_secs(self.max_wait_secs),
+                model_names.to_vec(),
+            )),
+            "time_slice" => Box::new(TimeSlicePolicy::new(
+                self.sleep_level,
+                Duration::from_secs(self.request_timeout_secs),
+                Duration::from_secs(self.min_active_secs),
+                Duration::from_secs(self.max_wait_secs),
+                Duration::from_millis(self.min_quantum_ms),
+                Duration::from_millis(self.tick_interval_ms),
+                model_names.to_vec(),
+            )),
+            _ => Box::new(FifoPolicy::new(
+                self.sleep_level,
+                Duration::from_secs(self.request_timeout_secs),
+                self.drain_before_switch,
+                Duration::from_secs(self.min_active_secs),
+            )),
+        }
     }
 }
 
