@@ -864,6 +864,7 @@ async fn test_end_to_end_single_model() {
         port: proxy_port,
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
+        checkpoint: None,
     };
 
     // Build the full app stack
@@ -969,6 +970,7 @@ async fn test_end_to_end_model_switching() {
         port: proxy_port,
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
+        checkpoint: None,
     };
 
     // Build the full app stack
@@ -1095,6 +1097,7 @@ async fn test_end_to_end_unknown_model_passthrough() {
         port: proxy_port,
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
+        checkpoint: None,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(
@@ -1447,6 +1450,7 @@ async fn test_end_to_end_concurrent_requests() {
         port: proxy_port,
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
+        checkpoint: None,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(

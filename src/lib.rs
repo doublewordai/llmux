@@ -43,7 +43,7 @@ mod policy;
 mod switcher;
 pub mod validate;
 
-pub use config::{Config, ModelConfig, PolicyConfig};
+pub use config::{CheckpointConfig, Config, ModelConfig, PolicyConfig};
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
 pub use orchestrator::{Orchestrator, OrchestratorError, ProcessState};
 pub use policy::{
@@ -65,9 +65,10 @@ pub async fn build_app(config: Config) -> Result<(axum::Router, Option<axum::Rou
     info!("Building llmux with {} models", config.models.len());
 
     // Create orchestrator with configured command
-    let orchestrator = Arc::new(Orchestrator::with_command(
+    let orchestrator = Arc::new(Orchestrator::with_options(
         config.models.clone(),
         config.vllm_command.clone(),
+        config.checkpoint.clone(),
     ));
 
     // Create policy

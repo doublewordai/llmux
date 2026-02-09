@@ -3,19 +3,21 @@
     "llama-7b": {
       "model_path": "meta-llama/Llama-2-7b-chat-hf",
       "port": 8001,
-      "gpu_memory_utilization": 0.9,
-      "tensor_parallel_size": 1,
-      "dtype": "auto",
-      "sleep_level": 1
+      "sleep_level": 1,
+      "extra_args": ["--gpu-memory-utilization", "0.9"]
     },
     "mistral-7b": {
       "model_path": "mistralai/Mistral-7B-Instruct-v0.2",
       "port": 8002,
-      "gpu_memory_utilization": 0.9,
-      "tensor_parallel_size": 1,
-      "dtype": "auto",
-      "sleep_level": 1
+      "sleep_level": 4,
+      "extra_args": ["--gpu-memory-utilization", "0.9"]
     }
+  },
+  "checkpoint": {
+    "criu_path": "criu",
+    "cuda_plugin_dir": "/usr/lib/criu/",
+    "images_dir": "/tmp/llmux-checkpoints",
+    "cuda_checkpoint_path": "cuda-checkpoint"
   },
   "policy": {
     "policy_type": "fifo",
