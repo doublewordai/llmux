@@ -31,7 +31,7 @@ struct Args {
     #[arg(long, value_name = "MODEL")]
     validate: Option<String>,
 
-    /// Sleep levels to validate (default: all). Comma-separated: 1,2
+    /// Sleep levels to validate (default: all). Comma-separated: 1,2,3,4
     #[arg(
         long,
         value_name = "LEVELS",

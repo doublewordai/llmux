@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use onwards::target::Targets;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Top-level configuration
@@ -30,10 +30,54 @@ pub struct Config {
     /// Can be overridden for testing with mock-vllm
     #[serde(default = "default_vllm_command")]
     pub vllm_command: String,
+
+    /// CRIU/CUDA checkpoint configuration (enables sleep levels 3 and 4)
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointConfig>,
+}
+
+/// Configuration for CUDA/CRIU-based checkpointing (sleep levels 3 and 4).
+///
+/// When present, enables `SleepLevel::Checkpoint` which uses `cuda-checkpoint`
+/// and `criu` to snapshot the entire vLLM process to disk, freeing all GPU
+/// memory while preserving full state (KV cache, CUDA graphs, warmed allocator).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointConfig {
+    /// Path to the criu binary (default: "criu" on PATH)
+    #[serde(default = "default_criu_path")]
+    pub criu_path: String,
+
+    /// Directory containing the CUDA checkpoint plugin (libcuda_plugin.so)
+    #[serde(default = "default_cuda_plugin_dir")]
+    pub cuda_plugin_dir: String,
+
+    /// Base directory for checkpoint images (per-model subdirectories are created)
+    #[serde(default = "default_images_dir")]
+    pub images_dir: PathBuf,
+
+    /// Path to cuda-checkpoint binary (default: "cuda-checkpoint" on PATH)
+    #[serde(default = "default_cuda_checkpoint_path")]
+    pub cuda_checkpoint_path: String,
 }
 
 fn default_vllm_command() -> String {
     "vllm".to_string()
+}
+
+fn default_criu_path() -> String {
+    "criu".to_string()
+}
+
+fn default_cuda_plugin_dir() -> String {
+    "/usr/lib/criu/".to_string()
+}
+
+fn default_images_dir() -> PathBuf {
+    PathBuf::from("/tmp/llmux-checkpoints")
+}
+
+fn default_cuda_checkpoint_path() -> String {
+    "cuda-checkpoint".to_string()
 }
 
 fn default_port() -> u16 {
@@ -110,13 +154,15 @@ pub struct ModelConfig {
     /// Sleep level when hibernating:
     /// - 1: Offload weights to CPU RAM (fastest wake)
     /// - 2: Discard weights (slower wake, less RAM)
-    /// - 3: Stop the vLLM process entirely (slowest wake, frees all GPU memory)
+    /// - 3: CUDA suspend (process stays alive, GPU freed, state in host RAM)
+    /// - 4: CRIU checkpoint (snapshot to disk, frees all GPU/CPU memory)
+    /// - 5: Stop the vLLM process entirely (full restart on wake)
     #[serde(default = "default_sleep_level")]
     pub sleep_level: u8,
 }
 
 fn default_sleep_level() -> u8 {
-    3
+    5
 }
 
 impl ModelConfig {
@@ -150,7 +196,7 @@ pub struct PolicyConfig {
     #[serde(default = "default_drain_before_switch")]
     pub drain_before_switch: bool,
 
-    /// Default sleep level (1, 2, or 3)
+    /// Default sleep level (1-5)
     #[serde(default = "default_sleep_level")]
     pub sleep_level: u8,
 

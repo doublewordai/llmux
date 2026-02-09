@@ -19,7 +19,13 @@ pub enum SleepLevel {
     L1,
     /// Level 2: Discard weights (slower wake, less RAM)
     L2,
-    /// Level 3: Stop the vLLM process entirely (slowest wake, frees all GPU memory)
+    /// Level 3: CUDA suspend via cuda-checkpoint toggle (process stays alive,
+    /// GPU freed, VRAM contents held in host RAM, full state preserved)
+    CudaSuspend,
+    /// Level 4: CRIU checkpoint (snapshot process to disk, frees all GPU/CPU memory,
+    /// preserves full state including KV cache, CUDA graphs, and warmed allocator)
+    Checkpoint,
+    /// Level 5: Stop the vLLM process entirely (full restart on wake)
     Stop,
 }
 
@@ -27,7 +33,9 @@ impl From<u8> for SleepLevel {
     fn from(level: u8) -> Self {
         match level {
             2 => SleepLevel::L2,
-            3 => SleepLevel::Stop,
+            3 => SleepLevel::CudaSuspend,
+            4 => SleepLevel::Checkpoint,
+            5 => SleepLevel::Stop,
             _ => SleepLevel::L1,
         }
     }

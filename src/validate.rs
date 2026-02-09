@@ -52,9 +52,10 @@ pub async fn run_validation(
     let mut models = HashMap::new();
     models.insert(model_name.to_string(), model_config.clone());
 
-    let orchestrator = Arc::new(Orchestrator::with_command(
+    let orchestrator = Arc::new(Orchestrator::with_options(
         models,
         config.vllm_command.clone(),
+        config.checkpoint.clone(),
     ));
 
     // Start the model
@@ -111,7 +112,7 @@ pub async fn run_validation(
     }
 
     // Cleanup: stop the model
-    println!("\nStopping model (L3)...");
+    println!("\nStopping model (L5)...");
     let _ = orchestrator.sleep_model(model_name, SleepLevel::Stop).await;
 
     // Print results table
@@ -278,6 +279,8 @@ fn print_results(results: &[LevelResult]) {
         let level_str = match r.level {
             SleepLevel::L1 => "L1",
             SleepLevel::L2 => "L2",
+            SleepLevel::CudaSuspend => "CudaSus",
+            SleepLevel::Checkpoint => "CRIU",
             SleepLevel::Stop => "Stop",
         };
 
