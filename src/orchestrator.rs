@@ -55,9 +55,10 @@ struct ManagedProcess {
     child: Option<Child>,
     /// Notifies waiters when process becomes ready
     ready_notify: Arc<Notify>,
-    /// PID of the engine core child process (holds GPU memory).
+    /// PIDs of processes holding GPU memory (engine core + TP workers).
     /// Discovered after startup for checkpoint-enabled models.
-    engine_core_pid: Option<u32>,
+    /// With TP=1 this is a single PID; with TP>1 one per rank.
+    engine_core_pids: Vec<u32>,
 }
 
 /// Strip ANSI escape sequences from a string.
@@ -79,52 +80,84 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Find the engine core child process PID (the one that holds GPU memory).
+/// Find all descendant processes that hold GPU memory.
 ///
-/// vLLM spawns a child process tree; the engine core is typically named
-/// something like "vllm.engine_core" or "VLLM:EngineCore". We look for
-/// child processes of the given parent PID by scanning /proc.
-fn find_engine_core_pid(parent_pid: u32) -> Option<u32> {
-    // Use pgrep to find child processes
-    let output = std::process::Command::new("pgrep")
-        .args(["-P", &parent_pid.to_string()])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
+/// vLLM spawns a child process tree. With TP=1, there's a single EngineCore
+/// process. With TP>1, the EngineCore spawns worker processes (one per rank),
+/// each holding a GPU. We find all descendants that have NVIDIA device
+/// mappings in /proc/PID/maps.
+fn find_gpu_pids(parent_pid: u32) -> Vec<u32> {
+    let all_descendants = find_all_descendants(parent_pid);
+    if all_descendants.is_empty() {
+        return vec![];
     }
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let child_pids: Vec<u32> = text
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
+    // Filter to processes that have NVIDIA GPU mappings
+    let gpu_pids: Vec<u32> = all_descendants
+        .iter()
+        .copied()
+        .filter(|&pid| has_nvidia_mappings(pid))
         .collect();
 
-    if child_pids.is_empty() {
-        return None;
+    if !gpu_pids.is_empty() {
+        return gpu_pids;
     }
 
-    // Look for the engine core process specifically by checking /proc/PID/cmdline
-    for &pid in &child_pids {
-        let cmdline_path = format!("/proc/{}/cmdline", pid);
-        if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
-            if cmdline.contains("EngineCore") || cmdline.contains("engine_core") {
-                return Some(pid);
-            }
+    // Fallback: look for processes named EngineCore
+    let engine_pids: Vec<u32> = all_descendants
+        .iter()
+        .copied()
+        .filter(|&pid| {
+            let cmdline_path = format!("/proc/{}/cmdline", pid);
+            std::fs::read_to_string(&cmdline_path)
+                .map(|c| c.contains("EngineCore") || c.contains("engine_core"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if !engine_pids.is_empty() {
+        return engine_pids;
+    }
+
+    // Last resort: return all direct children
+    find_child_pids(parent_pid)
+}
+
+/// Check if a process has NVIDIA GPU device mappings.
+fn has_nvidia_mappings(pid: u32) -> bool {
+    let maps_path = format!("/proc/{}/maps", pid);
+    std::fs::read_to_string(&maps_path)
+        .map(|maps| maps.contains("/dev/nvidia"))
+        .unwrap_or(false)
+}
+
+/// Get direct child PIDs of a process.
+fn find_child_pids(pid: u32) -> Vec<u32> {
+    let output = std::process::Command::new("pgrep")
+        .args(["-P", &pid.to_string()])
+        .output()
+        .ok();
+
+    match output {
+        Some(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect()
         }
+        _ => vec![],
     }
+}
 
-    // If we can't identify the engine core by name, check grandchildren too.
-    // The engine core may be a grandchild (vllm -> multiprocessing -> EngineCore).
-    for &pid in &child_pids {
-        if let Some(engine_pid) = find_engine_core_pid(pid) {
-            return Some(engine_pid);
-        }
+/// Recursively find all descendant PIDs of a process.
+fn find_all_descendants(pid: u32) -> Vec<u32> {
+    let mut result = Vec::new();
+    let children = find_child_pids(pid);
+    for &child in &children {
+        result.push(child);
+        result.extend(find_all_descendants(child));
     }
-
-    // Fall back to the first child if nothing matched
-    Some(child_pids[0])
+    result
 }
 
 /// Tail a log file, forwarding new lines as debug-level tracing events.
@@ -212,7 +245,7 @@ impl Orchestrator {
                     state: ProcessState::NotStarted,
                     child: None,
                     ready_notify: Arc::new(Notify::new()),
-                    engine_core_pid: None,
+                    engine_core_pids: vec![],
                 })),
             );
         }
@@ -222,7 +255,7 @@ impl Orchestrator {
             processes,
             operation_lock: Mutex::new(()),
             health_timeout: Duration::from_secs(5),
-            startup_timeout: Duration::from_secs(300), // 5 minutes for large models
+            startup_timeout: Duration::from_secs(600), // 10 minutes for large TP models
             vllm_command,
             checkpoint_config,
         }
@@ -485,21 +518,19 @@ impl Orchestrator {
                 Ok(true) => {
                     info!(model = %model, "vLLM process is ready");
                     let mut guard = process.lock().await;
-                    // Discover engine core PID for cuda-checkpoint-enabled models
-                    // (CudaSuspend and Checkpoint). vLLM spawns a child process
-                    // (EngineCore_DP0) that holds the actual GPU memory.
+                    // Discover GPU-holding PIDs for cuda-checkpoint-enabled models
+                    // (CudaSuspend and Checkpoint). With TP=1 this is a single
+                    // EngineCore process; with TP>1 one process per rank.
                     if needs_cuda_checkpoint {
                         if let Some(ref child) = guard.child {
                             if let Some(pid) = child.id() {
-                                match find_engine_core_pid(pid) {
-                                    Some(engine_pid) => {
-                                        info!(model = %model, pid, engine_pid, "Found engine core PID");
-                                        guard.engine_core_pid = Some(engine_pid);
-                                    }
-                                    None => {
-                                        warn!(model = %model, pid, "Could not find engine core PID, will use parent PID for cuda-checkpoint");
-                                        guard.engine_core_pid = Some(pid);
-                                    }
+                                let gpu_pids = find_gpu_pids(pid);
+                                if gpu_pids.is_empty() {
+                                    warn!(model = %model, pid, "Could not find GPU processes, will use parent PID for cuda-checkpoint");
+                                    guard.engine_core_pids = vec![pid];
+                                } else {
+                                    info!(model = %model, pid, gpu_pids = ?gpu_pids, "Found {} GPU process(es)", gpu_pids.len());
+                                    guard.engine_core_pids = gpu_pids;
                                 }
                             }
                         }
@@ -782,7 +813,7 @@ impl Orchestrator {
                 info!(model = %model, "Cleaning up checkpoint images");
                 let _ = std::fs::remove_dir_all(images_dir);
                 guard.state = ProcessState::NotStarted;
-                guard.engine_core_pid = None;
+                guard.engine_core_pids.clear();
                 return Ok(());
             }
 
@@ -796,13 +827,27 @@ impl Orchestrator {
                 let _ = child.wait().await;
             }
             guard.child = None;
-            guard.engine_core_pid = None;
+            guard.engine_core_pids.clear();
             guard.state = ProcessState::NotStarted;
             info!(model = %model, "vLLM process stopped");
             return Ok(());
         }
 
         if level == SleepLevel::CudaSuspend {
+            // cuda-checkpoint does not support NCCL/IPC memory (required for TP>1).
+            // See: https://github.com/NVIDIA/cuda-checkpoint/issues/30
+            let gpu_count = process.lock().await.engine_core_pids.len();
+            if gpu_count > 1 {
+                return Err(OrchestratorError::SleepFailed {
+                    model: model.to_string(),
+                    reason: format!(
+                        "CudaSuspend does not support tensor parallelism (TP={}) — \
+                         cuda-checkpoint cannot restore NCCL IPC memory. \
+                         Use sleep level 1, 2, or 5 instead.",
+                        gpu_count
+                    ),
+                });
+            }
             self.cuda_suspend_toggle(model, &process, true).await?;
             let mut guard = process.lock().await;
             guard.state = ProcessState::Running {
@@ -813,6 +858,19 @@ impl Orchestrator {
         }
 
         if level == SleepLevel::Checkpoint {
+            // CRIU checkpoint also uses cuda-checkpoint internally, so same NCCL limitation
+            let gpu_count = process.lock().await.engine_core_pids.len();
+            if gpu_count > 1 {
+                return Err(OrchestratorError::SleepFailed {
+                    model: model.to_string(),
+                    reason: format!(
+                        "CRIU Checkpoint does not support tensor parallelism (TP={}) — \
+                         cuda-checkpoint cannot restore NCCL IPC memory. \
+                         Use sleep level 1, 2, or 5 instead.",
+                        gpu_count
+                    ),
+                });
+            }
             return self.checkpoint_model(model, &process).await;
         }
 
@@ -848,6 +906,8 @@ impl Orchestrator {
     /// When `suspend` is true, CUDA state is suspended (VRAM copied to host RAM,
     /// GPU memory freed). When false, CUDA state is resumed (copied back to GPU).
     /// The process stays alive throughout.
+    ///
+    /// With TP>1, toggles each GPU-holding process sequentially.
     async fn cuda_suspend_toggle(
         &self,
         model: &str,
@@ -862,40 +922,49 @@ impl Orchestrator {
             }
         })?;
 
-        let engine_pid = {
+        let pids = {
             let guard = process.lock().await;
-            guard.engine_core_pid.ok_or_else(|| OrchestratorError::SleepFailed {
-                model: model.to_string(),
-                reason: "No engine core PID available for cuda-checkpoint".to_string(),
-            })?
+            if guard.engine_core_pids.is_empty() {
+                return Err(OrchestratorError::SleepFailed {
+                    model: model.to_string(),
+                    reason: "No GPU PIDs available for cuda-checkpoint".to_string(),
+                });
+            }
+            guard.engine_core_pids.clone()
         };
 
         let action = if suspend { "suspend" } else { "resume" };
-        info!(model = %model, engine_pid, action, "cuda-checkpoint --toggle");
+        info!(model = %model, pids = ?pids, action, "cuda-checkpoint --toggle ({} process(es))", pids.len());
 
-        let output = tokio::process::Command::new("sudo")
-            .args([
-                &ckpt_cfg.cuda_checkpoint_path,
-                "--toggle",
-                "--pid",
-                &engine_pid.to_string(),
-            ])
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::SleepFailed {
-                model: model.to_string(),
-                reason: format!("Failed to run cuda-checkpoint: {}", e),
-            })?;
+        for (i, &pid) in pids.iter().enumerate() {
+            let output = tokio::process::Command::new("sudo")
+                .args([
+                    &ckpt_cfg.cuda_checkpoint_path,
+                    "--toggle",
+                    "--pid",
+                    &pid.to_string(),
+                ])
+                .output()
+                .await
+                .map_err(|e| OrchestratorError::SleepFailed {
+                    model: model.to_string(),
+                    reason: format!("Failed to run cuda-checkpoint for PID {}: {}", pid, e),
+                })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(OrchestratorError::SleepFailed {
-                model: model.to_string(),
-                reason: format!("cuda-checkpoint --toggle ({}) failed: {}", action, stderr),
-            });
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(OrchestratorError::SleepFailed {
+                    model: model.to_string(),
+                    reason: format!(
+                        "cuda-checkpoint --toggle ({}) failed for PID {} [{}/{}]: {}",
+                        action, pid, i + 1, pids.len(), stderr
+                    ),
+                });
+            }
+            debug!(model = %model, pid, "[{}/{}] toggled", i + 1, pids.len());
         }
 
-        info!(model = %model, action, "cuda-checkpoint toggle succeeded");
+        info!(model = %model, action, "cuda-checkpoint toggle succeeded for all {} process(es)", pids.len());
         Ok(())
     }
 
@@ -916,16 +985,14 @@ impl Orchestrator {
             }
         })?;
 
-        let (parent_pid, engine_pid) = {
+        let parent_pid = {
             let guard = process.lock().await;
-            let parent_pid = guard.child.as_ref().and_then(|c| c.id()).ok_or_else(|| {
+            guard.child.as_ref().and_then(|c| c.id()).ok_or_else(|| {
                 OrchestratorError::SleepFailed {
                     model: model.to_string(),
                     reason: "No child PID available for checkpoint".to_string(),
                 }
-            })?;
-            let engine_pid = guard.engine_core_pid.unwrap_or(parent_pid);
-            (parent_pid, engine_pid)
+            })?
         };
 
         // Prepare images directory (clean up old checkpoint first)
@@ -941,30 +1008,9 @@ impl Orchestrator {
             reason: format!("Failed to create images dir: {}", e),
         })?;
 
-        // Step 1: Toggle CUDA checkpoint (suspends CUDA, copies VRAM to host)
-        info!(model = %model, engine_pid, "Checkpoint step 1/2: cuda-checkpoint --toggle");
-        let cuda_toggle = tokio::process::Command::new("sudo")
-            .args([
-                &ckpt_cfg.cuda_checkpoint_path,
-                "--toggle",
-                "--pid",
-                &engine_pid.to_string(),
-            ])
-            .output()
-            .await
-            .map_err(|e| OrchestratorError::SleepFailed {
-                model: model.to_string(),
-                reason: format!("Failed to run cuda-checkpoint: {}", e),
-            })?;
-
-        if !cuda_toggle.status.success() {
-            let stderr = String::from_utf8_lossy(&cuda_toggle.stderr);
-            return Err(OrchestratorError::SleepFailed {
-                model: model.to_string(),
-                reason: format!("cuda-checkpoint --toggle failed: {}", stderr),
-            });
-        }
-        info!(model = %model, "cuda-checkpoint toggle succeeded");
+        // Step 1: Toggle CUDA checkpoint on all GPU processes
+        info!(model = %model, "Checkpoint step 1/2: cuda-checkpoint --toggle");
+        self.cuda_suspend_toggle(model, process, true).await?;
 
         // Step 2: CRIU dump (snapshots process tree to disk, kills it)
         info!(model = %model, parent_pid, "Checkpoint step 2/2: criu dump");
