@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/doublewordai/llmux/compare/v0.3.1...v0.4.0) - 2026-02-10
+
+### Added
+
+- support NCCL suspend/resume for TP>1 cuda-checkpoint ([#11](https://github.com/doublewordai/llmux/pull/11))
+- add CRIU checkpoint and CUDA suspend sleep levels
+- add drain-first TimeSlice scheduling policy
+
+### Fixed
+
+- reject TP>1 for CUDA suspend/checkpoint, discover all GPU PIDs
+
 ## [0.3.1](https://github.com/doublewordai/llmux/compare/v0.3.0...v0.3.1) - 2026-02-05
 
 ### Fixed
