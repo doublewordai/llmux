@@ -93,8 +93,7 @@ pub async fn build_app(config: Config) -> Result<(axum::Router, Option<axum::Rou
 
     // Install metrics layer and build metrics router if enabled
     let metrics_router = if config.metrics_port > 0 {
-        let (prometheus_layer, handle) =
-            onwards::build_metrics_layer_and_handle("llmux");
+        let (prometheus_layer, handle) = onwards::build_metrics_layer_and_handle("llmux");
         app = app.layer(prometheus_layer);
         Some(onwards::build_metrics_router(handle))
     } else {

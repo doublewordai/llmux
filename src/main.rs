@@ -71,6 +71,9 @@ async fn main() -> Result<()> {
         config.port = port;
     }
 
+    // Validate configuration (warns about misconfigurations)
+    config.validate();
+
     info!(
         models = ?config.models.keys().collect::<Vec<_>>(),
         port = config.port,

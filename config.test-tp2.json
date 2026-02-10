@@ -1,0 +1,22 @@
+{
+  "models": {
+    "llama-8b": {
+      "model_path": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+      "port": 8005,
+      "sleep_level": 3,
+      "extra_args": [
+        "--max-model-len", "512",
+        "--gpu-memory-utilization", "0.85",
+        "--enforce-eager",
+        "--disable-custom-all-reduce",
+        "--tensor-parallel-size", "2"
+      ]
+    }
+  },
+  "checkpoint": {
+    "cuda_checkpoint_path": "cuda-checkpoint"
+  },
+  "vllm_command": "/home/fergus/.local/bin/vllm",
+  "port": 3333,
+  "metrics_port": 0
+}

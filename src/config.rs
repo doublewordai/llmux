@@ -99,6 +99,54 @@ impl Config {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
+    /// Validate configuration, warning about common misconfigurations.
+    ///
+    /// Checks that models using CudaSuspend (level 3) or Checkpoint (level 4)
+    /// with tensor parallelism have the required vLLM flags.
+    pub fn validate(&self) {
+        use tracing::warn;
+
+        for (name, model) in &self.models {
+            let level = model.sleep_level;
+            if level != 3 && level != 4 {
+                continue;
+            }
+
+            // Parse --tensor-parallel-size from extra_args
+            let tp = model.tensor_parallel_size();
+            if tp <= 1 {
+                continue;
+            }
+
+            let level_name = if level == 3 {
+                "CudaSuspend"
+            } else {
+                "Checkpoint"
+            };
+
+            if !model.extra_args.contains(&"--enforce-eager".to_string()) {
+                warn!(
+                    model = %name,
+                    "Model uses {} at TP={} but is missing --enforce-eager. \
+                     CUDA graphs hold stale NCCL handles and will crash on resume.",
+                    level_name, tp
+                );
+            }
+
+            if !model
+                .extra_args
+                .contains(&"--disable-custom-all-reduce".to_string())
+            {
+                warn!(
+                    model = %name,
+                    "Model uses {} at TP={} but is missing --disable-custom-all-reduce. \
+                     CustomAllReduce IPC buffers cannot survive cuda-checkpoint.",
+                    level_name, tp
+                );
+            }
+        }
+    }
+
     /// Build onwards Targets from model configs
     pub fn build_onwards_targets(&self) -> Result<Targets> {
         use dashmap::DashMap;
@@ -166,6 +214,15 @@ fn default_sleep_level() -> u8 {
 }
 
 impl ModelConfig {
+    /// Parse tensor parallel size from extra_args (default: 1)
+    pub fn tensor_parallel_size(&self) -> usize {
+        self.extra_args
+            .windows(2)
+            .find(|w| w[0] == "--tensor-parallel-size")
+            .and_then(|w| w[1].parse().ok())
+            .unwrap_or(1)
+    }
+
     /// Build vLLM command line arguments
     pub fn vllm_args(&self) -> Vec<String> {
         let mut args = vec![

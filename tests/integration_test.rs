@@ -1334,9 +1334,8 @@ async fn test_drain_waits_for_in_flight_before_sleep() {
     // Step 3: Trigger switch to model-b on a background task.
     // The switch will drain model-a (waiting for in-flight to reach 0).
     let switcher_bg = switcher.clone();
-    let switch_handle = tokio::spawn(async move {
-        switcher_bg.ensure_model_ready("model-b").await
-    });
+    let switch_handle =
+        tokio::spawn(async move { switcher_bg.ensure_model_ready("model-b").await });
 
     // Give the switch task time to start the drain
     tokio::time::sleep(Duration::from_millis(100)).await;
