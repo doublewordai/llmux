@@ -11,7 +11,7 @@ use crate::switcher::SleepLevel;
 use anyhow::Result;
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,12 +139,10 @@ fn find_child_pids(pid: u32) -> Vec<u32> {
         .ok();
 
     match output {
-        Some(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| line.trim().parse::<u32>().ok())
-                .collect()
-        }
+        Some(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect(),
         _ => vec![],
     }
 }
@@ -195,6 +193,17 @@ async fn tail_log_file(path: PathBuf, model: String, stream: &'static str) {
             }
             Err(_) => break,
         }
+    }
+}
+
+/// Build a command, prefixing with `sudo` only if we're not already root.
+fn maybe_sudo(program: &str) -> tokio::process::Command {
+    if unsafe { libc::geteuid() } == 0 {
+        tokio::process::Command::new(program)
+    } else {
+        let mut cmd = tokio::process::Command::new("sudo");
+        cmd.arg(program);
+        cmd
     }
 }
 
@@ -334,7 +343,9 @@ impl Orchestrator {
             let guard = process.lock().await;
             if matches!(
                 guard.state,
-                ProcessState::Running { .. } | ProcessState::Starting | ProcessState::Checkpointed { .. }
+                ProcessState::Running { .. }
+                    | ProcessState::Starting
+                    | ProcessState::Checkpointed { .. }
             ) {
                 return Ok(());
             }
@@ -370,8 +381,10 @@ impl Orchestrator {
         // - Checkpoint (CRIU) additionally needs file-based stdio and io_uring disabled
         // - Stop doesn't need anything special
         let model_level = SleepLevel::from(config.sleep_level);
-        let needs_cuda_checkpoint =
-            matches!(model_level, SleepLevel::CudaSuspend | SleepLevel::Checkpoint);
+        let needs_cuda_checkpoint = matches!(
+            model_level,
+            SleepLevel::CudaSuspend | SleepLevel::Checkpoint
+        );
         let needs_criu = matches!(model_level, SleepLevel::Checkpoint);
 
         let args = if needs_cuda_checkpoint {
@@ -403,10 +416,8 @@ impl Orchestrator {
             cmd.env("USE_LIBUV", "0");
         }
 
-        if !needs_cuda_checkpoint {
-            // Dev mode required for vLLM sleep/wake API endpoints
-            cmd.env("VLLM_SERVER_DEV_MODE", "1");
-        }
+        // Dev mode required for vLLM sleep/wake and collective_rpc API endpoints
+        cmd.env("VLLM_SERVER_DEV_MODE", "1");
 
         // CRIU cannot checkpoint unix stream socket FDs (pipes). For
         // CRIU-enabled models, redirect stdout/stderr to files and tail
@@ -521,18 +532,17 @@ impl Orchestrator {
                     // Discover GPU-holding PIDs for cuda-checkpoint-enabled models
                     // (CudaSuspend and Checkpoint). With TP=1 this is a single
                     // EngineCore process; with TP>1 one process per rank.
-                    if needs_cuda_checkpoint {
-                        if let Some(ref child) = guard.child {
-                            if let Some(pid) = child.id() {
-                                let gpu_pids = find_gpu_pids(pid);
-                                if gpu_pids.is_empty() {
-                                    warn!(model = %model, pid, "Could not find GPU processes, will use parent PID for cuda-checkpoint");
-                                    guard.engine_core_pids = vec![pid];
-                                } else {
-                                    info!(model = %model, pid, gpu_pids = ?gpu_pids, "Found {} GPU process(es)", gpu_pids.len());
-                                    guard.engine_core_pids = gpu_pids;
-                                }
-                            }
+                    if needs_cuda_checkpoint
+                        && let Some(ref child) = guard.child
+                        && let Some(pid) = child.id()
+                    {
+                        let gpu_pids = find_gpu_pids(pid);
+                        if gpu_pids.is_empty() {
+                            warn!(model = %model, pid, "Could not find GPU processes, will use parent PID for cuda-checkpoint");
+                            guard.engine_core_pids = vec![pid];
+                        } else {
+                            info!(model = %model, pid, gpu_pids = ?gpu_pids, "Found {} GPU process(es)", gpu_pids.len());
+                            guard.engine_core_pids = gpu_pids;
                         }
                     }
                     guard.state = ProcessState::Running { sleeping: None };
@@ -683,9 +693,27 @@ impl Orchestrator {
 
         info!(model = %model, sleep_level = ?actual_sleep_level, "Waking model from sleep");
 
-        // CudaSuspend: just toggle CUDA back on, no vLLM API needed
+        // CudaSuspend: toggle CUDA back on, then rebuild NCCL for TP>1
         if actual_sleep_level == SleepLevel::CudaSuspend {
             self.cuda_suspend_toggle(model, &process, false).await?;
+
+            // For TP>1: rebuild NCCL communicators after cuda-checkpoint restore
+            let gpu_count = process.lock().await.engine_core_pids.len();
+            if gpu_count > 1 {
+                let base_url = format!("http://localhost:{}", config.port);
+                info!(model = %model, tp = gpu_count, "Resuming NCCL communicators");
+                self.post_request(
+                    &format!("{}/collective_rpc", base_url),
+                    Some(r#"{"method": "resume_nccl"}"#),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| OrchestratorError::WakeFailed {
+                    model: model.to_string(),
+                    reason: format!("Failed to resume NCCL: {}", e),
+                })?;
+            }
+
             let mut guard = process.lock().await;
             guard.state = ProcessState::Running { sleeping: None };
             info!(model = %model, "Model resumed from CUDA suspend");
@@ -788,7 +816,13 @@ impl Orchestrator {
             match &guard.state {
                 ProcessState::Running {
                     sleeping: Some(_), ..
-                } if !matches!(level, SleepLevel::Stop | SleepLevel::Checkpoint | SleepLevel::CudaSuspend) => return Ok(()),
+                } if !matches!(
+                    level,
+                    SleepLevel::Stop | SleepLevel::Checkpoint | SleepLevel::CudaSuspend
+                ) =>
+                {
+                    return Ok(());
+                }
                 ProcessState::Running { .. } => {
                     // Proceed with sleep (awake, or sleeping but Stop/Checkpoint requested)
                 }
@@ -834,20 +868,25 @@ impl Orchestrator {
         }
 
         if level == SleepLevel::CudaSuspend {
-            // cuda-checkpoint does not support NCCL/IPC memory (required for TP>1).
-            // See: https://github.com/NVIDIA/cuda-checkpoint/issues/30
             let gpu_count = process.lock().await.engine_core_pids.len();
+            let base_url = format!("http://localhost:{}", config.port);
+
+            // For TP>1: tear down NCCL communicators before cuda-checkpoint
+            // (NCCL IPC handles cannot be checkpointed)
             if gpu_count > 1 {
-                return Err(OrchestratorError::SleepFailed {
+                info!(model = %model, tp = gpu_count, "Suspending NCCL communicators");
+                self.post_request(
+                    &format!("{}/collective_rpc", base_url),
+                    Some(r#"{"method": "suspend_nccl"}"#),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| OrchestratorError::SleepFailed {
                     model: model.to_string(),
-                    reason: format!(
-                        "CudaSuspend does not support tensor parallelism (TP={}) — \
-                         cuda-checkpoint cannot restore NCCL IPC memory. \
-                         Use sleep level 1, 2, or 5 instead.",
-                        gpu_count
-                    ),
-                });
+                    reason: format!("Failed to suspend NCCL: {}", e),
+                })?;
             }
+
             self.cuda_suspend_toggle(model, &process, true).await?;
             let mut guard = process.lock().await;
             guard.state = ProcessState::Running {
@@ -858,19 +897,24 @@ impl Orchestrator {
         }
 
         if level == SleepLevel::Checkpoint {
-            // CRIU checkpoint also uses cuda-checkpoint internally, so same NCCL limitation
             let gpu_count = process.lock().await.engine_core_pids.len();
+
+            // For TP>1: tear down NCCL communicators before cuda-checkpoint
             if gpu_count > 1 {
-                return Err(OrchestratorError::SleepFailed {
+                let base_url = format!("http://localhost:{}", config.port);
+                info!(model = %model, tp = gpu_count, "Suspending NCCL communicators");
+                self.post_request(
+                    &format!("{}/collective_rpc", base_url),
+                    Some(r#"{"method": "suspend_nccl"}"#),
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| OrchestratorError::SleepFailed {
                     model: model.to_string(),
-                    reason: format!(
-                        "CRIU Checkpoint does not support tensor parallelism (TP={}) — \
-                         cuda-checkpoint cannot restore NCCL IPC memory. \
-                         Use sleep level 1, 2, or 5 instead.",
-                        gpu_count
-                    ),
-                });
+                    reason: format!("Failed to suspend NCCL: {}", e),
+                })?;
             }
+
             return self.checkpoint_model(model, &process).await;
         }
 
@@ -907,20 +951,21 @@ impl Orchestrator {
     /// GPU memory freed). When false, CUDA state is resumed (copied back to GPU).
     /// The process stays alive throughout.
     ///
-    /// With TP>1, toggles each GPU-holding process sequentially.
+    /// With TP>1, toggles all GPU-holding processes in parallel.
     async fn cuda_suspend_toggle(
         &self,
         model: &str,
         process: &Arc<Mutex<ManagedProcess>>,
         suspend: bool,
     ) -> Result<(), OrchestratorError> {
-        let ckpt_cfg = self.checkpoint_config.as_ref().ok_or_else(|| {
-            OrchestratorError::SleepFailed {
-                model: model.to_string(),
-                reason: "CudaSuspend requires checkpoint config (for cuda_checkpoint_path)"
-                    .to_string(),
-            }
-        })?;
+        let ckpt_cfg =
+            self.checkpoint_config
+                .as_ref()
+                .ok_or_else(|| OrchestratorError::SleepFailed {
+                    model: model.to_string(),
+                    reason: "CudaSuspend requires checkpoint config (for cuda_checkpoint_path)"
+                        .to_string(),
+                })?;
 
         let pids = {
             let guard = process.lock().await;
@@ -934,34 +979,48 @@ impl Orchestrator {
         };
 
         let action = if suspend { "suspend" } else { "resume" };
-        info!(model = %model, pids = ?pids, action, "cuda-checkpoint --toggle ({} process(es))", pids.len());
+        info!(model = %model, pids = ?pids, action, "cuda-checkpoint --toggle ({} process(es), parallel)", pids.len());
 
-        for (i, &pid) in pids.iter().enumerate() {
-            let output = tokio::process::Command::new("sudo")
-                .args([
-                    &ckpt_cfg.cuda_checkpoint_path,
-                    "--toggle",
-                    "--pid",
-                    &pid.to_string(),
-                ])
-                .output()
-                .await
-                .map_err(|e| OrchestratorError::SleepFailed {
-                    model: model.to_string(),
-                    reason: format!("Failed to run cuda-checkpoint for PID {}: {}", pid, e),
-                })?;
+        let mut set = tokio::task::JoinSet::new();
+        for pid in &pids {
+            let pid = *pid;
+            let cuda_checkpoint_path = ckpt_cfg.cuda_checkpoint_path.clone();
+            set.spawn(async move {
+                let output = maybe_sudo(&cuda_checkpoint_path)
+                    .args(["--toggle", "--pid", &pid.to_string()])
+                    .output()
+                    .await
+                    .map_err(|e| (pid, format!("Failed to run cuda-checkpoint: {}", e)))?;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(OrchestratorError::SleepFailed {
-                    model: model.to_string(),
-                    reason: format!(
-                        "cuda-checkpoint --toggle ({}) failed for PID {} [{}/{}]: {}",
-                        action, pid, i + 1, pids.len(), stderr
-                    ),
-                });
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err((pid, format!("cuda-checkpoint failed: {}", stderr)));
+                }
+                Ok(pid)
+            });
+        }
+
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok(Ok(pid)) => {
+                    debug!(model = %model, pid, action, "cuda-checkpoint toggled");
+                }
+                Ok(Err((pid, reason))) => {
+                    return Err(OrchestratorError::SleepFailed {
+                        model: model.to_string(),
+                        reason: format!(
+                            "cuda-checkpoint --toggle ({}) failed for PID {}: {}",
+                            action, pid, reason
+                        ),
+                    });
+                }
+                Err(e) => {
+                    return Err(OrchestratorError::SleepFailed {
+                        model: model.to_string(),
+                        reason: format!("cuda-checkpoint task panicked: {}", e),
+                    });
+                }
             }
-            debug!(model = %model, pid, "[{}/{}] toggled", i + 1, pids.len());
         }
 
         info!(model = %model, action, "cuda-checkpoint toggle succeeded for all {} process(es)", pids.len());
@@ -978,12 +1037,13 @@ impl Orchestrator {
         model: &str,
         process: &Arc<Mutex<ManagedProcess>>,
     ) -> Result<(), OrchestratorError> {
-        let ckpt_cfg = self.checkpoint_config.as_ref().ok_or_else(|| {
-            OrchestratorError::SleepFailed {
-                model: model.to_string(),
-                reason: "Checkpoint level requested but no checkpoint config".to_string(),
-            }
-        })?;
+        let ckpt_cfg =
+            self.checkpoint_config
+                .as_ref()
+                .ok_or_else(|| OrchestratorError::SleepFailed {
+                    model: model.to_string(),
+                    reason: "Checkpoint level requested but no checkpoint config".to_string(),
+                })?;
 
         let parent_pid = {
             let guard = process.lock().await;
@@ -1014,9 +1074,8 @@ impl Orchestrator {
 
         // Step 2: CRIU dump (snapshots process tree to disk, kills it)
         info!(model = %model, parent_pid, "Checkpoint step 2/2: criu dump");
-        let criu_dump = tokio::process::Command::new("sudo")
+        let criu_dump = maybe_sudo(&ckpt_cfg.criu_path)
             .args([
-                &ckpt_cfg.criu_path,
                 "dump",
                 "--shell-job",
                 "--ext-unix-sk",
@@ -1070,14 +1129,15 @@ impl Orchestrator {
     async fn restore_checkpoint(
         &self,
         model: &str,
-        images_dir: &PathBuf,
+        images_dir: &Path,
     ) -> Result<(), OrchestratorError> {
-        let ckpt_cfg = self.checkpoint_config.as_ref().ok_or_else(|| {
-            OrchestratorError::WakeFailed {
-                model: model.to_string(),
-                reason: "Checkpoint config missing for restore".to_string(),
-            }
-        })?;
+        let ckpt_cfg =
+            self.checkpoint_config
+                .as_ref()
+                .ok_or_else(|| OrchestratorError::WakeFailed {
+                    model: model.to_string(),
+                    reason: "Checkpoint config missing for restore".to_string(),
+                })?;
 
         let config = self
             .configs
@@ -1087,9 +1147,8 @@ impl Orchestrator {
         info!(model = %model, images_dir = %images_dir.display(), "Restoring from CRIU checkpoint");
 
         // Run criu restore
-        let criu_restore = tokio::process::Command::new("sudo")
+        let criu_restore = maybe_sudo(&ckpt_cfg.criu_path)
             .args([
-                &ckpt_cfg.criu_path,
                 "restore",
                 "--shell-job",
                 "--ext-unix-sk",

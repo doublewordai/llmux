@@ -503,11 +503,9 @@ impl ModelSwitcher {
                     counter!("llmux_switches_total", "from" => from_str.to_owned(), "to" => target_model.to_owned()).increment(1);
 
                     // Notify policy of empirical switch timing
-                    self.inner.policy.on_switch_complete(
-                        from_str,
-                        target_model,
-                        total_dur,
-                    );
+                    self.inner
+                        .policy
+                        .on_switch_complete(from_str, target_model, total_dur);
 
                     // Update active model gauge
                     if let Some(ref from) = from_model {
@@ -528,7 +526,8 @@ impl ModelSwitcher {
                         let mut state = self.inner.state.write().await;
                         *state = SwitcherState::Idle;
                     }
-                    counter!("llmux_switch_failures_total", "to" => target_model.to_owned()).increment(1);
+                    counter!("llmux_switch_failures_total", "to" => target_model.to_owned())
+                        .increment(1);
                     self.notify_pending(
                         target_model,
                         Err(SwitchError::NotReady(target_model.to_string())),
@@ -548,7 +547,8 @@ impl ModelSwitcher {
                     let mut state = self.inner.state.write().await;
                     *state = SwitcherState::Idle;
                 }
-                counter!("llmux_switch_failures_total", "to" => target_model.to_owned()).increment(1);
+                counter!("llmux_switch_failures_total", "to" => target_model.to_owned())
+                    .increment(1);
                 self.notify_pending(target_model, Err(SwitchError::Orchestrator(e)))
                     .await;
             }
@@ -568,9 +568,7 @@ impl ModelSwitcher {
     /// Build a ScheduleContext from current switcher state.
     async fn build_schedule_context(&self) -> ScheduleContext {
         let (active_model, active_in_flight) = match &*self.inner.state.read().await {
-            SwitcherState::Active { model } => {
-                (Some(model.clone()), self.in_flight_count(model))
-            }
+            SwitcherState::Active { model } => (Some(model.clone()), self.in_flight_count(model)),
             _ => (None, 0),
         };
 

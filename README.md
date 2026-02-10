@@ -34,8 +34,8 @@ lifecycle. Only one model is active at a time - the rest are sleeping
 |-------|-------|------|-----------|---------|-----------------|----------|
 | **L1** | Slow (offload to CPU) | Fast (~1s) | Most | High (holds weights) | Partial | Model you expect to return to soon |
 | **L2** | Fast (~1s) | Slow (reload from disk) | Most | None | No (KV cache, CUDA graphs lost) | Model you may not need for a while |
-| **L3** (CUDA suspend) | Fast (~3s) | Fast (~3s) | All (100%) | High (holds VRAM) | Full | Like L1, but frees 100% GPU; works with vLLM v0.14+. **TP=1 only.** |
-| **L4** (CRIU) | ~27s (checkpoint to disk) | ~15s (restore) | All (100%) | None | Full (KV cache, CUDA graphs, allocator) | Many models; works with vLLM v0.14+. **TP=1 only.** |
+| **L3** (CUDA suspend) | Fast (~3s, ~15s at TP=2) | Fast (~3s, ~7s at TP=2) | All (100%) | High (holds VRAM) | Full | Like L1, but frees 100% GPU |
+| **L4** (CRIU) | ~27s (checkpoint to disk) | ~15s (restore) | All (100%) | None | Full (KV cache, CUDA graphs, allocator) | Many models; lowest resource usage while sleeping |
 | **L5** | Kill process | Cold start | All | None | No | Fallback / cleanup |
 
 If L1-L4 sleep fails, llmux automatically escalates to L5 (kill) to guarantee
@@ -48,18 +48,16 @@ RAM. The process stays alive — no serialization, no CRIU. Wake is just another
 toggle to copy state back to GPU.
 
 Like L1, this holds state in CPU RAM. Unlike L1, it frees 100% of GPU memory
-(L1 keeps ~500 MiB for CUDA context) and preserves full state. Doesn't require
-vLLM's sleep API, so it works with vLLM v0.14+ where sleep mode is broken.
+(L1 keeps ~500 MiB for CUDA context) and preserves full state.
+
+For TP>1, llmux coordinates NCCL teardown before checkpoint and rebuild after
+restore. This requires patched vLLM with `suspend_nccl`/`resume_nccl` support
+(included in the Docker image).
 
 **Requirements:**
-- `cuda-checkpoint` utility
+- `cuda-checkpoint` utility (included in Docker image)
 - Root access (or passwordless `sudo` for `cuda-checkpoint`)
-
-**Limitations:**
-- **TP=1 only** — `cuda-checkpoint` does not support NCCL IPC memory, so it cannot
-  checkpoint/restore processes that communicate via NCCL (i.e., tensor parallel workers).
-  See [NVIDIA/cuda-checkpoint#30](https://github.com/NVIDIA/cuda-checkpoint/issues/30).
-  For TP>1 models, use L1/L2 (vLLM sleep) or L5 (kill).
+- For TP>1: `--enforce-eager` and `--disable-custom-all-reduce` in `extra_args`
 
 #### CRIU checkpoint (level 4)
 
@@ -70,19 +68,15 @@ graphs, and the warmed memory allocator. First inference after restore is ~30ms
 (no warmup needed).
 
 **Requirements:**
-- CRIU 4.x with the CUDA plugin (`libcuda_plugin.so`)
-- `cuda-checkpoint` utility
+- CRIU 4.x with the CUDA plugin (`libcuda_plugin.so`) (included in Docker image)
+- `cuda-checkpoint` utility (included in Docker image)
 - Root access (or passwordless `sudo` for `criu` and `cuda-checkpoint`)
 - vLLM process must not use `io_uring` or `libuv` (set automatically)
-
-**Limitations:**
-- **TP=1 only** — same `cuda-checkpoint` NCCL limitation as L3.
+- For TP>1: `--enforce-eager` and `--disable-custom-all-reduce` in `extra_args`
 
 **Trade-offs vs L1/L2:**
 - Slower sleep/wake than L1, but no CPU RAM cost and full state preservation
 - Slower wake than L1 but faster first-inference (no warmup)
-- Works with vLLM v0.14+ where sleep mode is broken
-- No need for `--enable-sleep-mode` or `VLLM_SERVER_DEV_MODE`
 
 ## Quickstart
 
@@ -108,7 +102,8 @@ Create a `config.json`:
 
 ### With Docker (recommended)
 
-The Docker image bundles vLLM v0.13.0:
+The Docker image bundles vLLM v0.15.1 with patches for NCCL suspend/resume
+and sleep mode fixes:
 
 ```bash
 docker run --gpus all --init \
@@ -118,6 +113,26 @@ docker run --gpus all --init \
   ghcr.io/doublewordai/llmux:latest
 ```
 
+For sleep levels 3 and 4 (cuda-checkpoint/CRIU), additional flags are required:
+
+```bash
+docker run --gpus all --init \
+  --pid=host \
+  --ipc=host \
+  --cap-add SYS_PTRACE \
+  --cap-add CHECKPOINT_RESTORE \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ./config.json:/etc/llmux/config.json:ro \
+  -p 3000:3000 \
+  ghcr.io/doublewordai/llmux:latest
+```
+
+The extra flags are needed because:
+- `--pid=host` — cuda-checkpoint needs to ptrace vLLM worker PIDs
+- `--ipc=host` — NCCL uses shared memory for inter-GPU communication
+- `--cap-add SYS_PTRACE` — cuda-checkpoint's ptrace calls
+- `--cap-add CHECKPOINT_RESTORE` — CRIU process checkpoint/restore
+
 ### From source
 
 Requires vLLM installed and available as `vllm` on PATH:
@@ -126,6 +141,9 @@ Requires vLLM installed and available as `vllm` on PATH:
 cargo install llmux
 llmux --config config.json
 ```
+
+For sleep levels 3 and 4, you also need `cuda-checkpoint` and `criu` (with
+CUDA plugin) installed and either run as root or configure passwordless sudo.
 
 ### Send requests
 
@@ -163,6 +181,30 @@ All vLLM-specific flags (e.g. `--gpu-memory-utilization`, `--tensor-parallel-siz
 }
 ```
 
+#### Tensor parallelism with L3/L4
+
+When using sleep levels 3 or 4 with TP>1, you **must** include `--enforce-eager`
+and `--disable-custom-all-reduce` in `extra_args`:
+
+```json
+{
+  "model_path": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+  "port": 8001,
+  "sleep_level": 3,
+  "extra_args": [
+    "--tensor-parallel-size", "2",
+    "--enforce-eager",
+    "--disable-custom-all-reduce",
+    "--gpu-memory-utilization", "0.85"
+  ]
+}
+```
+
+- `--enforce-eager` — CUDA graphs hold stale NCCL handles and crash on resume
+- `--disable-custom-all-reduce` — CustomAllReduce IPC buffers cannot survive cuda-checkpoint
+
+llmux validates the config at startup and warns if these flags are missing.
+
 ### Top-level options
 
 | Field | Default | Description |
@@ -173,7 +215,7 @@ All vLLM-specific flags (e.g. `--gpu-memory-utilization`, `--tensor-parallel-siz
 
 ### Checkpoint config (for sleep levels 3 and 4)
 
-To use CRIU checkpointing, add a `checkpoint` section to your config:
+To use cuda-checkpoint or CRIU, add a `checkpoint` section to your config:
 
 ```json
 {
@@ -181,12 +223,22 @@ To use CRIU checkpointing, add a `checkpoint` section to your config:
     "qwen-14b": {
       "model_path": "Qwen/Qwen3-14B",
       "port": 8001,
-      "sleep_level": 4
+      "sleep_level": 3
     }
   },
   "checkpoint": {
-    "criu_path": "/tmp/criu/criu/criu",
-    "cuda_plugin_dir": "/tmp/criu/plugins/cuda/",
+    "cuda_checkpoint_path": "cuda-checkpoint"
+  }
+}
+```
+
+For CRIU checkpointing (level 4), the full config is:
+
+```json
+{
+  "checkpoint": {
+    "criu_path": "criu",
+    "cuda_plugin_dir": "/usr/lib/criu/",
     "images_dir": "/tmp/llmux-checkpoints",
     "cuda_checkpoint_path": "cuda-checkpoint"
   }
@@ -249,7 +301,54 @@ L2              0.3        8.2      44033 MiB       1341 MiB      44033 MiB     
 Result: ALL PASSED
 ```
 
-## Docker Compose with onwards
+## Docker Compose
+
+### Basic setup
+
+```yaml
+services:
+  llmux:
+    image: ghcr.io/doublewordai/llmux:latest
+    init: true
+    command: ["--config", "/etc/llmux/config.json"]
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./config.json:/etc/llmux/config.json:ro
+    ports:
+      - "3000:3000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+```
+
+### With cuda-checkpoint/CRIU (sleep levels 3 and 4)
+
+```yaml
+services:
+  llmux:
+    image: ghcr.io/doublewordai/llmux:latest
+    init: true
+    command: ["--config", "/etc/llmux/config.json"]
+    pid: host
+    ipc: host
+    cap_add:
+      - SYS_PTRACE
+      - CHECKPOINT_RESTORE
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./config.json:/etc/llmux/config.json:ro
+    ports:
+      - "3000:3000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+```
+
+### With onwards (API key auth)
 
 For production, put [onwards](https://github.com/doublewordai/onwards) in
 front for API key authentication:
@@ -260,6 +359,11 @@ services:
     image: ghcr.io/doublewordai/llmux:latest
     init: true
     command: ["--config", "/etc/llmux/config.json"]
+    pid: host
+    ipc: host
+    cap_add:
+      - SYS_PTRACE
+      - CHECKPOINT_RESTORE
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - ./config.json:/etc/llmux/config.json:ro
@@ -297,10 +401,38 @@ Where `targets.json` maps model names to llmux with API keys:
 }
 ```
 
+## Tensor parallelism
+
+All sleep levels work with TP>1:
+
+| Level | TP>1 | Notes |
+|-------|------|-------|
+| L1 | Yes | vLLM manages NCCL teardown/rebuild internally |
+| L2 | Yes | Same — vLLM handles it |
+| L3 | Yes | llmux tears down NCCL before cuda-checkpoint, rebuilds after restore |
+| L4 | Yes | Same — NCCL teardown before checkpoint, rebuild after restore |
+| L5 | Yes | Kill + cold restart always works |
+
+For L3 and L4, llmux uses vLLM's `/collective_rpc` endpoint to call
+`suspend_nccl` (before cuda-checkpoint) and `resume_nccl` (after restore)
+on all TP workers. This tears down NCCL IPC handles that cuda-checkpoint
+cannot checkpoint, then rebuilds them after CUDA state is restored.
+
+This requires patched vLLM with `suspend_nccl`/`resume_nccl` support. The
+Docker image includes these patches. For bare-metal installs, apply
+`patches/nccl-suspend-resume-v0.15.1.patch` to your vLLM installation.
+
 ## Known issues
 
 The `--validate` flag exists specifically to catch these kinds of problems
 before they hit production.
+
+### vLLM v0.14+ sleep regression
+
+Sleep mode (L1/L2) has a regression where weights are not discarded from GPU
+memory ([vllm#32714](https://github.com/vllm-project/vllm/issues/32714)).
+The Docker image includes a patch (`fix-sleep-mode-v0.15.1.patch`) that fixes
+this. For bare-metal installs, apply the patch or use L3/L5 instead.
 
 ### vLLM v0.13.0
 
@@ -311,115 +443,16 @@ before they hit production.
 - L1 and L2 both work correctly for `Qwen/Qwen3-14B` and
   `google/gemma-3-12b-it`.
 
-### vLLM v0.14+
+### NVIDIA driver requirements
 
-Sleep mode (L1/L2) is broken — weights are not discarded from GPU memory
-regardless of sleep level ([vllm#32714](https://github.com/vllm-project/vllm/issues/32714)).
-Use CUDA suspend (L3) or CRIU checkpointing (L4) on v0.14+ instead, or stick with v0.13.x for L1/L2.
+The Docker image uses vLLM v0.15.1 which requires CUDA 12.9 and
+nvidia-driver-580 or later. Check your driver version with `nvidia-smi`.
 
 ## Compatibility
 
-- **L1/L2 sleep:** Requires vLLM v0.13.x (broken on v0.14+)
-- **L3 CUDA suspend / L4 CRIU checkpoint:** Works with any vLLM version (tested on v0.13.x and v0.14+). **TP=1 only.**
-
-## Tensor parallelism and sleep levels
-
-L3 (CudaSuspend) and L4 (CRIU checkpoint) only work with TP=1. Both depend on
-`cuda-checkpoint`, which [does not support NCCL IPC memory](https://github.com/NVIDIA/cuda-checkpoint/issues/30).
-With TP>1, suspend works (GPU memory is freed), but restore fails because the
-inter-process NCCL communication channels cannot be reconstructed — workers end
-up in a broken spin-loop.
-
-**What works today for TP>1:**
-
-| Level | TP>1 | Notes |
-|-------|------|-------|
-| L1 | Yes | vLLM manages NCCL teardown/rebuild internally |
-| L2 | Yes | Same — vLLM handles it |
-| L3 | No | `cuda-checkpoint` can't restore NCCL IPC handles |
-| L4 | No | Same — CRIU uses `cuda-checkpoint` internally |
-| L5 | Yes | Kill + cold restart always works |
-
-### Future: hybrid L2 + cuda-checkpoint for TP>1
-
-A promising approach is to combine vLLM's sleep API (which handles NCCL
-teardown/rebuild at the application level) with `cuda-checkpoint` (which frees
-the remaining GPU memory that vLLM doesn't release). The orchestrator would
-coordinate a two-phase sleep/wake:
-
-**Sleep sequence:**
-1. `POST /sleep?level=2` — vLLM tears down NCCL communicators, discards weights.
-   This handles the cross-process coordination that `cuda-checkpoint` can't.
-2. `cuda-checkpoint --toggle` on each TP worker — frees remaining CUDA context,
-   allocator state, and any GPU memory vLLM didn't release (especially on v0.14+
-   where sleep is broken for memory freeing).
-
-**Wake sequence:**
-1. `cuda-checkpoint --toggle` on each TP worker — restores CUDA context. No NCCL
-   IPC to worry about because vLLM already tore it down.
-2. `POST /wake_up` — vLLM re-initializes NCCL communicators, reloads weights
-   from disk, rebuilds KV cache.
-
-This gives us:
-- **100% GPU freed** (cuda-checkpoint handles what vLLM misses)
-- **TP>1 support** (vLLM manages NCCL lifecycle, not cuda-checkpoint)
-- **Works on v0.14+** (cuda-checkpoint compensates for broken sleep memory freeing)
-- **Trade-off**: wake is slower than pure L3 (needs weight reload + NCCL reinit),
-  similar to L2 wake time. But unlike pure L2, actually frees all GPU memory.
-
-**Open questions:**
-- Does vLLM's `/sleep` on v0.14+ still correctly tear down NCCL, even if it
-  fails to free GPU memory? If the NCCL teardown works, the rest follows.
-- After `cuda-checkpoint` restore + `/wake_up`, does NCCL re-init succeed on
-  the restored CUDA contexts? Or does it need fresh contexts?
-- Could we skip the `/sleep` call and instead use vLLM's internal NCCL destroy/
-  init APIs directly (e.g., via a custom vLLM plugin or env var)?
-
-### Future: cooperative TP checkpoint via vLLM hooks
-
-A more complete approach — validated in proof-of-concept testing
-(see `~/checkpointing/report.md`, Experiment 3). The key insight: NCCL can be
-destroyed before checkpoint and reinitialized after restore, and CUDA tensors
-(weights, KV cache) survive CRIU independently of NCCL state.
-
-**Validated primitives:**
-1. CUDA tensors survive CRIU checkpoint/restore (proven with TP=1 vLLM)
-2. NCCL can be reinitialized on a CRIU-restored process — `destroy_process_group()`,
-   checkpoint, restore, `init_process_group()`, then `all_reduce` works on original tensors
-
-**vLLM already has the hooks:**
-- `vllm.distributed.parallel_state.destroy_model_parallel()` (parallel_state.py) —
-  tears down all NCCL process groups (world, TP, PP)
-- `vllm.v1.worker.gpu_worker.Worker.reinitialize_distributed()` (gpu_worker.py) —
-  destroys and recreates distributed state; currently used for NIXL bootstrapping
-  but the pattern is exactly what checkpoint/restore needs
-- `vllm.v1.engine.core.EngineCore` — has request scheduling that can be paused
-
-**Checkpoint sequence (TP=N):**
-1. **Drain** — stop accepting requests, wait for in-flight completions
-2. **Barrier** — all ranks synchronize (no pending NCCL ops)
-3. **Destroy NCCL** — each rank calls `destroy_model_parallel()`
-4. **CUDA suspend** — `cuda-checkpoint --toggle` on each rank (no IPC memory left)
-5. **CRIU dump** — checkpoint each rank process (can be parallel)
-
-**Restore sequence:**
-1. **CRIU restore** — restore each rank (CUDA plugin copies memory back to GPU)
-2. **Reinit NCCL** — each rank calls `reinitialize_distributed()` with same rank/world_size
-3. **Resume** — weights and KV cache are intact, start accepting requests
-
-**Implementation path:**
-1. Add a "checkpoint" control message to the engine core's input socket
-2. On receiving it: drain scheduler, call `destroy_model_parallel()`, signal ready
-3. Orchestrator runs `cuda-checkpoint --toggle` + `criu dump` on each rank
-4. On restore: engine core calls `reinitialize_distributed()`, resumes event loop
-
-| Component | Effort | Notes |
-|-----------|--------|-------|
-| Orchestrator coordination | Low | Coordinate ranks from llmux |
-| vLLM drain hook | Medium | Pause scheduler, wait for completion |
-| NCCL teardown/reinit | Low | `destroy_model_parallel` + `reinitialize_distributed` exist |
-| TCPStore bootstrapping | Medium | Fresh rendezvous for NCCL reinit; rank 0 hosts new store |
-| Testing | High | Race conditions, partial failures, timeout handling |
+- **L1/L2 sleep:** Works with vLLM v0.13.x out of the box. Works with v0.15.1 with the sleep fix patch (included in Docker image).
+- **L3 CUDA suspend / L4 CRIU checkpoint:** Works with vLLM v0.13.x+ with NCCL patches (included in Docker image). Requires `cuda-checkpoint` and CRIU (included in Docker image).
+- **TP>1 with L3/L4:** Requires vLLM NCCL suspend/resume patches (included in Docker image) plus `--enforce-eager` and `--disable-custom-all-reduce` flags.
 
 ## License
 

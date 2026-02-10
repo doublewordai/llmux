@@ -377,10 +377,8 @@ impl CostAwarePolicy {
 #[async_trait]
 impl SwitchPolicy for CostAwarePolicy {
     async fn on_pending_request(&self, ctx: &PolicyContext) -> PolicyDecision {
-        let switch_cost = self.estimated_switch_cost(
-            ctx.active_model.as_deref(),
-            &ctx.target_model,
-        );
+        let switch_cost =
+            self.estimated_switch_cost(ctx.active_model.as_deref(), &ctx.target_model);
         let required_depth = self.min_queue_depth(switch_cost);
 
         debug!(
@@ -451,10 +449,10 @@ impl SwitchPolicy for CostAwarePolicy {
         let coalesce_state = self.coalesce_states.get(&ctx.target_model);
 
         // If a defer is already pending, don't spawn another one
-        if let Some(state) = coalesce_state {
-            if state.defer_pending.load(Ordering::SeqCst) {
-                return PolicyDecision::Skip;
-            }
+        if let Some(state) = coalesce_state
+            && state.defer_pending.load(Ordering::SeqCst)
+        {
+            return PolicyDecision::Skip;
         }
 
         // Start a coalescing window

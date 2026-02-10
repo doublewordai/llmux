@@ -1,3 +1,8 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::too_many_arguments,
+    clippy::manual_is_multiple_of
+)]
 //! Discrete-event policy simulator for comparing scheduling algorithms.
 //!
 //! Models the real system: requests arrive, queue, and trigger policy evaluation.
@@ -41,9 +46,13 @@ impl std::fmt::Display for Result {
         write!(
             f,
             "{:<14} reqs={:<4} sw={:<3} sw_t={:>6.1}s gpu={:>5.1}% max_w={:>6.1}s avg_w={:>5.1}s",
-            self.policy, self.requests, self.switches,
-            self.switch_time, self.gpu_pct * 100.0,
-            self.max_wait, self.avg_wait,
+            self.policy,
+            self.requests,
+            self.switches,
+            self.switch_time,
+            self.gpu_pct * 100.0,
+            self.max_wait,
+            self.avg_wait,
         )
     }
 }
@@ -454,7 +463,13 @@ fn simulate(
         loop {
             let mut dummy = BinaryHeap::new();
             try_serve(
-                &active, &mut queues, &mut dummy, &mut waits, &mut served, t, service_time,
+                &active,
+                &mut queues,
+                &mut dummy,
+                &mut waits,
+                &mut served,
+                t,
+                service_time,
                 &mut serving,
             );
             if serving {
@@ -468,18 +483,20 @@ fn simulate(
 
     // Drain any stragglers (switching between remaining queues)
     {
-        let mut t = requests
-            .iter()
-            .map(|r| r.arrive_at)
-            .fold(0.0_f64, f64::max)
-            + 300.0;
+        let mut t = requests.iter().map(|r| r.arrive_at).fold(0.0_f64, f64::max) + 300.0;
         for _ in 0..1000 {
             if served >= requests.len() {
                 break;
             }
             let mut dummy = BinaryHeap::new();
             try_serve(
-                &active, &mut queues, &mut dummy, &mut waits, &mut served, t, service_time,
+                &active,
+                &mut queues,
+                &mut dummy,
+                &mut waits,
+                &mut served,
+                t,
+                service_time,
                 &mut serving,
             );
             if serving {
@@ -775,7 +792,11 @@ fn run_benchmark(switch_cost: f64, service_time: f64, max_wait: f64) {
         let gpu = if wt > 0.0 { 1.0 - (st / wt) } else { 1.0 };
         let mw = rs.iter().map(|r| r.max_wait).fold(0.0_f64, f64::max);
         let total_reqs: f64 = rs.iter().map(|r| r.requests as f64).sum();
-        let aw: f64 = rs.iter().map(|r| r.avg_wait * r.requests as f64).sum::<f64>() / total_reqs;
+        let aw: f64 = rs
+            .iter()
+            .map(|r| r.avg_wait * r.requests as f64)
+            .sum::<f64>()
+            / total_reqs;
         println!(
             "    {:<14} switches={:<4} gpu={:>5.1}% max_wait={:>6.1}s avg_wait={:>5.1}s",
             pname,
