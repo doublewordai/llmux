@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/doublewordai/llmux/compare/v0.4.0...v0.4.1) - 2026-02-10
+
+### Fixed
+
+- CRIU checkpoint networking and TP>1 restore ([#12](https://github.com/doublewordai/llmux/pull/12))
+
 ## [0.4.0](https://github.com/doublewordai/llmux/compare/v0.3.1...v0.4.0) - 2026-02-10
 
 ### Added
