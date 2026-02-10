@@ -1068,7 +1068,12 @@ impl Orchestrator {
             reason: format!("Failed to create images dir: {}", e),
         })?;
 
-        // Step 1: Toggle CUDA checkpoint on all GPU processes
+        // Step 1: Toggle CUDA checkpoint on all GPU processes.
+        // This suspends CUDA state (copies VRAM to host RAM, frees GPU memory)
+        // for each GPU-holding process. With TP>1, all ranks are toggled in
+        // parallel. The CRIU CUDA plugin gracefully handles pre-checkpointed
+        // processes: pause_devices skips the lock step, checkpoint_devices
+        // skips the checkpoint step, and resume_devices_late always restores.
         info!(model = %model, "Checkpoint step 1/2: cuda-checkpoint --toggle");
         self.cuda_suspend_toggle(model, process, true).await?;
 
@@ -1080,6 +1085,8 @@ impl Orchestrator {
                 "--shell-job",
                 "--ext-unix-sk",
                 "--tcp-established",
+                "--network-lock",
+                "nftables",
                 "--link-remap",
                 "-L",
                 &ckpt_cfg.cuda_plugin_dir,
@@ -1153,6 +1160,8 @@ impl Orchestrator {
                 "--shell-job",
                 "--ext-unix-sk",
                 "--tcp-established",
+                "--network-lock",
+                "nftables",
                 "-L",
                 &ckpt_cfg.cuda_plugin_dir,
                 "--restore-detached",
@@ -1199,6 +1208,30 @@ impl Orchestrator {
                 model: model.to_string(),
                 reason: "Restored process failed health check".to_string(),
             });
+        }
+
+        // For TP>1: rebuild NCCL communicators after restore
+        // (they were torn down before checkpoint via suspend_nccl)
+        let gpu_count = {
+            let process = self
+                .processes
+                .get(model)
+                .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
+            process.lock().await.engine_core_pids.len()
+        };
+        if gpu_count > 1 {
+            let base_url = format!("http://localhost:{}", config.port);
+            info!(model = %model, tp = gpu_count, "Resuming NCCL communicators");
+            self.post_request(
+                &format!("{}/collective_rpc", base_url),
+                Some(r#"{"method": "resume_nccl"}"#),
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|e| OrchestratorError::WakeFailed {
+                model: model.to_string(),
+                reason: format!("Failed to resume NCCL: {}", e),
+            })?;
         }
 
         // Update state — process is back and serving
