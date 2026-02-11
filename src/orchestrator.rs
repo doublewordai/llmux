@@ -59,6 +59,10 @@ struct ManagedProcess {
     /// Discovered after startup for checkpoint-enabled models.
     /// With TP=1 this is a single PID; with TP>1 one per rank.
     engine_core_pids: Vec<u32>,
+    /// Parent PID of the vLLM process. Stored separately because after
+    /// CRIU restore with --restore-detached, the tokio Child handle is gone
+    /// but the process is running at its original PID.
+    parent_pid: Option<u32>,
 }
 
 /// Strip ANSI escape sequences from a string.
@@ -255,6 +259,7 @@ impl Orchestrator {
                     child: None,
                     ready_notify: Arc::new(Notify::new()),
                     engine_core_pids: vec![],
+                    parent_pid: None,
                 })),
             );
         }
@@ -264,7 +269,7 @@ impl Orchestrator {
             processes,
             operation_lock: Mutex::new(()),
             health_timeout: Duration::from_secs(5),
-            startup_timeout: Duration::from_secs(600), // 10 minutes for large TP models
+            startup_timeout: Duration::from_secs(900), // 15 minutes for large TP models
             vllm_command,
             checkpoint_config,
         }
@@ -285,6 +290,17 @@ impl Orchestrator {
     /// Get the configured sleep level for a model
     pub fn sleep_level_for(&self, model: &str) -> Option<u8> {
         self.configs.get(model).map(|c| c.sleep_level)
+    }
+
+    /// Check if a model is currently in the Checkpointed state
+    pub fn is_checkpointed(&self, model: &str) -> bool {
+        if let Some(process) = self.processes.get(model) {
+            // try_lock to avoid blocking the switcher
+            if let Ok(guard) = process.try_lock() {
+                return matches!(guard.state, ProcessState::Checkpointed { .. });
+            }
+        }
+        false
     }
 
     /// Ensure a model's process is running and ready
@@ -446,6 +462,17 @@ impl Orchestrator {
                 }
             })?;
 
+            // CRIU requires stdin to point to a container-local /dev/null rather
+            // than an inherited pipe or host fd. If stdin's mount ID belongs to
+            // the host mount namespace, CRIU dump fails with
+            // "Can't lookup mount=N for fd=0 path=/dev/null".
+            let devnull = std::fs::File::open("/dev/null").map_err(|e| {
+                OrchestratorError::SpawnFailed {
+                    model: model.to_string(),
+                    reason: format!("Failed to open /dev/null: {}", e),
+                }
+            })?;
+            cmd.stdin(devnull);
             cmd.stdout(stdout_file);
             cmd.stderr(stderr_file);
 
@@ -499,9 +526,10 @@ impl Orchestrator {
             }
         }
 
-        // Store child process
+        // Store child process and its PID (for CRIU checkpoint after restore)
         {
             let mut guard = process.lock().await;
+            guard.parent_pid = child.id();
             guard.child = Some(child);
         }
 
@@ -847,6 +875,7 @@ impl Orchestrator {
                 info!(model = %model, "Cleaning up checkpoint images");
                 let _ = std::fs::remove_dir_all(images_dir);
                 guard.state = ProcessState::NotStarted;
+                guard.parent_pid = None;
                 guard.engine_core_pids.clear();
                 return Ok(());
             }
@@ -861,6 +890,7 @@ impl Orchestrator {
                 let _ = child.wait().await;
             }
             guard.child = None;
+            guard.parent_pid = None;
             guard.engine_core_pids.clear();
             guard.state = ProcessState::NotStarted;
             info!(model = %model, "vLLM process stopped");
@@ -1047,12 +1077,15 @@ impl Orchestrator {
 
         let parent_pid = {
             let guard = process.lock().await;
-            guard.child.as_ref().and_then(|c| c.id()).ok_or_else(|| {
-                OrchestratorError::SleepFailed {
+            guard
+                .child
+                .as_ref()
+                .and_then(|c| c.id())
+                .or(guard.parent_pid)
+                .ok_or_else(|| OrchestratorError::SleepFailed {
                     model: model.to_string(),
                     reason: "No child PID available for checkpoint".to_string(),
-                }
-            })?
+                })?
         };
 
         // Prepare images directory (clean up old checkpoint first)
@@ -1074,8 +1107,25 @@ impl Orchestrator {
         // parallel. The CRIU CUDA plugin gracefully handles pre-checkpointed
         // processes: pause_devices skips the lock step, checkpoint_devices
         // skips the checkpoint step, and resume_devices_late always restores.
-        info!(model = %model, "Checkpoint step 1/2: cuda-checkpoint --toggle");
-        self.cuda_suspend_toggle(model, process, true).await?;
+        //
+        // NOTE: Skip pre-toggle — let the CRIU CUDA plugin handle
+        // cuda-checkpoint internally. On driver 580+ the plugin expects to
+        // find the restore thread, which is gone after --toggle.
+        info!(model = %model, "Checkpoint step 1/2: skipping pre-toggle (CRIU plugin handles cuda-checkpoint)");
+
+        // Clean up stale CRIU link_remap artifacts in /dev/shm before dump.
+        // CRIU's --link-remap creates temporary hardlinks named link_remap.N
+        // in /dev/shm for POSIX semaphores. These aren't cleaned up after
+        // dump and cause "File exists" errors on subsequent dumps.
+        if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("link_remap.") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
 
         // Step 2: CRIU dump (snapshots process tree to disk, kills it)
         info!(model = %model, parent_pid, "Checkpoint step 2/2: criu dump");
@@ -1088,6 +1138,7 @@ impl Orchestrator {
                 "--network-lock",
                 "nftables",
                 "--link-remap",
+                "--enable-external-masters",
                 "-L",
                 &ckpt_cfg.cuda_plugin_dir,
                 "--images-dir",
@@ -1162,6 +1213,7 @@ impl Orchestrator {
                 "--tcp-established",
                 "--network-lock",
                 "nftables",
+                "--enable-external-masters",
                 "-L",
                 &ckpt_cfg.cuda_plugin_dir,
                 "--restore-detached",
@@ -1219,6 +1271,22 @@ impl Orchestrator {
                 .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
             process.lock().await.engine_core_pids.len()
         };
+        // Update state before NCCL resume — the process is already live after
+        // CRIU restore, so mark it Running so cleanup paths (e.g. force_sleep)
+        // correctly kill the process rather than just deleting images.
+        {
+            let process = self
+                .processes
+                .get(model)
+                .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
+            let mut guard = process.lock().await;
+            guard.state = ProcessState::Running { sleeping: None };
+            // Note: child handle is not available after criu restore --restore-detached.
+            // The process runs independently. We track it by PID / health check.
+            // Engine core PID is preserved from before checkpoint.
+        }
+
+        // For TP>1: rebuild NCCL communicators after restore
         if gpu_count > 1 {
             let base_url = format!("http://localhost:{}", config.port);
             info!(model = %model, tp = gpu_count, "Resuming NCCL communicators");
@@ -1234,17 +1302,14 @@ impl Orchestrator {
             })?;
         }
 
-        // Update state — process is back and serving
-        {
-            let process = self
-                .processes
-                .get(model)
-                .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
-            let mut guard = process.lock().await;
-            guard.state = ProcessState::Running { sleeping: None };
-            // Note: child handle is not available after criu restore --restore-detached.
-            // The process runs independently. We track it by PID / health check.
-            // Engine core PID is preserved from before checkpoint.
+        if !ckpt_cfg.keep_images {
+            // Clean up checkpoint images to free disk space. For large models
+            // this can be tens of GB.
+            if let Err(e) = std::fs::remove_dir_all(images_dir) {
+                warn!(model = %model, error = %e, "Failed to clean up checkpoint images (non-fatal)");
+            } else {
+                info!(model = %model, "Cleaned up checkpoint images");
+            }
         }
 
         info!(model = %model, "Model restored from checkpoint and ready");

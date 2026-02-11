@@ -444,6 +444,9 @@ impl ModelSwitcher {
 
         // Phase 3: Sleep old model — use per-model sleep level from config,
         // falling back to the global policy default.
+        // Exception: if the target model is already checkpointed on disk,
+        // downgrade the sleep to Stop (kill) to avoid needing disk space
+        // for two simultaneous CRIU checkpoints.
         let sleep_start = Instant::now();
         if let Some(ref from) = from_model {
             let level_raw = self
@@ -451,7 +454,17 @@ impl ModelSwitcher {
                 .orchestrator
                 .sleep_level_for(from)
                 .unwrap_or_else(|| self.inner.policy.sleep_level());
-            let sleep_level = SleepLevel::from(level_raw);
+            let mut sleep_level = SleepLevel::from(level_raw);
+            if sleep_level == SleepLevel::Checkpoint
+                && self.inner.orchestrator.is_checkpointed(target_model)
+            {
+                info!(
+                    from = %from,
+                    to = %target_model,
+                    "Target is checkpointed; downgrading sleep to Stop to avoid dual checkpoint"
+                );
+                sleep_level = SleepLevel::Stop;
+            }
             debug!(model = %from, level = ?sleep_level, "Sleeping model");
             self.inner.orchestrator.force_sleep(from, sleep_level).await;
         }

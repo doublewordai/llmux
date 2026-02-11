@@ -58,6 +58,12 @@ pub struct CheckpointConfig {
     /// Path to cuda-checkpoint binary (default: "cuda-checkpoint" on PATH)
     #[serde(default = "default_cuda_checkpoint_path")]
     pub cuda_checkpoint_path: String,
+
+    /// Keep checkpoint images on disk after restore (default: true).
+    /// When true, images are preserved so the same checkpoint can be
+    /// restored multiple times without re-checkpointing.
+    #[serde(default = "default_keep_images")]
+    pub keep_images: bool,
 }
 
 fn default_vllm_command() -> String {
@@ -78,6 +84,10 @@ fn default_images_dir() -> PathBuf {
 
 fn default_cuda_checkpoint_path() -> String {
     "cuda-checkpoint".to_string()
+}
+
+fn default_keep_images() -> bool {
+    true
 }
 
 fn default_port() -> u16 {
