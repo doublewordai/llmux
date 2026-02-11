@@ -1271,6 +1271,22 @@ impl Orchestrator {
                 .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
             process.lock().await.engine_core_pids.len()
         };
+        // Update state before NCCL resume — the process is already live after
+        // CRIU restore, so mark it Running so cleanup paths (e.g. force_sleep)
+        // correctly kill the process rather than just deleting images.
+        {
+            let process = self
+                .processes
+                .get(model)
+                .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
+            let mut guard = process.lock().await;
+            guard.state = ProcessState::Running { sleeping: None };
+            // Note: child handle is not available after criu restore --restore-detached.
+            // The process runs independently. We track it by PID / health check.
+            // Engine core PID is preserved from before checkpoint.
+        }
+
+        // For TP>1: rebuild NCCL communicators after restore
         if gpu_count > 1 {
             let base_url = format!("http://localhost:{}", config.port);
             info!(model = %model, tp = gpu_count, "Resuming NCCL communicators");
@@ -1284,19 +1300,6 @@ impl Orchestrator {
                 model: model.to_string(),
                 reason: format!("Failed to resume NCCL: {}", e),
             })?;
-        }
-
-        // Update state — process is back and serving
-        {
-            let process = self
-                .processes
-                .get(model)
-                .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
-            let mut guard = process.lock().await;
-            guard.state = ProcessState::Running { sleeping: None };
-            // Note: child handle is not available after criu restore --restore-detached.
-            // The process runs independently. We track it by PID / health check.
-            // Engine core PID is preserved from before checkpoint.
         }
 
         if !ckpt_cfg.keep_images {
