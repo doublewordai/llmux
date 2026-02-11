@@ -25,30 +25,51 @@ field.
 ```
 
 llmux spawns vLLM processes lazily on first request and manages their
-lifecycle. Only one model is active at a time - the rest are sleeping
-(weights offloaded to CPU or discarded) or stopped entirely.
+lifecycle. Only one model is active at a time - the rest are evicted using
+a configurable two-axis policy.
 
-### Sleep levels
+### Eviction policy
 
-| Level | Sleep | Wake | GPU freed | CPU RAM | State preserved | Use case |
-|-------|-------|------|-----------|---------|-----------------|----------|
-| **L1** | Slow (offload to CPU) | Fast (~1s) | Most | High (holds weights) | Partial | Model you expect to return to soon |
-| **L2** | Fast (~1s) | Slow (reload from disk) | Most | None | No (KV cache, CUDA graphs lost) | Model you may not need for a while |
-| **L3** (CUDA suspend) | Fast (~3s, ~15s at TP=2) | Fast (~3s, ~7s at TP=2) | All (100%) | High (holds VRAM) | Full | Like L1, but frees 100% GPU |
-| **L4** (CRIU) | ~27s (checkpoint to disk) | ~15s (restore) | All (100%) | None | Full (KV cache, CUDA graphs, allocator) | Many models; lowest resource usage while sleeping |
-| **L5** | Kill process | Cold start | All | None | No | Fallback / cleanup |
+When a model is evicted, llmux applies two independent strategies:
 
-If L1-L4 sleep fails, llmux automatically escalates to L5 (kill) to guarantee
-GPU memory is freed.
+**Weight strategy** — what to do with model weights:
 
-#### CUDA suspend (level 3)
+| Strategy | vLLM API | Speed | GPU freed | CPU RAM | State |
+|----------|----------|-------|-----------|---------|-------|
+| `retain` | (none) | Instant | None | None | Full |
+| `offload` | sleep L1 | Slow (~35s) | Most | High (holds weights) | Partial |
+| `discard` | sleep L2 | Fast (~1s) | Most | None | Lost (KV cache, CUDA graphs) |
+
+**Process strategy** — what to do with the OS process:
+
+| Strategy | Mechanism | Speed | GPU freed | CPU RAM | State |
+|----------|-----------|-------|-----------|---------|-------|
+| `keep_running` | (none) | Instant | None | Process stays | — |
+| `cuda_suspend` | `cuda-checkpoint --toggle` | ~3s (TP=1), ~15s (TP=2) | All (100%) | High (holds VRAM) | Full |
+| `checkpoint` | CRIU dump | ~27s | All (100%) | None | Full |
+| `stop` | Kill process | Instant | All | None | Lost |
+
+These combine freely. Common combinations:
+
+| Config | Equivalent to old | Use case |
+|--------|-------------------|----------|
+| `offload` + `keep_running` | L1 | Model you expect to return to soon |
+| `discard` + `keep_running` | L2 | Model you may not need for a while |
+| `retain` + `cuda_suspend` | L3 | Like offload, but frees 100% GPU |
+| `discard` + `checkpoint` | L4 | Many models; lowest resource usage |
+| `retain` + `stop` | L5 | Fallback / cleanup |
+
+If eviction fails, llmux automatically escalates to `stop` to guarantee GPU
+memory is freed.
+
+#### CUDA suspend
 
 Uses `cuda-checkpoint --toggle` to suspend CUDA state and copy VRAM to host
 RAM. The process stays alive — no serialization, no CRIU. Wake is just another
 toggle to copy state back to GPU.
 
-Like L1, this holds state in CPU RAM. Unlike L1, it frees 100% of GPU memory
-(L1 keeps ~500 MiB for CUDA context) and preserves full state.
+Like `offload`, this holds state in CPU RAM. Unlike `offload`, it frees 100% of
+GPU memory (`offload` keeps ~500 MiB for CUDA context) and preserves full state.
 
 For TP>1, llmux coordinates NCCL teardown before checkpoint and rebuild after
 restore. This requires patched vLLM with `suspend_nccl`/`resume_nccl` support
@@ -59,7 +80,7 @@ restore. This requires patched vLLM with `suspend_nccl`/`resume_nccl` support
 - Root access (or passwordless `sudo` for `cuda-checkpoint`)
 - For TP>1: `--enforce-eager` and `--disable-custom-all-reduce` in `extra_args`
 
-#### CRIU checkpoint (level 4)
+#### CRIU checkpoint
 
 CRIU checkpointing uses `cuda-checkpoint` and `criu` to snapshot the entire
 vLLM process tree to disk, then kill it. On restore, CRIU brings the process
@@ -74,9 +95,9 @@ graphs, and the warmed memory allocator. First inference after restore is ~30ms
 - vLLM process must not use `io_uring` or `libuv` (set automatically)
 - For TP>1: `--enforce-eager` and `--disable-custom-all-reduce` in `extra_args`
 
-**Trade-offs vs L1/L2:**
-- Slower sleep/wake than L1, but no CPU RAM cost and full state preservation
-- Slower wake than L1 but faster first-inference (no warmup)
+**Trade-offs vs offload:**
+- Slower sleep/wake than `offload`, but no CPU RAM cost and full state preservation
+- Slower wake than `offload` but faster first-inference (no warmup)
 
 ## Quickstart
 
@@ -88,12 +109,12 @@ Create a `config.json`:
     "qwen-14b": {
       "model_path": "Qwen/Qwen3-14B",
       "port": 8001,
-      "sleep_level": 1
+      "eviction": { "weights": "offload", "process": "keep_running" }
     },
     "gemma-12b": {
       "model_path": "google/gemma-3-12b-it",
       "port": 8002,
-      "sleep_level": 2
+      "eviction": { "weights": "discard", "process": "keep_running" }
     }
   },
   "port": 3000
@@ -113,7 +134,7 @@ docker run --gpus all --init \
   ghcr.io/doublewordai/llmux:latest
 ```
 
-For sleep levels 3 and 4 (cuda-checkpoint/CRIU), additional flags are required:
+For `cuda_suspend` or `checkpoint` process strategies, additional flags are required:
 
 ```bash
 docker run --gpus all \
@@ -133,7 +154,7 @@ The extra flags are needed because:
 - `--ipc=host` — NCCL uses shared memory for inter-GPU communication
 - `-v /tmp/llmux-checkpoints:...` — CRIU checkpoints can be tens of GB; mount a host volume to avoid filling the container filesystem
 
-**Important:** Do NOT use `--init` with CRIU (sleep level 4). Docker's init process (tini)
+**Important:** Do NOT use `--init` with CRIU (`checkpoint` process strategy). Docker's init process (tini)
 redirects stdin to the host's `/dev/null`, whose mount ID is invisible inside the container.
 CRIU dump fails with "Can't lookup mount=N for fd=0 path=/dev/null".
 
@@ -146,8 +167,8 @@ cargo install llmux
 llmux --config config.json
 ```
 
-For sleep levels 3 and 4, you also need `cuda-checkpoint` and `criu` (with
-CUDA plugin) installed and either run as root or configure passwordless sudo.
+For `cuda_suspend` or `checkpoint` process strategies, you also need `cuda-checkpoint`
+and `criu` (with CUDA plugin) installed and either run as root or configure passwordless sudo.
 
 ### Send requests
 
@@ -171,8 +192,16 @@ curl http://localhost:3000/v1/chat/completions \
 |-------|---------|-------------|
 | `model_path` | *required* | HuggingFace model ID or local path |
 | `port` | *required* | Port for this model's vLLM instance |
-| `sleep_level` | `5` | Sleep level (1-2: vLLM, 3: CUDA suspend, 4: CRIU, 5: stop) |
+| `eviction` | `retain` + `stop` | Eviction policy (see below) |
 | `extra_args` | `[]` | Additional vLLM CLI arguments |
+
+The `eviction` field takes an object with `weights` and `process` keys:
+
+```json
+{
+  "eviction": { "weights": "offload", "process": "keep_running" }
+}
+```
 
 All vLLM-specific flags (e.g. `--gpu-memory-utilization`, `--tensor-parallel-size`,
 `--dtype`) should be passed via `extra_args`:
@@ -185,16 +214,16 @@ All vLLM-specific flags (e.g. `--gpu-memory-utilization`, `--tensor-parallel-siz
 }
 ```
 
-#### Tensor parallelism with L3/L4
+#### Tensor parallelism with cuda_suspend/checkpoint
 
-When using sleep levels 3 or 4 with TP>1, you **must** include `--enforce-eager`
+When using `cuda_suspend` or `checkpoint` with TP>1, you **must** include `--enforce-eager`
 and `--disable-custom-all-reduce` in `extra_args`:
 
 ```json
 {
   "model_path": "NousResearch/Meta-Llama-3.1-8B-Instruct",
   "port": 8001,
-  "sleep_level": 3,
+  "eviction": { "weights": "retain", "process": "cuda_suspend" },
   "extra_args": [
     "--tensor-parallel-size", "2",
     "--enforce-eager",
@@ -217,9 +246,9 @@ llmux validates the config at startup and warns if these flags are missing.
 | `metrics_port` | `9090` | Prometheus metrics port (0 to disable) |
 | `vllm_command` | `"vllm"` | vLLM binary path |
 
-### Checkpoint config (for sleep levels 3 and 4)
+### Checkpoint config
 
-To use cuda-checkpoint or CRIU, add a `checkpoint` section to your config:
+To use `cuda_suspend` or `checkpoint` process strategies, add a `checkpoint` section:
 
 ```json
 {
@@ -227,7 +256,7 @@ To use cuda-checkpoint or CRIU, add a `checkpoint` section to your config:
     "qwen-14b": {
       "model_path": "Qwen/Qwen3-14B",
       "port": 8001,
-      "sleep_level": 3
+      "eviction": { "weights": "retain", "process": "cuda_suspend" }
     }
   },
   "checkpoint": {
@@ -236,7 +265,7 @@ To use cuda-checkpoint or CRIU, add a `checkpoint` section to your config:
 }
 ```
 
-For CRIU checkpointing (level 4), the full config is:
+For CRIU checkpointing, the full config is:
 
 ```json
 {
@@ -282,7 +311,7 @@ variable is also set on spawned vLLM processes.
 | `policy_type` | `"fifo"` | Switching policy |
 | `request_timeout_secs` | `60` | Request timeout |
 | `drain_before_switch` | `true` | Wait for in-flight requests before sleeping |
-| `sleep_level` | `5` | Default sleep level for policy |
+| `eviction` | `retain` + `stop` | Default eviction policy |
 
 ## Validation
 
@@ -327,7 +356,7 @@ services:
             - capabilities: [gpu]
 ```
 
-### With cuda-checkpoint/CRIU (sleep levels 3 and 4)
+### With cuda-checkpoint/CRIU
 
 ```yaml
 services:
@@ -407,17 +436,17 @@ Where `targets.json` maps model names to llmux with API keys:
 
 ## Tensor parallelism
 
-All sleep levels work with TP>1:
+All eviction strategies work with TP>1:
 
-| Level | TP>1 | Notes |
-|-------|------|-------|
-| L1 | Yes | vLLM manages NCCL teardown/rebuild internally |
-| L2 | Yes | Same — vLLM handles it |
-| L3 | Yes | llmux tears down NCCL before cuda-checkpoint, rebuilds after restore |
-| L4 | Yes | Same — NCCL teardown before checkpoint, rebuild after restore |
-| L5 | Yes | Kill + cold restart always works |
+| Strategy | TP>1 | Notes |
+|----------|------|-------|
+| `offload` | Yes | vLLM manages NCCL teardown/rebuild internally |
+| `discard` | Yes | Same — vLLM handles it |
+| `cuda_suspend` | Yes | llmux tears down NCCL before cuda-checkpoint, rebuilds after restore |
+| `checkpoint` | Yes | Same — NCCL teardown before checkpoint, rebuild after restore |
+| `stop` | Yes | Kill + cold restart always works |
 
-For L3 and L4, llmux uses vLLM's `/collective_rpc` endpoint to call
+For `cuda_suspend` and `checkpoint`, llmux uses vLLM's `/collective_rpc` endpoint to call
 `suspend_nccl` (before cuda-checkpoint) and `resume_nccl` (after restore)
 on all TP workers. This tears down NCCL IPC handles that cuda-checkpoint
 cannot checkpoint, then rebuilds them after CUDA state is restored.
@@ -433,18 +462,18 @@ before they hit production.
 
 ### vLLM v0.14+ sleep regression
 
-Sleep mode (L1/L2) has a regression where weights are not discarded from GPU
+Sleep mode (`offload`/`discard`) has a regression where weights are not discarded from GPU
 memory ([vllm#32714](https://github.com/vllm-project/vllm/issues/32714)).
 The Docker image includes a patch (`fix-sleep-mode-v0.15.1.patch`) that fixes
-this. For bare-metal installs, apply the patch or use L3/L5 instead.
+this. For bare-metal installs, apply the patch or use `cuda_suspend`/`stop` instead.
 
 ### vLLM v0.13.0
 
-- **`openai/gpt-oss-20b` L2 reload fails.** The MXFP4 weight loader crashes on
+- **`openai/gpt-oss-20b` `discard` reload fails.** The MXFP4 weight loader crashes on
   wake with `default_weight_loader() got an unexpected keyword argument
-  'weight_name'`. L1 works fine (19.6s sleep, 0.6s wake). Use L1 for this
+  'weight_name'`. `offload` works fine (19.6s sleep, 0.6s wake). Use `offload` for this
   model.
-- L1 and L2 both work correctly for `Qwen/Qwen3-14B` and
+- `offload` and `discard` both work correctly for `Qwen/Qwen3-14B` and
   `google/gemma-3-12b-it`.
 
 ### NVIDIA driver requirements
@@ -454,9 +483,9 @@ nvidia-driver-580 or later. Check your driver version with `nvidia-smi`.
 
 ## Compatibility
 
-- **L1/L2 sleep:** Works with vLLM v0.13.x out of the box. Works with v0.15.1 with the sleep fix patch (included in Docker image).
-- **L3 CUDA suspend / L4 CRIU checkpoint:** Works with vLLM v0.13.x+ with NCCL patches (included in Docker image). Requires `cuda-checkpoint` and CRIU (included in Docker image).
-- **TP>1 with L3/L4:** Requires vLLM NCCL suspend/resume patches (included in Docker image) plus `--enforce-eager` and `--disable-custom-all-reduce` flags.
+- **`offload`/`discard`:** Works with vLLM v0.13.x out of the box. Works with v0.15.1 with the sleep fix patch (included in Docker image).
+- **`cuda_suspend`/`checkpoint`:** Works with vLLM v0.13.x+ with NCCL patches (included in Docker image). Requires `cuda-checkpoint` and CRIU (included in Docker image).
+- **TP>1 with `cuda_suspend`/`checkpoint`:** Requires vLLM NCCL suspend/resume patches (included in Docker image) plus `--enforce-eager` and `--disable-custom-all-reduce` flags.
 
 ## License
 
