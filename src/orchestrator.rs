@@ -1299,13 +1299,14 @@ impl Orchestrator {
             // Engine core PID is preserved from before checkpoint.
         }
 
-        // Clean up checkpoint images to free disk space. The process is
-        // running again so the images are no longer needed. For large models
-        // this can be tens of GB.
-        if let Err(e) = std::fs::remove_dir_all(images_dir) {
-            warn!(model = %model, error = %e, "Failed to clean up checkpoint images (non-fatal)");
-        } else {
-            info!(model = %model, "Cleaned up checkpoint images");
+        if !ckpt_cfg.keep_images {
+            // Clean up checkpoint images to free disk space. For large models
+            // this can be tens of GB.
+            if let Err(e) = std::fs::remove_dir_all(images_dir) {
+                warn!(model = %model, error = %e, "Failed to clean up checkpoint images (non-fatal)");
+            } else {
+                info!(model = %model, "Cleaned up checkpoint images");
+            }
         }
 
         info!(model = %model, "Model restored from checkpoint and ready");

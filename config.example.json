@@ -17,7 +17,8 @@
     "criu_path": "criu",
     "cuda_plugin_dir": "/usr/lib/criu/",
     "images_dir": "/tmp/llmux-checkpoints",
-    "cuda_checkpoint_path": "cuda-checkpoint"
+    "cuda_checkpoint_path": "cuda-checkpoint",
+    "keep_images": true
   },
   "policy": {
     "policy_type": "fifo",
