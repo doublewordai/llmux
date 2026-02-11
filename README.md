@@ -116,22 +116,26 @@ docker run --gpus all --init \
 For sleep levels 3 and 4 (cuda-checkpoint/CRIU), additional flags are required:
 
 ```bash
-docker run --gpus all --init \
+docker run --gpus all \
+  --privileged \
   --pid=host \
   --ipc=host \
-  --cap-add SYS_PTRACE \
-  --cap-add CHECKPOINT_RESTORE \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ./config.json:/etc/llmux/config.json:ro \
+  -v /tmp/llmux-checkpoints:/tmp/llmux-checkpoints \
   -p 3000:3000 \
   ghcr.io/doublewordai/llmux:latest
 ```
 
 The extra flags are needed because:
+- `--privileged` — CRIU requires broad namespace and ptrace access
 - `--pid=host` — cuda-checkpoint needs to ptrace vLLM worker PIDs
 - `--ipc=host` — NCCL uses shared memory for inter-GPU communication
-- `--cap-add SYS_PTRACE` — cuda-checkpoint's ptrace calls
-- `--cap-add CHECKPOINT_RESTORE` — CRIU process checkpoint/restore
+- `-v /tmp/llmux-checkpoints:...` — CRIU checkpoints can be tens of GB; mount a host volume to avoid filling the container filesystem
+
+**Important:** Do NOT use `--init` with CRIU (sleep level 4). Docker's init process (tini)
+redirects stdin to the host's `/dev/null`, whose mount ID is invisible inside the container.
+CRIU dump fails with "Can't lookup mount=N for fd=0 path=/dev/null".
 
 ### From source
 
