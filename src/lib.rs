@@ -37,6 +37,7 @@
 //! ```
 
 mod config;
+pub mod control;
 mod middleware;
 mod orchestrator;
 mod policy;
@@ -50,7 +51,7 @@ pub use policy::{
     CostAwarePolicy, FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy,
     TimeSlicePolicy,
 };
-pub use switcher::{ModelSwitcher, SleepLevel, SwitchError, SwitcherState};
+pub use switcher::{ModelSwitcher, SleepLevel, SwitchError, SwitchMode, SwitcherState};
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -58,10 +59,13 @@ use tracing::info;
 
 /// Build the complete llmux stack
 ///
-/// Returns the main Axum router and an optional metrics router. When
-/// `config.metrics_port > 0`, the global metrics recorder is installed and a
-/// separate router serving `/metrics` is returned for the caller to bind.
-pub async fn build_app(config: Config) -> Result<(axum::Router, Option<axum::Router>)> {
+/// Returns:
+/// - The main Axum router (proxy + middleware)
+/// - An optional metrics router (when `config.metrics_port > 0`)
+/// - The control API router (for the admin port)
+pub async fn build_app(
+    config: Config,
+) -> Result<(axum::Router, Option<axum::Router>, axum::Router)> {
     info!("Building llmux with {} models", config.models.len());
 
     // Create orchestrator with configured command
@@ -80,6 +84,9 @@ pub async fn build_app(config: Config) -> Result<(axum::Router, Option<axum::Rou
 
     // Spawn background scheduler if the policy uses one
     let _scheduler_handle = switcher.clone().spawn_scheduler();
+
+    // Build control API router (served on separate admin port)
+    let control = control::control_router(switcher.clone());
 
     // Build onwards targets from model configs
     let targets = config.build_onwards_targets()?;
@@ -100,5 +107,5 @@ pub async fn build_app(config: Config) -> Result<(axum::Router, Option<axum::Rou
         None
     };
 
-    Ok((app, metrics_router))
+    Ok((app, metrics_router, control))
 }

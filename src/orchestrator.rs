@@ -217,6 +217,8 @@ pub struct Orchestrator {
     configs: HashMap<String, ModelConfig>,
     /// Process state for each model
     processes: DashMap<String, Arc<Mutex<ManagedProcess>>>,
+    /// Runtime sleep level overrides (takes priority over config)
+    sleep_level_overrides: DashMap<String, u8>,
     /// Lock for serializing process operations
     operation_lock: Mutex<()>,
     /// Health check timeout
@@ -267,6 +269,7 @@ impl Orchestrator {
         Self {
             configs,
             processes,
+            sleep_level_overrides: DashMap::new(),
             operation_lock: Mutex::new(()),
             health_timeout: Duration::from_secs(5),
             startup_timeout: Duration::from_secs(900), // 15 minutes for large TP models
@@ -287,8 +290,11 @@ impl Orchestrator {
         self.configs.keys().cloned().collect()
     }
 
-    /// Get the configured sleep level for a model
+    /// Get the effective sleep level for a model (override > config)
     pub fn sleep_level_for(&self, model: &str) -> Option<u8> {
+        if let Some(level) = self.sleep_level_overrides.get(model) {
+            return Some(*level);
+        }
         self.configs.get(model).map(|c| c.sleep_level)
     }
 
@@ -301,6 +307,11 @@ impl Orchestrator {
             }
         }
         false
+    }
+
+    /// Override the sleep level for a model at runtime
+    pub fn set_sleep_level(&self, model: &str, level: u8) {
+        self.sleep_level_overrides.insert(model.to_string(), level);
     }
 
     /// Ensure a model's process is running and ready

@@ -865,6 +865,7 @@ async fn test_end_to_end_single_model() {
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
+        admin_port: None,
     };
 
     // Build the full app stack
@@ -971,6 +972,7 @@ async fn test_end_to_end_model_switching() {
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
+        admin_port: None,
     };
 
     // Build the full app stack
@@ -1098,6 +1100,7 @@ async fn test_end_to_end_unknown_model_passthrough() {
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
+        admin_port: None,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(
@@ -1450,6 +1453,7 @@ async fn test_end_to_end_concurrent_requests() {
         metrics_port: 0,
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
+        admin_port: None,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(
@@ -1877,4 +1881,504 @@ async fn test_wake_failure_cleans_up_target_model() {
             model: "model-a".to_string()
         }
     );
+}
+
+// =============================================================================
+// Control API Tests
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_control_status() {
+    use llmux::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "test".to_string(),
+            port: 8001,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::new(configs));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    let control = llmux::control::control_router(switcher);
+
+    let admin_port = allocate_port();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", admin_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, control).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("http://127.0.0.1:{}/control/status", admin_port))
+        .send()
+        .await
+        .expect("Status request failed");
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["state"], "idle");
+    assert_eq!(body["mode"]["mode"], "auto");
+    assert!(body["models"]["model-a"].is_object());
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_control_mode_switching() {
+    use llmux::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "test".to_string(),
+            port: 8001,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::new(configs));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    let control = llmux::control::control_router(switcher.clone());
+
+    let admin_port = allocate_port();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", admin_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, control).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Switch to manual mode
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/mode", admin_port))
+        .json(&serde_json::json!({"mode": "manual"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    // Verify via status
+    let status: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{}/control/status", admin_port))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["mode"]["mode"], "manual");
+
+    // Switch back to auto
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/mode", admin_port))
+        .json(&serde_json::json!({"mode": "auto"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    let status: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{}/control/status", admin_port))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["mode"]["mode"], "auto");
+
+    // Invalid mode returns 400
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/mode", admin_port))
+        .json(&serde_json::json!({"mode": "invalid"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_control_pin_and_unpin() {
+    use llmux::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitchMode};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+    configs.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        configs,
+        mock_vllm_path.to_string(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    let control = llmux::control::control_router(switcher.clone());
+
+    let admin_port = allocate_port();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", admin_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, control).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Pin to model-a — should switch to it and enter manual mode
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/pin", admin_port))
+        .json(&serde_json::json!({"model": "model-a"}))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Pin failed: {}",
+        response.text().await.unwrap()
+    );
+
+    // Verify manual mode with pin
+    assert_eq!(
+        switcher.mode().await,
+        SwitchMode::Manual {
+            pinned: Some("model-a".to_string())
+        }
+    );
+    assert_eq!(
+        switcher.active_model().await,
+        Some("model-a".to_string())
+    );
+
+    // Pin to unknown model returns 404
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/pin", admin_port))
+        .json(&serde_json::json!({"model": "nonexistent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Unpin — should return to auto mode
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/unpin", admin_port))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(switcher.mode().await, SwitchMode::Auto);
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_control_force_switch() {
+    use llmux::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+    configs.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        configs,
+        mock_vllm_path.to_string(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    let control = llmux::control::control_router(switcher.clone());
+
+    let admin_port = allocate_port();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", admin_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, control).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Force switch to model-a
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/switch", admin_port))
+        .json(&serde_json::json!({"model": "model-a"}))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Switch failed: {}",
+        response.text().await.unwrap()
+    );
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-a".to_string()
+        }
+    );
+
+    // Force switch to model-b
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/switch", admin_port))
+        .json(&serde_json::json!({"model": "model-b"}))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Switch failed: {}",
+        response.text().await.unwrap()
+    );
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-b".to_string()
+        }
+    );
+
+    // Switch to unknown model returns 404
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/switch", admin_port))
+        .json(&serde_json::json!({"model": "nonexistent"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_control_pin_blocks_auto_switching() {
+    use axum::Router;
+    use llmux::{
+        Config, FifoPolicy, ModelConfig, ModelSwitcher, ModelSwitcherLayer, Orchestrator,
+        PolicyConfig, SwitchMode,
+    };
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+    let proxy_port = allocate_port();
+    let admin_port = allocate_port();
+
+    let mut models = HashMap::new();
+    models.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+    models.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let config = Config {
+        models: models.clone(),
+        policy: PolicyConfig::default(),
+        port: proxy_port,
+        metrics_port: 0,
+        vllm_command: mock_vllm_path.to_string(),
+        checkpoint: None,
+        admin_port: None,
+    };
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        config.models.clone(),
+        config.vllm_command.clone(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    // Set up control API on admin port
+    let control = llmux::control::control_router(switcher.clone());
+    let admin_listener = TcpListener::bind(format!("127.0.0.1:{}", admin_port))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        axum::serve(admin_listener, control).await.unwrap();
+    });
+
+    // Set up proxy
+    let targets = config.build_onwards_targets().unwrap();
+    let onwards_state = onwards::AppState::new(targets);
+    let onwards_router = onwards::build_router(onwards_state);
+    let app: Router = onwards_router.layer(ModelSwitcherLayer::new(switcher.clone()));
+
+    let proxy_listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Pin to model-a via control API
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/pin", admin_port))
+        .json(&serde_json::json!({"model": "model-a"}))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    // Request for model-a via proxy should succeed
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "test"}]
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    // Request for model-b via proxy should be rejected (manual mode)
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .json(&serde_json::json!({
+            "model": "model-b",
+            "messages": [{"role": "user", "content": "test"}]
+        }))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+    // Unpin
+    let response = client
+        .post(format!("http://127.0.0.1:{}/control/unpin", admin_port))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(switcher.mode().await, SwitchMode::Auto);
+
+    // Now model-b should be reachable (auto-switching resumes)
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .json(&serde_json::json!({
+            "model": "model-b",
+            "messages": [{"role": "user", "content": "test after unpin"}]
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "model-b request failed after unpin: {}",
+        response.status()
+    );
+
+    server.abort();
 }

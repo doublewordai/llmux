@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
     }
 
     // Build the application
-    let (app, metrics_router) = llmux::build_app(config.clone())
+    let (app, metrics_router, control_router) = llmux::build_app(config.clone())
         .await
         .context("Failed to build application")?;
 
@@ -107,6 +107,20 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = axum::serve(metrics_listener, metrics_router).await {
                 tracing::error!(error = %e, "Metrics server error");
+            }
+        });
+    }
+
+    // Spawn admin/control API server if enabled
+    if let Some(admin_port) = config.admin_port {
+        let admin_addr = format!("0.0.0.0:{}", admin_port);
+        let admin_listener = TcpListener::bind(&admin_addr)
+            .await
+            .with_context(|| format!("Failed to bind admin API to {}", admin_addr))?;
+        info!(addr = %admin_addr, "Serving control API");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin_listener, control_router).await {
+                tracing::error!(error = %e, "Admin server error");
             }
         });
     }
