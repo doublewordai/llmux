@@ -26,6 +26,10 @@ pub struct Config {
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
 
+    /// Admin/control API port (None to disable)
+    #[serde(default)]
+    pub admin_port: Option<u16>,
+
     /// Command to use for spawning vLLM processes (default: "vllm")
     /// Can be overridden for testing with mock-vllm
     #[serde(default = "default_vllm_command")]
@@ -97,6 +101,7 @@ fn default_port() -> u16 {
 fn default_metrics_port() -> u16 {
     9090
 }
+
 
 impl Config {
     /// Load configuration from a JSON file
