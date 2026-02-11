@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/doublewordai/llmux/compare/v0.4.1...v0.5.0) - 2026-02-11
+
+### Added
+
+- add control API with manual switching mode
+- add keep_images option to preserve checkpoints after restore
+
+### Fixed
+
+- transition to Running state before NCCL resume after restore
+- CRIU checkpoint/restore reliability in Docker
+
 ## [0.4.1](https://github.com/doublewordai/llmux/compare/v0.4.0...v0.4.1) - 2026-02-10
 
 ### Fixed
