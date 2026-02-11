@@ -15,6 +15,7 @@
 //!   with the most demand only after the active model's queue fully drains. This
 //!   minimizes switches while a staleness bound caps maximum wait time.
 
+use crate::switcher::EvictionPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::future::Future;
@@ -113,8 +114,8 @@ pub trait SwitchPolicy: Send + Sync {
     /// Policies can use this to track empirical switch costs.
     fn on_switch_complete(&self, _from: &str, _to: &str, _duration: Duration) {}
 
-    /// Sleep level to use (1 or 2)
-    fn sleep_level(&self) -> u8;
+    /// Default eviction policy for models that don't specify one
+    fn eviction_policy(&self) -> EvictionPolicy;
 
     /// Request timeout
     fn request_timeout(&self) -> Duration;
@@ -138,7 +139,7 @@ pub trait SwitchPolicy: Send + Sync {
 
 /// FIFO policy - switch immediately on first request
 pub struct FifoPolicy {
-    sleep_level: u8,
+    eviction: EvictionPolicy,
     request_timeout: Duration,
     drain_before_switch: bool,
     min_active_duration: Duration,
@@ -146,13 +147,13 @@ pub struct FifoPolicy {
 
 impl FifoPolicy {
     pub fn new(
-        sleep_level: u8,
+        eviction: EvictionPolicy,
         request_timeout: Duration,
         drain_before_switch: bool,
         min_active_duration: Duration,
     ) -> Self {
         Self {
-            sleep_level,
+            eviction,
             request_timeout,
             drain_before_switch,
             min_active_duration,
@@ -162,7 +163,12 @@ impl FifoPolicy {
 
 impl Default for FifoPolicy {
     fn default() -> Self {
-        Self::new(1, Duration::from_secs(300), true, Duration::from_secs(5))
+        Self::new(
+            EvictionPolicy::from(1),
+            Duration::from_secs(300),
+            true,
+            Duration::from_secs(5),
+        )
     }
 }
 
@@ -178,8 +184,8 @@ impl SwitchPolicy for FifoPolicy {
         }
     }
 
-    fn sleep_level(&self) -> u8 {
-        self.sleep_level
+    fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction
     }
 
     fn request_timeout(&self) -> Duration {
@@ -261,7 +267,7 @@ impl Default for CoalesceState {
 /// using an exponential moving average. It uses these to estimate both the
 /// cost threshold and the serving window duration.
 pub struct CostAwarePolicy {
-    sleep_level: u8,
+    eviction: EvictionPolicy,
     request_timeout: Duration,
     min_active_duration: Duration,
 
@@ -294,7 +300,7 @@ pub struct CostAwarePolicy {
 
 impl CostAwarePolicy {
     pub fn new(
-        sleep_level: u8,
+        eviction: EvictionPolicy,
         request_timeout: Duration,
         min_active_duration: Duration,
         coalesce_window: Duration,
@@ -320,7 +326,7 @@ impl CostAwarePolicy {
         }
 
         Self {
-            sleep_level,
+            eviction,
             request_timeout,
             min_active_duration,
             coalesce_window,
@@ -482,8 +488,8 @@ impl SwitchPolicy for CostAwarePolicy {
         self.record_switch(from, to, duration);
     }
 
-    fn sleep_level(&self) -> u8 {
-        self.sleep_level
+    fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction
     }
 
     fn request_timeout(&self) -> Duration {
@@ -519,7 +525,7 @@ impl SwitchPolicy for CostAwarePolicy {
 /// this policy achieves 61-94% GPU serving time vs CostAware's 40-81% and
 /// FIFO's 33-79%, while also delivering 2-6x lower maximum wait times.
 pub struct TimeSlicePolicy {
-    sleep_level: u8,
+    eviction: EvictionPolicy,
     request_timeout: Duration,
     min_active_duration: Duration,
     max_wait: Duration,
@@ -530,7 +536,7 @@ pub struct TimeSlicePolicy {
 
 impl TimeSlicePolicy {
     pub fn new(
-        sleep_level: u8,
+        eviction: EvictionPolicy,
         request_timeout: Duration,
         min_active_duration: Duration,
         max_wait: Duration,
@@ -539,7 +545,7 @@ impl TimeSlicePolicy {
         _model_names: Vec<String>,
     ) -> Self {
         Self {
-            sleep_level,
+            eviction,
             request_timeout,
             min_active_duration,
             max_wait,
@@ -578,8 +584,8 @@ impl SwitchPolicy for TimeSlicePolicy {
         ctx.wait_for_in_flight().await;
     }
 
-    fn sleep_level(&self) -> u8 {
-        self.sleep_level
+    fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction
     }
 
     fn request_timeout(&self) -> Duration {

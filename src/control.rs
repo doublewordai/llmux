@@ -13,13 +13,13 @@
 //! | POST   | `/control/pin`          | Pin a model (enters manual mode + switch)|
 //! | POST   | `/control/unpin`        | Unpin and return to auto mode            |
 //! | POST   | `/control/switch`       | Force switch to a model                  |
-//! | GET    | `/control/sleep-levels` | Current sleep level per model             |
-//! | POST   | `/control/sleep-level`  | Override a model's sleep level            |
+//! | GET    | `/control/eviction`     | Current eviction policy per model         |
+//! | POST   | `/control/eviction`     | Override a model's eviction policy        |
 //! | POST   | `/control/sleep`        | Put a model to sleep                      |
 //! | POST   | `/control/wake`         | Wake a sleeping model                     |
 
 use crate::orchestrator::ProcessState;
-use crate::switcher::{ModelSwitcher, SleepLevel, SwitchMode, SwitcherState};
+use crate::switcher::{EvictionPolicy, ModelSwitcher, SwitchMode, SwitcherState};
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::{get, post}};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,8 +32,7 @@ pub fn control_router(switcher: ModelSwitcher) -> Router {
         .route("/control/pin", post(pin_model))
         .route("/control/unpin", post(unpin_model))
         .route("/control/switch", post(force_switch))
-        .route("/control/sleep-levels", get(get_sleep_levels))
-        .route("/control/sleep-level", post(set_sleep_level))
+        .route("/control/eviction", get(get_eviction_policies).post(set_eviction_policy))
         .route("/control/sleep", post(sleep_model))
         .route("/control/wake", post(wake_model))
         .with_state(switcher)
@@ -74,15 +73,15 @@ struct SwitchRequest {
 }
 
 #[derive(Deserialize)]
-struct SetSleepLevelRequest {
+struct SetEvictionRequest {
     model: String,
-    level: u8,
+    eviction: EvictionPolicy,
 }
 
 #[derive(Deserialize)]
 struct SleepRequest {
     model: String,
-    level: Option<u8>,
+    eviction: Option<EvictionPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -91,13 +90,13 @@ struct WakeRequest {
 }
 
 #[derive(Serialize)]
-struct SleepLevelsResponse {
-    models: HashMap<String, SleepLevelInfo>,
+struct EvictionPoliciesResponse {
+    models: HashMap<String, EvictionPolicyInfo>,
 }
 
 #[derive(Serialize)]
-struct SleepLevelInfo {
-    effective_level: u8,
+struct EvictionPolicyInfo {
+    eviction: EvictionPolicy,
     process_state: String,
 }
 
@@ -288,14 +287,14 @@ async fn force_switch(
     }))
 }
 
-async fn get_sleep_levels(State(switcher): State<ModelSwitcher>) -> impl IntoResponse {
+async fn get_eviction_policies(State(switcher): State<ModelSwitcher>) -> impl IntoResponse {
     let orch = switcher.orchestrator();
-    let policy_default = switcher.policy_sleep_level();
+    let policy_default = switcher.policy_eviction();
     let mut models = HashMap::new();
 
     for model_name in switcher.registered_models() {
-        let effective_level = orch
-            .sleep_level_for(&model_name)
+        let eviction = orch
+            .eviction_policy_for(&model_name)
             .unwrap_or(policy_default);
         let process_state = orch
             .process_state(&model_name)
@@ -305,19 +304,19 @@ async fn get_sleep_levels(State(switcher): State<ModelSwitcher>) -> impl IntoRes
 
         models.insert(
             model_name,
-            SleepLevelInfo {
-                effective_level,
+            EvictionPolicyInfo {
+                eviction,
                 process_state,
             },
         );
     }
 
-    Json(SleepLevelsResponse { models })
+    Json(EvictionPoliciesResponse { models })
 }
 
-async fn set_sleep_level(
+async fn set_eviction_policy(
     State(switcher): State<ModelSwitcher>,
-    Json(body): Json<SetSleepLevelRequest>,
+    Json(body): Json<SetEvictionRequest>,
 ) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
     if !switcher.is_registered(&body.model) {
         return Err((
@@ -328,23 +327,14 @@ async fn set_sleep_level(
         ));
     }
 
-    if body.level < 1 || body.level > 5 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("Invalid sleep level: {}. Must be 1-5.", body.level),
-            }),
-        ));
-    }
-
-    switcher.orchestrator().set_sleep_level(&body.model, body.level);
+    switcher
+        .orchestrator()
+        .set_eviction_policy(&body.model, body.eviction);
 
     Ok(Json(MessageResponse {
         message: format!(
-            "Sleep level for {} set to {} ({:?})",
-            body.model,
-            body.level,
-            SleepLevel::from(body.level)
+            "Eviction policy for {} set to {:?}",
+            body.model, body.eviction
         ),
     }))
 }
@@ -362,26 +352,16 @@ async fn sleep_model(
         ));
     }
 
-    let level_raw = body.level.unwrap_or_else(|| {
+    let eviction = body.eviction.unwrap_or_else(|| {
         switcher
             .orchestrator()
-            .sleep_level_for(&body.model)
-            .unwrap_or(switcher.policy_sleep_level())
+            .eviction_policy_for(&body.model)
+            .unwrap_or(switcher.policy_eviction())
     });
 
-    if level_raw < 1 || level_raw > 5 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("Invalid sleep level: {}. Must be 1-5.", level_raw),
-            }),
-        ));
-    }
-
-    let sleep_level = SleepLevel::from(level_raw);
     let orch = switcher.orchestrator();
 
-    if let Err(e) = orch.sleep_model(&body.model, sleep_level).await {
+    if let Err(e) = orch.sleep_model(&body.model, eviction).await {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -391,7 +371,7 @@ async fn sleep_model(
     }
 
     Ok(Json(MessageResponse {
-        message: format!("Model {} sleeping at level {:?}", body.model, sleep_level),
+        message: format!("Model {} sleeping with policy {:?}", body.model, eviction),
     }))
 }
 
@@ -434,8 +414,11 @@ fn format_process_state(state: ProcessState) -> String {
         ProcessState::Starting => "starting".to_string(),
         ProcessState::Running { sleeping: None } => "running".to_string(),
         ProcessState::Running {
-            sleeping: Some(level),
-        } => format!("sleeping:{:?}", level),
+            sleeping: Some(eviction),
+        } => format!(
+            "sleeping:{:?}+{:?}",
+            eviction.weights, eviction.process
+        ),
         ProcessState::Failed { reason } => format!("failed:{}", reason),
         ProcessState::Checkpointed { .. } => "checkpointed".to_string(),
     }
@@ -452,6 +435,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn make_test_switcher() -> ModelSwitcher {
+        use crate::switcher::EvictionPolicy;
         let mut configs = std::collections::HashMap::new();
         configs.insert(
             "model-a".to_string(),
@@ -459,7 +443,7 @@ mod tests {
                 model_path: "test".to_string(),
                 port: 8001,
                 extra_args: vec![],
-                sleep_level: 1,
+                eviction: EvictionPolicy::from(1),
             },
         );
         configs.insert(
@@ -468,7 +452,7 @@ mod tests {
                 model_path: "test".to_string(),
                 port: 8002,
                 extra_args: vec![],
-                sleep_level: 1,
+                eviction: EvictionPolicy::from(1),
             },
         );
         let orchestrator = std::sync::Arc::new(Orchestrator::new(configs));
@@ -632,14 +616,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_sleep_levels() {
+    async fn test_get_eviction_policies() {
         let switcher = make_test_switcher();
         let app = control_router(switcher);
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/control/sleep-levels")
+                    .uri("/control/eviction")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -653,12 +637,12 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert!(json["models"]["model-a"]["effective_level"].is_number());
-        assert!(json["models"]["model-b"]["effective_level"].is_number());
+        assert!(json["models"]["model-a"]["eviction"].is_object());
+        assert!(json["models"]["model-b"]["eviction"].is_object());
     }
 
     #[tokio::test]
-    async fn test_set_sleep_level() {
+    async fn test_set_eviction_policy() {
         let switcher = make_test_switcher();
         let app = control_router(switcher.clone());
 
@@ -666,9 +650,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/control/sleep-level")
+                    .uri("/control/eviction")
                     .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"model":"model-a","level":3}"#))
+                    .body(Body::from(
+                        r#"{"model":"model-a","eviction":{"weights":"retain","process":"cuda_suspend"}}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -677,31 +663,15 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Verify the override took effect
-        assert_eq!(switcher.orchestrator().sleep_level_for("model-a"), Some(3));
-    }
-
-    #[tokio::test]
-    async fn test_set_sleep_level_invalid() {
-        let switcher = make_test_switcher();
-        let app = control_router(switcher);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/control/sleep-level")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"model":"model-a","level":9}"#))
-                    .unwrap(),
-            )
-            .await
+        let policy = switcher
+            .orchestrator()
+            .eviction_policy_for("model-a")
             .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(policy, EvictionPolicy::from(3)); // Retain + CudaSuspend
     }
 
     #[tokio::test]
-    async fn test_set_sleep_level_unknown_model() {
+    async fn test_set_eviction_policy_unknown_model() {
         let switcher = make_test_switcher();
         let app = control_router(switcher);
 
@@ -709,9 +679,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/control/sleep-level")
+                    .uri("/control/eviction")
                     .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"model":"nonexistent","level":2}"#))
+                    .body(Body::from(
+                        r#"{"model":"nonexistent","eviction":{"weights":"discard","process":"stop"}}"#,
+                    ))
                     .unwrap(),
             )
             .await

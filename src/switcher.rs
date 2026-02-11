@@ -12,34 +12,141 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
-/// Sleep level for hibernating models
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SleepLevel {
-    /// Level 1: Offload weights to CPU RAM (faster wake)
-    L1,
-    /// Level 2: Discard weights (slower wake, less RAM)
-    L2,
-    /// Level 3: CUDA suspend via cuda-checkpoint toggle (process stays alive,
-    /// GPU freed, VRAM contents held in host RAM, full state preserved)
+/// What to do with model weights when freeing GPU memory.
+///
+/// This is one axis of the eviction policy. The other is [`ProcessStrategy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeightStrategy {
+    /// Keep weights on GPU (no vLLM sleep). Only meaningful with CudaSuspend
+    /// or Checkpoint — the CUDA plugin/cuda-checkpoint handles GPU state directly.
+    Retain,
+    /// vLLM L1: offload to pinned CPU RAM. Fast wake (~1s), but consumes
+    /// host RAM and produces large CRIU images.
+    Offload,
+    /// vLLM L2: discard weights. Slow wake (reload from disk ~15s), but
+    /// frees host RAM and produces small CRIU images.
+    Discard,
+}
+
+/// What to do with the OS process after weight strategy is applied.
+///
+/// This is one axis of the eviction policy. The other is [`WeightStrategy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessStrategy {
+    /// Process stays alive, CUDA context active.
+    KeepRunning,
+    /// cuda-checkpoint: suspend CUDA context, free remaining VRAM.
+    /// Process stays alive in host RAM.
     CudaSuspend,
-    /// Level 4: CRIU checkpoint (snapshot process to disk, frees all GPU/CPU memory,
-    /// preserves full state including KV cache, CUDA graphs, and warmed allocator)
+    /// CRIU: snapshot to disk, process killed. Frees everything.
     Checkpoint,
-    /// Level 5: Stop the vLLM process entirely (full restart on wake)
+    /// Kill process. Cold start on next use.
     Stop,
 }
 
-impl From<u8> for SleepLevel {
-    fn from(level: u8) -> Self {
-        match level {
-            2 => SleepLevel::L2,
-            3 => SleepLevel::CudaSuspend,
-            4 => SleepLevel::Checkpoint,
-            5 => SleepLevel::Stop,
-            _ => SleepLevel::L1,
+/// Two-axis eviction policy: weight management x process management.
+///
+/// Combinations and their tradeoffs:
+///
+/// | Weights × Process | Images | Wake cost | GPU freed | Host RAM |
+/// |---|---|---|---|---|
+/// | Discard + Checkpoint | tiny (~7GB) | reload weights (~15s) | 100% | 100% |
+/// | Offload + Checkpoint | large (~45GB) | instant (~1s) | 100% | 100% |
+/// | Offload + CudaSuspend | none (in RAM) | instant (~3s) | 100% | weights stay |
+/// | Offload + KeepRunning | none | instant (~1s) | ~90% | weights stay |
+/// | Discard + KeepRunning | none | reload weights (~15s) | ~90% | freed |
+/// | Retain + CudaSuspend | none (in RAM) | instant (~3s) | 100% | VRAM copy |
+/// | Retain + Stop | none | cold start | 100% | 100% |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvictionPolicy {
+    pub weights: WeightStrategy,
+    pub process: ProcessStrategy,
+}
+
+impl EvictionPolicy {
+    /// Convenience constant: kill the process (no checkpoint, no sleep).
+    pub const STOP: Self = Self {
+        weights: WeightStrategy::Retain,
+        process: ProcessStrategy::Stop,
+    };
+
+    /// Whether this policy uses vLLM's sleep API (L1 or L2).
+    pub fn needs_vllm_sleep(&self) -> bool {
+        matches!(
+            self.weights,
+            WeightStrategy::Offload | WeightStrategy::Discard
+        )
+    }
+
+    /// Whether this policy needs cuda-checkpoint or CRIU (which includes
+    /// the CUDA plugin that handles cuda-checkpoint internally).
+    pub fn needs_cuda_checkpoint(&self) -> bool {
+        matches!(
+            self.process,
+            ProcessStrategy::CudaSuspend | ProcessStrategy::Checkpoint
+        )
+    }
+
+    /// Whether this policy uses CRIU for process snapshotting.
+    pub fn needs_criu(&self) -> bool {
+        matches!(self.process, ProcessStrategy::Checkpoint)
+    }
+
+    /// The vLLM sleep level number (1 or 2), or None if no vLLM sleep.
+    pub fn vllm_sleep_level(&self) -> Option<u8> {
+        match self.weights {
+            WeightStrategy::Offload => Some(1),
+            WeightStrategy::Discard => Some(2),
+            WeightStrategy::Retain => None,
         }
     }
 }
+
+impl Default for EvictionPolicy {
+    fn default() -> Self {
+        Self {
+            weights: WeightStrategy::Retain,
+            process: ProcessStrategy::Stop,
+        }
+    }
+}
+
+/// Backward-compatible conversion from the old numeric sleep levels.
+///
+/// - 1 → Offload + KeepRunning (old L1)
+/// - 2 → Discard + KeepRunning (old L2)
+/// - 3 → Retain + CudaSuspend (old CudaSuspend)
+/// - 4 → Discard + Checkpoint (old Checkpoint — now uses the optimal combo)
+/// - 5 → Retain + Stop (old Stop)
+impl From<u8> for EvictionPolicy {
+    fn from(level: u8) -> Self {
+        match level {
+            1 => EvictionPolicy {
+                weights: WeightStrategy::Offload,
+                process: ProcessStrategy::KeepRunning,
+            },
+            2 => EvictionPolicy {
+                weights: WeightStrategy::Discard,
+                process: ProcessStrategy::KeepRunning,
+            },
+            3 => EvictionPolicy {
+                weights: WeightStrategy::Retain,
+                process: ProcessStrategy::CudaSuspend,
+            },
+            4 => EvictionPolicy {
+                weights: WeightStrategy::Discard,
+                process: ProcessStrategy::Checkpoint,
+            },
+            5 | _ => EvictionPolicy {
+                weights: WeightStrategy::Retain,
+                process: ProcessStrategy::Stop,
+            },
+        }
+    }
+}
+
 
 /// Errors from the switcher
 #[derive(Debug, thiserror::Error)]
@@ -202,9 +309,9 @@ impl ModelSwitcher {
         &self.inner.orchestrator
     }
 
-    /// Get the policy's default sleep level
-    pub fn policy_sleep_level(&self) -> u8 {
-        self.inner.policy.sleep_level()
+    /// Get the policy's default eviction policy
+    pub fn policy_eviction(&self) -> EvictionPolicy {
+        self.inner.policy.eviction_policy()
     }
 
     /// Force a switch to the given model, bypassing policy.
@@ -554,31 +661,30 @@ impl ModelSwitcher {
         }
         let drain_dur = drain_start.elapsed();
 
-        // Phase 3: Sleep old model — use per-model sleep level from config,
+        // Phase 3: Sleep old model — use per-model eviction policy from config,
         // falling back to the global policy default.
         // Exception: if the target model is already checkpointed on disk,
-        // downgrade the sleep to Stop (kill) to avoid needing disk space
+        // downgrade the process strategy to Stop (kill) to avoid needing disk space
         // for two simultaneous CRIU checkpoints.
         let sleep_start = Instant::now();
         if let Some(ref from) = from_model {
-            let level_raw = self
+            let mut eviction = self
                 .inner
                 .orchestrator
-                .sleep_level_for(from)
-                .unwrap_or_else(|| self.inner.policy.sleep_level());
-            let mut sleep_level = SleepLevel::from(level_raw);
-            if sleep_level == SleepLevel::Checkpoint
+                .eviction_policy_for(from)
+                .unwrap_or_else(|| self.inner.policy.eviction_policy());
+            if eviction.process == ProcessStrategy::Checkpoint
                 && self.inner.orchestrator.is_checkpointed(target_model)
             {
                 info!(
                     from = %from,
                     to = %target_model,
-                    "Target is checkpointed; downgrading sleep to Stop to avoid dual checkpoint"
+                    "Target is checkpointed; downgrading process to Stop to avoid dual checkpoint"
                 );
-                sleep_level = SleepLevel::Stop;
+                eviction.process = ProcessStrategy::Stop;
             }
-            debug!(model = %from, level = ?sleep_level, "Sleeping model");
-            self.inner.orchestrator.force_sleep(from, sleep_level).await;
+            debug!(model = %from, eviction = ?eviction, "Sleeping model");
+            self.inner.orchestrator.force_sleep(from, eviction).await;
         }
 
         // Clear draining flag now that sleep is complete
@@ -644,7 +750,7 @@ impl ModelSwitcher {
                     // Clean up: force-sleep the partially-woken model to free GPU memory
                     self.inner
                         .orchestrator
-                        .force_sleep(target_model, SleepLevel::Stop)
+                        .force_sleep(target_model, EvictionPolicy::STOP)
                         .await;
                     *self.inner.last_switch_failure.write().await = Some(Instant::now());
                     {
@@ -665,7 +771,7 @@ impl ModelSwitcher {
                 // Clean up: force-sleep in case the model partially woke
                 self.inner
                     .orchestrator
-                    .force_sleep(target_model, SleepLevel::Stop)
+                    .force_sleep(target_model, EvictionPolicy::STOP)
                     .await;
                 *self.inner.last_switch_failure.write().await = Some(Instant::now());
                 {
@@ -797,7 +903,7 @@ mod tests {
                 model_path: "test".to_string(),
                 port: 8001,
                 extra_args: vec![],
-                sleep_level: 1,
+                eviction: EvictionPolicy::from(1),
             },
         );
         configs.insert(
@@ -806,7 +912,7 @@ mod tests {
                 model_path: "test".to_string(),
                 port: 8002,
                 extra_args: vec![],
-                sleep_level: 1,
+                eviction: EvictionPolicy::from(1),
             },
         );
         Arc::new(Orchestrator::new(configs))

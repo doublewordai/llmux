@@ -3,7 +3,7 @@
     "llama-8b": {
       "model_path": "NousResearch/Meta-Llama-3.1-8B-Instruct",
       "port": 8005,
-      "sleep_level": 3,
+      "eviction": { "weights": "retain", "process": "cuda_suspend" },
       "extra_args": [
         "--max-model-len", "512",
         "--gpu-memory-utilization", "0.85",

@@ -5,16 +5,16 @@
 
 use crate::config::Config;
 use crate::orchestrator::Orchestrator;
-use crate::switcher::SleepLevel;
+use crate::switcher::EvictionPolicy;
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
-/// Result of testing a single sleep level
+/// Result of testing a single eviction policy
 struct LevelResult {
-    level: SleepLevel,
+    eviction: EvictionPolicy,
     sleep_secs: f64,
     wake_secs: f64,
     gpu_before_sleep: u64,
@@ -73,21 +73,21 @@ pub async fn run_validation(
     println!("Baseline response: {:?}", baseline);
     println!("Baseline GPU memory: {} MiB", baseline_gpu);
 
-    // Test each sleep level
-    let test_levels: Vec<SleepLevel> = match levels {
-        Some(nums) => nums.iter().map(|&n| SleepLevel::from(n)).collect(),
-        None => vec![SleepLevel::L1, SleepLevel::L2],
+    // Test each eviction policy
+    let test_policies: Vec<EvictionPolicy> = match levels {
+        Some(nums) => nums.iter().map(|&n| EvictionPolicy::from(n)).collect(),
+        None => vec![EvictionPolicy::from(1), EvictionPolicy::from(2)],
     };
     let mut results = Vec::new();
 
-    for level in &test_levels {
-        println!("\n--- Testing {:?} ---", level);
+    for eviction in &test_policies {
+        println!("\n--- Testing {:?} ---", eviction);
         let result = test_sleep_level(
             &orchestrator,
             model_name,
             port,
             &model_path,
-            *level,
+            *eviction,
             &baseline,
             baseline_gpu,
         )
@@ -96,9 +96,9 @@ pub async fn run_validation(
         match result {
             Ok(r) => results.push(r),
             Err(e) => {
-                println!("ERROR testing {:?}: {}", level, e);
+                println!("ERROR testing {:?}: {}", eviction, e);
                 results.push(LevelResult {
-                    level: *level,
+                    eviction: *eviction,
                     sleep_secs: 0.0,
                     wake_secs: 0.0,
                     gpu_before_sleep: baseline_gpu,
@@ -112,8 +112,8 @@ pub async fn run_validation(
     }
 
     // Cleanup: stop the model
-    println!("\nStopping model (L5)...");
-    let _ = orchestrator.sleep_model(model_name, SleepLevel::Stop).await;
+    println!("\nStopping model...");
+    let _ = orchestrator.sleep_model(model_name, EvictionPolicy::STOP).await;
 
     // Print results table
     print_results(&results);
@@ -128,13 +128,13 @@ pub async fn run_validation(
     Ok(all_pass)
 }
 
-/// Test a single sleep level: sleep → measure → wake → measure → verify response
+/// Test a single eviction policy: sleep → measure → wake → measure → verify response
 async fn test_sleep_level(
     orchestrator: &Arc<Orchestrator>,
     model: &str,
     port: u16,
     model_path: &str,
-    level: SleepLevel,
+    eviction: EvictionPolicy,
     baseline: &str,
     _baseline_gpu: u64,
 ) -> Result<LevelResult> {
@@ -143,7 +143,7 @@ async fn test_sleep_level(
     // Sleep
     let sleep_start = Instant::now();
     orchestrator
-        .sleep_model(model, level)
+        .sleep_model(model, eviction)
         .await
         .context("sleep_model failed")?;
     let sleep_secs = sleep_start.elapsed().as_secs_f64();
@@ -187,7 +187,7 @@ async fn test_sleep_level(
     let pass = response_matches;
 
     Ok(LevelResult {
-        level,
+        eviction,
         sleep_secs,
         wake_secs,
         gpu_before_sleep,
@@ -270,23 +270,17 @@ fn query_gpu_memory() -> u64 {
 fn print_results(results: &[LevelResult]) {
     println!();
     println!(
-        "{:<8} {:>10} {:>10} {:>12} {:>12} {:>12} {:>10} {:>6}",
-        "Level", "Sleep (s)", "Wake (s)", "GPU Before", "GPU After", "GPU Wake", "Response", "Pass"
+        "{:<20} {:>10} {:>10} {:>12} {:>12} {:>12} {:>10} {:>6}",
+        "Policy", "Sleep (s)", "Wake (s)", "GPU Before", "GPU After", "GPU Wake", "Response", "Pass"
     );
-    println!("{}", "-".repeat(88));
+    println!("{}", "-".repeat(100));
 
     for r in results {
-        let level_str = match r.level {
-            SleepLevel::L1 => "L1",
-            SleepLevel::L2 => "L2",
-            SleepLevel::CudaSuspend => "CudaSus",
-            SleepLevel::Checkpoint => "CRIU",
-            SleepLevel::Stop => "Stop",
-        };
+        let policy_str = format!("{:?}+{:?}", r.eviction.weights, r.eviction.process);
 
         println!(
-            "{:<8} {:>10.1} {:>10.1} {:>10} MiB {:>10} MiB {:>10} MiB {:>10} {:>6}",
-            level_str,
+            "{:<20} {:>10.1} {:>10.1} {:>10} MiB {:>10} MiB {:>10} MiB {:>10} {:>6}",
+            policy_str,
             r.sleep_secs,
             r.wake_secs,
             r.gpu_before_sleep,

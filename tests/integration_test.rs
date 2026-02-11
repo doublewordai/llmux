@@ -297,7 +297,7 @@ async fn test_orchestrator_spawns_and_manages_process() {
             model_path: "test-model".to_string(),
             port: 0, // Will use dynamic port, but orchestrator needs a fixed port
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -345,7 +345,7 @@ async fn test_orchestrator_spawns_and_manages_process() {
 
     // Sleep via orchestrator
     orchestrator
-        .sleep_model("test-model", llmux::SleepLevel::L1)
+        .sleep_model("test-model", llmux::EvictionPolicy::from(1))
         .await
         .unwrap();
 
@@ -382,7 +382,7 @@ async fn test_orchestrator_multiple_models() {
             model_path: "model-alpha".to_string(),
             port: port_alpha,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     models.insert(
@@ -391,7 +391,7 @@ async fn test_orchestrator_multiple_models() {
             model_path: "model-beta".to_string(),
             port: port_beta,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -443,7 +443,7 @@ async fn test_orchestrator_multiple_models() {
 
     // Sleep alpha, beta stays awake
     orchestrator
-        .sleep_model("model-alpha", llmux::SleepLevel::L1)
+        .sleep_model("model-alpha", llmux::EvictionPolicy::from(1))
         .await
         .unwrap();
 
@@ -481,7 +481,7 @@ async fn test_switcher_basic_registration() {
             model_path: "test".to_string(),
             port: 8001,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     configs.insert(
@@ -490,7 +490,7 @@ async fn test_switcher_basic_registration() {
             model_path: "test".to_string(),
             port: 8002,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -515,7 +515,7 @@ async fn test_switcher_unregistered_model_error() {
             model_path: "test".to_string(),
             port: 8001,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -540,7 +540,7 @@ async fn test_switcher_in_flight_tracking() {
             model_path: "test".to_string(),
             port: 8001,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -585,7 +585,7 @@ async fn test_switcher_initial_state() {
             model_path: "test".to_string(),
             port: 8001,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -618,7 +618,7 @@ async fn test_switcher_ensure_model_ready() {
             model_path: "test-model".to_string(),
             port,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -672,7 +672,7 @@ async fn test_switcher_model_switching() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     configs.insert(
@@ -681,7 +681,7 @@ async fn test_switcher_model_switching() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -748,7 +748,7 @@ async fn test_switcher_same_model_no_switch() {
             model_path: "model-a".to_string(),
             port,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -804,7 +804,7 @@ async fn test_orchestrator_unknown_model() {
             model_path: "test".to_string(),
             port: 8001,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -819,7 +819,7 @@ async fn test_orchestrator_unknown_model() {
 
     // sleep/wake should fail for unknown model
     let result = orchestrator
-        .sleep_model("unknown", llmux::SleepLevel::L1)
+        .sleep_model("unknown", llmux::EvictionPolicy::from(1))
         .await;
     assert!(matches!(result, Err(OrchestratorError::ModelNotFound(_))));
 
@@ -854,7 +854,7 @@ async fn test_end_to_end_single_model() {
             model_path: "test-model".to_string(),
             port: backend_port,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -952,7 +952,7 @@ async fn test_end_to_end_model_switching() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     models.insert(
@@ -961,7 +961,7 @@ async fn test_end_to_end_model_switching() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1089,7 +1089,7 @@ async fn test_end_to_end_unknown_model_passthrough() {
             model_path: "known-model".to_string(),
             port: backend_port,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1170,7 +1170,7 @@ async fn test_l3_fallback_on_sleep_failure() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     configs.insert(
@@ -1179,7 +1179,7 @@ async fn test_l3_fallback_on_sleep_failure() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1283,7 +1283,7 @@ async fn test_drain_waits_for_in_flight_before_sleep() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     configs.insert(
@@ -1292,7 +1292,7 @@ async fn test_drain_waits_for_in_flight_before_sleep() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1303,7 +1303,7 @@ async fn test_drain_waits_for_in_flight_before_sleep() {
 
     // Zero cooldown, drain before switch
     let policy = Box::new(FifoPolicy::new(
-        1,
+        llmux::EvictionPolicy::from(1),
         Duration::from_secs(60),
         true,
         Duration::ZERO,
@@ -1442,7 +1442,7 @@ async fn test_end_to_end_concurrent_requests() {
             model_path: "test-model".to_string(),
             port: backend_port,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1536,7 +1536,7 @@ async fn test_switch_cooldown_enforced() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     configs.insert(
@@ -1545,7 +1545,7 @@ async fn test_switch_cooldown_enforced() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1556,7 +1556,7 @@ async fn test_switch_cooldown_enforced() {
 
     // Use a 2-second cooldown for testing
     let policy = Box::new(FifoPolicy::new(
-        1,
+        llmux::EvictionPolicy::from(1),
         Duration::from_secs(60),
         true,
         Duration::from_secs(2),
@@ -1620,7 +1620,7 @@ async fn test_zombie_process_recovery() {
             model_path: "test-model".to_string(),
             port,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1652,7 +1652,7 @@ async fn test_zombie_process_recovery() {
 
     // Kill the process via orchestrator's sleep_model with Stop level
     orchestrator
-        .sleep_model("test-model", llmux::SleepLevel::Stop)
+        .sleep_model("test-model", llmux::EvictionPolicy::STOP)
         .await
         .unwrap();
 
@@ -1703,7 +1703,7 @@ async fn test_zombie_detection_on_wake() {
             model_path: "test-model".to_string(),
             port,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1793,7 +1793,7 @@ async fn test_wake_failure_cleans_up_target_model() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     configs.insert(
@@ -1802,7 +1802,7 @@ async fn test_wake_failure_cleans_up_target_model() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1843,7 +1843,7 @@ async fn test_wake_failure_cleans_up_target_model() {
 
     // Put model-b to sleep so the switcher will try to wake it
     orchestrator
-        .sleep_model("model-b", llmux::SleepLevel::L1)
+        .sleep_model("model-b", llmux::EvictionPolicy::from(1))
         .await
         .expect("Failed to sleep model-b");
 
@@ -1901,7 +1901,7 @@ async fn test_control_status() {
             model_path: "test".to_string(),
             port: 8001,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -1951,7 +1951,7 @@ async fn test_control_mode_switching() {
             model_path: "test".to_string(),
             port: 8001,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -2042,7 +2042,7 @@ async fn test_control_pin_and_unpin() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     configs.insert(
@@ -2051,7 +2051,7 @@ async fn test_control_pin_and_unpin() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -2141,7 +2141,7 @@ async fn test_control_force_switch() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     configs.insert(
@@ -2150,7 +2150,7 @@ async fn test_control_force_switch() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 
@@ -2253,7 +2253,7 @@ async fn test_control_pin_blocks_auto_switching() {
             model_path: "model-a".to_string(),
             port: port_a,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
     models.insert(
@@ -2262,7 +2262,7 @@ async fn test_control_pin_blocks_auto_switching() {
             model_path: "model-b".to_string(),
             port: port_b,
             extra_args: vec![],
-            sleep_level: 1,
+            eviction: llmux::EvictionPolicy::from(1),
         },
     );
 

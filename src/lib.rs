@@ -51,7 +51,10 @@ pub use policy::{
     CostAwarePolicy, FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy,
     TimeSlicePolicy,
 };
-pub use switcher::{ModelSwitcher, SleepLevel, SwitchError, SwitchMode, SwitcherState};
+pub use switcher::{
+    EvictionPolicy, ModelSwitcher, ProcessStrategy, SwitchError, SwitchMode, SwitcherState,
+    WeightStrategy,
+};
 
 use anyhow::Result;
 use std::sync::Arc;

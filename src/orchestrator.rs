@@ -7,7 +7,7 @@
 //! - Coordinating with the switcher for wake/sleep operations
 
 use crate::config::{CheckpointConfig, ModelConfig};
-use crate::switcher::SleepLevel;
+use crate::switcher::{EvictionPolicy, ProcessStrategy, WeightStrategy};
 use anyhow::Result;
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -38,8 +38,8 @@ pub enum ProcessState {
     Starting,
     /// Process is running and ready
     Running {
-        /// Whether the model is currently sleeping, and at which level
-        sleeping: Option<SleepLevel>,
+        /// Whether the model is currently sleeping, and the eviction policy used
+        sleeping: Option<EvictionPolicy>,
     },
     /// Process failed to start or crashed
     Failed { reason: String },
@@ -217,8 +217,8 @@ pub struct Orchestrator {
     configs: HashMap<String, ModelConfig>,
     /// Process state for each model
     processes: DashMap<String, Arc<Mutex<ManagedProcess>>>,
-    /// Runtime sleep level overrides (takes priority over config)
-    sleep_level_overrides: DashMap<String, u8>,
+    /// Runtime eviction policy overrides (takes priority over config)
+    eviction_overrides: DashMap<String, EvictionPolicy>,
     /// Lock for serializing process operations
     operation_lock: Mutex<()>,
     /// Health check timeout
@@ -269,7 +269,7 @@ impl Orchestrator {
         Self {
             configs,
             processes,
-            sleep_level_overrides: DashMap::new(),
+            eviction_overrides: DashMap::new(),
             operation_lock: Mutex::new(()),
             health_timeout: Duration::from_secs(5),
             startup_timeout: Duration::from_secs(900), // 15 minutes for large TP models
@@ -290,12 +290,12 @@ impl Orchestrator {
         self.configs.keys().cloned().collect()
     }
 
-    /// Get the effective sleep level for a model (override > config)
-    pub fn sleep_level_for(&self, model: &str) -> Option<u8> {
-        if let Some(level) = self.sleep_level_overrides.get(model) {
-            return Some(*level);
+    /// Get the effective eviction policy for a model (override > config)
+    pub fn eviction_policy_for(&self, model: &str) -> Option<EvictionPolicy> {
+        if let Some(policy) = self.eviction_overrides.get(model) {
+            return Some(*policy);
         }
-        self.configs.get(model).map(|c| c.sleep_level)
+        self.configs.get(model).map(|c| c.eviction)
     }
 
     /// Check if a model is currently in the Checkpointed state
@@ -309,9 +309,9 @@ impl Orchestrator {
         false
     }
 
-    /// Override the sleep level for a model at runtime
-    pub fn set_sleep_level(&self, model: &str, level: u8) {
-        self.sleep_level_overrides.insert(model.to_string(), level);
+    /// Override the eviction policy for a model at runtime
+    pub fn set_eviction_policy(&self, model: &str, policy: EvictionPolicy) {
+        self.eviction_overrides.insert(model.to_string(), policy);
     }
 
     /// Ensure a model's process is running and ready
@@ -402,31 +402,16 @@ impl Orchestrator {
         }
 
         // Build vLLM command
-        // Determine spawn behaviour from the model's configured sleep level.
-        // - L1/L2 use vLLM's built-in sleep API → need --enable-sleep-mode + dev mode
-        // - CudaSuspend uses cuda-checkpoint toggle → no vLLM sleep API needed
+        // Determine spawn behaviour from the model's configured eviction policy.
+        // - Offload/Discard weights use vLLM's built-in sleep API
+        // - CudaSuspend/Checkpoint process strategies need cuda-checkpoint or CRIU
         // - Checkpoint (CRIU) additionally needs file-based stdio and io_uring disabled
-        // - Stop doesn't need anything special
-        let model_level = SleepLevel::from(config.sleep_level);
-        let needs_cuda_checkpoint = matches!(
-            model_level,
-            SleepLevel::CudaSuspend | SleepLevel::Checkpoint
-        );
-        let needs_criu = matches!(model_level, SleepLevel::Checkpoint);
+        let eviction = config.eviction;
+        let needs_cuda_checkpoint = eviction.needs_cuda_checkpoint();
+        let needs_criu = eviction.needs_criu();
 
-        let args = if needs_cuda_checkpoint {
-            // cuda-checkpoint / CRIU mode: don't add --enable-sleep-mode
-            let mut args = vec![
-                "serve".to_string(),
-                config.model_path.clone(),
-                "--port".to_string(),
-                config.port.to_string(),
-            ];
-            args.extend(config.extra_args.clone());
-            args
-        } else {
-            config.vllm_args()
-        };
+        // vllm_args() always includes --enable-sleep-mode for consistency
+        let args = config.vllm_args();
         debug!(model = %model, args = ?args, "vLLM command args");
 
         // Spawn process in its own process group so we can kill the entire
@@ -715,14 +700,14 @@ impl Orchestrator {
             .get(model)
             .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
 
-        // Check if already awake, and capture the sleep level for wake logic
-        let actual_sleep_level = {
+        // Check if already awake, and capture the eviction policy for wake logic
+        let eviction = {
             let guard = process.lock().await;
             match &guard.state {
                 ProcessState::Running { sleeping: None } => return Ok(()),
                 ProcessState::Running {
-                    sleeping: Some(level),
-                } => *level,
+                    sleeping: Some(policy),
+                } => *policy,
                 _ => {
                     // Not running at all — ensure_running above should have started it
                     return Ok(());
@@ -730,10 +715,10 @@ impl Orchestrator {
             }
         };
 
-        info!(model = %model, sleep_level = ?actual_sleep_level, "Waking model from sleep");
+        info!(model = %model, eviction = ?eviction, "Waking model from sleep");
 
         // CudaSuspend: toggle CUDA back on, then rebuild NCCL for TP>1
-        if actual_sleep_level == SleepLevel::CudaSuspend {
+        if eviction.process == ProcessStrategy::CudaSuspend {
             self.cuda_suspend_toggle(model, &process, false).await?;
 
             // For TP>1: rebuild NCCL communicators after cuda-checkpoint restore
@@ -761,61 +746,64 @@ impl Orchestrator {
 
         let base_url = format!("http://localhost:{}", config.port);
 
-        // Step 1: POST /wake_up
-        info!(model = %model, "Wake step 1/3: POST /wake_up");
-        self.post_request(
-            &format!("{}/wake_up", base_url),
-            None,
-            Duration::from_secs(30),
-        )
-        .await
-        .map_err(|e| {
-            error!(model = %model, error = %e, "Wake step 1/3 FAILED: /wake_up returned error");
-            OrchestratorError::WakeFailed {
-                model: model.to_string(),
-                reason: e,
-            }
-        })?;
-        info!(model = %model, "Wake step 1/3: /wake_up succeeded");
-
-        // For L2 sleep, need to reload weights
-        if actual_sleep_level == SleepLevel::L2 {
-            // Step 2: POST /collective_rpc (reload_weights)
-            info!(model = %model, "Wake step 2/3: POST /collective_rpc (reload_weights)");
-
-            if let Err(e) = self
-                .post_request(
-                    &format!("{}/collective_rpc", base_url),
-                    Some(r#"{"method": "reload_weights"}"#),
-                    Duration::from_secs(60),
-                )
-                .await
-            {
-                // L2 reload failed — model is partially woken, consuming GPU memory.
-                // Force it back to sleep to free GPU memory before returning error.
-                error!(model = %model, error = %e, "Wake step 2/3 FAILED: reload_weights returned error");
-                self.force_sleep(model, SleepLevel::Stop).await;
-                return Err(OrchestratorError::WakeFailed {
-                    model: model.to_string(),
-                    reason: e,
-                });
-            }
-            info!(model = %model, "Wake step 2/3: reload_weights succeeded");
-
-            // Step 3: POST /reset_prefix_cache
-            info!(model = %model, "Wake step 3/3: POST /reset_prefix_cache");
+        // If vLLM sleep was used (Offload or Discard weights), wake via API
+        if eviction.needs_vllm_sleep() {
+            // Step 1: POST /wake_up
+            info!(model = %model, "Wake step 1/3: POST /wake_up");
             self.post_request(
-                &format!("{}/reset_prefix_cache", base_url),
+                &format!("{}/wake_up", base_url),
                 None,
                 Duration::from_secs(30),
             )
             .await
             .map_err(|e| {
-                warn!(model = %model, error = %e, "Wake step 3/3: reset_prefix_cache failed (non-fatal)");
-                // Don't fail on cache reset
-            })
-            .ok();
-            info!(model = %model, "Wake step 3/3: reset_prefix_cache done");
+                error!(model = %model, error = %e, "Wake step 1/3 FAILED: /wake_up returned error");
+                OrchestratorError::WakeFailed {
+                    model: model.to_string(),
+                    reason: e,
+                }
+            })?;
+            info!(model = %model, "Wake step 1/3: /wake_up succeeded");
+
+            // For Discard weights, need to reload weights
+            if eviction.weights == WeightStrategy::Discard {
+                // Step 2: POST /collective_rpc (reload_weights)
+                info!(model = %model, "Wake step 2/3: POST /collective_rpc (reload_weights)");
+
+                if let Err(e) = self
+                    .post_request(
+                        &format!("{}/collective_rpc", base_url),
+                        Some(r#"{"method": "reload_weights"}"#),
+                        Duration::from_secs(60),
+                    )
+                    .await
+                {
+                    // Reload failed — model is partially woken, consuming GPU memory.
+                    // Force it back to sleep to free GPU memory before returning error.
+                    error!(model = %model, error = %e, "Wake step 2/3 FAILED: reload_weights returned error");
+                    self.force_sleep(model, EvictionPolicy::STOP).await;
+                    return Err(OrchestratorError::WakeFailed {
+                        model: model.to_string(),
+                        reason: e,
+                    });
+                }
+                info!(model = %model, "Wake step 2/3: reload_weights succeeded");
+
+                // Step 3: POST /reset_prefix_cache
+                info!(model = %model, "Wake step 3/3: POST /reset_prefix_cache");
+                self.post_request(
+                    &format!("{}/reset_prefix_cache", base_url),
+                    None,
+                    Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| {
+                    warn!(model = %model, error = %e, "Wake step 3/3: reset_prefix_cache failed (non-fatal)");
+                    // Don't fail on cache reset
+                })
+                .ok();
+                info!(model = %model, "Wake step 3/3: reset_prefix_cache done");
+            }
         }
 
         // Update state
@@ -828,11 +816,15 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Put a model to sleep
+    /// Put a model to sleep using the given eviction policy.
+    ///
+    /// The sleep sequence is:
+    /// 1. Apply weight strategy (vLLM sleep API if Offload/Discard)
+    /// 2. Apply process strategy (CudaSuspend, Checkpoint, Stop, or KeepRunning)
     pub async fn sleep_model(
         &self,
         model: &str,
-        level: SleepLevel,
+        eviction: EvictionPolicy,
     ) -> Result<(), OrchestratorError> {
         // Check if the process is still alive before trying to talk to it
         self.check_process_alive(model).await;
@@ -848,37 +840,36 @@ impl Orchestrator {
             .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
 
         // Check if already sleeping or not running.
-        // Allow Stop to proceed even if already sleeping — it kills the process
-        // to guarantee GPU memory is freed (e.g. after a failed wake).
+        // Allow Stop/Checkpoint/CudaSuspend to proceed even if already sleeping —
+        // they guarantee GPU memory is freed (e.g. after a failed wake).
         {
             let guard = process.lock().await;
             match &guard.state {
                 ProcessState::Running {
                     sleeping: Some(_), ..
-                } if !matches!(
-                    level,
-                    SleepLevel::Stop | SleepLevel::Checkpoint | SleepLevel::CudaSuspend
+                } if matches!(
+                    eviction.process,
+                    ProcessStrategy::KeepRunning
                 ) =>
                 {
                     return Ok(());
                 }
                 ProcessState::Running { .. } => {
-                    // Proceed with sleep (awake, or sleeping but Stop/Checkpoint requested)
+                    // Proceed with sleep (awake, or sleeping but escalating)
                 }
-                ProcessState::Checkpointed { .. } if level == SleepLevel::Stop => {
+                ProcessState::Checkpointed { .. }
+                    if eviction.process == ProcessStrategy::Stop =>
+                {
                     // Allow Stop to clean up checkpoint images
                 }
                 _ => return Ok(()), // Not running, nothing to sleep
             }
         }
 
-        info!(model = %model, level = ?level, "Putting model to sleep");
+        info!(model = %model, eviction = ?eviction, "Putting model to sleep");
 
-        if level == SleepLevel::Stop {
-            // Stop: kill the vLLM process entirely to free all GPU memory.
-            // vLLM spawns child processes (e.g. EngineCore_DP0) that hold GPU
-            // memory, so we must kill the entire process group, not just the
-            // parent.
+        // Process strategy: Stop — kill the process entirely
+        if eviction.process == ProcessStrategy::Stop {
             let mut guard = process.lock().await;
 
             // If checkpointed, just clean up images dir and reset state
@@ -908,77 +899,80 @@ impl Orchestrator {
             return Ok(());
         }
 
-        if level == SleepLevel::CudaSuspend {
-            let gpu_count = process.lock().await.engine_core_pids.len();
-            let base_url = format!("http://localhost:{}", config.port);
+        let base_url = format!("http://localhost:{}", config.port);
 
-            // For TP>1: tear down NCCL communicators before cuda-checkpoint
-            // (NCCL IPC handles cannot be checkpointed)
-            if gpu_count > 1 {
-                info!(model = %model, tp = gpu_count, "Suspending NCCL communicators");
-                self.post_request(
-                    &format!("{}/collective_rpc", base_url),
-                    Some(r#"{"method": "suspend_nccl"}"#),
-                    Duration::from_secs(30),
-                )
+        // Step 1: Apply weight strategy via vLLM sleep API (if Offload or Discard)
+        if let Some(sleep_level) = eviction.vllm_sleep_level() {
+            let url = format!("{}/sleep?level={}", base_url, sleep_level);
+            self.post_request(&url, None, Duration::from_secs(120))
                 .await
                 .map_err(|e| OrchestratorError::SleepFailed {
                     model: model.to_string(),
-                    reason: format!("Failed to suspend NCCL: {}", e),
+                    reason: e,
                 })?;
-            }
-
-            self.cuda_suspend_toggle(model, &process, true).await?;
-            let mut guard = process.lock().await;
-            guard.state = ProcessState::Running {
-                sleeping: Some(SleepLevel::CudaSuspend),
-            };
-            info!(model = %model, "Model CUDA-suspended (GPU freed, state in host RAM)");
-            return Ok(());
+            info!(model = %model, sleep_level, "vLLM sleep applied");
         }
 
-        if level == SleepLevel::Checkpoint {
-            let gpu_count = process.lock().await.engine_core_pids.len();
-
-            // For TP>1: tear down NCCL communicators before cuda-checkpoint
-            if gpu_count > 1 {
-                let base_url = format!("http://localhost:{}", config.port);
-                info!(model = %model, tp = gpu_count, "Suspending NCCL communicators");
-                self.post_request(
-                    &format!("{}/collective_rpc", base_url),
-                    Some(r#"{"method": "suspend_nccl"}"#),
-                    Duration::from_secs(30),
-                )
-                .await
-                .map_err(|e| OrchestratorError::SleepFailed {
-                    model: model.to_string(),
-                    reason: format!("Failed to suspend NCCL: {}", e),
-                })?;
+        // Step 2: Apply process strategy
+        match eviction.process {
+            ProcessStrategy::KeepRunning => {
+                // Process stays alive, just update state
             }
+            ProcessStrategy::CudaSuspend => {
+                let gpu_count = process.lock().await.engine_core_pids.len();
 
-            return self.checkpoint_model(model, &process).await;
+                // For TP>1: tear down NCCL communicators before cuda-checkpoint
+                // (NCCL IPC handles cannot be checkpointed)
+                if gpu_count > 1 {
+                    info!(model = %model, tp = gpu_count, "Suspending NCCL communicators");
+                    self.post_request(
+                        &format!("{}/collective_rpc", base_url),
+                        Some(r#"{"method": "suspend_nccl"}"#),
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .map_err(|e| OrchestratorError::SleepFailed {
+                        model: model.to_string(),
+                        reason: format!("Failed to suspend NCCL: {}", e),
+                    })?;
+                }
+
+                self.cuda_suspend_toggle(model, &process, true).await?;
+                let mut guard = process.lock().await;
+                guard.state = ProcessState::Running {
+                    sleeping: Some(eviction),
+                };
+                info!(model = %model, "Model CUDA-suspended (GPU freed, state in host RAM)");
+                return Ok(());
+            }
+            ProcessStrategy::Checkpoint => {
+                let gpu_count = process.lock().await.engine_core_pids.len();
+
+                // For TP>1: tear down NCCL communicators before checkpoint
+                if gpu_count > 1 {
+                    info!(model = %model, tp = gpu_count, "Suspending NCCL communicators");
+                    self.post_request(
+                        &format!("{}/collective_rpc", base_url),
+                        Some(r#"{"method": "suspend_nccl"}"#),
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .map_err(|e| OrchestratorError::SleepFailed {
+                        model: model.to_string(),
+                        reason: format!("Failed to suspend NCCL: {}", e),
+                    })?;
+                }
+
+                return self.checkpoint_model(model, &process).await;
+            }
+            ProcessStrategy::Stop => unreachable!(), // handled above
         }
 
-        let level_num = match level {
-            SleepLevel::L1 => 1,
-            SleepLevel::L2 => 2,
-            SleepLevel::Stop | SleepLevel::Checkpoint | SleepLevel::CudaSuspend => unreachable!(),
-        };
-
-        let url = format!("http://localhost:{}/sleep?level={}", config.port, level_num);
-
-        self.post_request(&url, None, Duration::from_secs(120))
-            .await
-            .map_err(|e| OrchestratorError::SleepFailed {
-                model: model.to_string(),
-                reason: e,
-            })?;
-
-        // Update state
+        // Update state (for KeepRunning path)
         {
             let mut guard = process.lock().await;
             guard.state = ProcessState::Running {
-                sleeping: Some(level),
+                sleeping: Some(eviction),
             };
         }
 
@@ -1327,18 +1321,18 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Force a model to sleep, escalating to Stop if the initial level fails.
+    /// Force a model to sleep, escalating to Stop if the initial policy fails.
     ///
     /// This is a guaranteed-cleanup method: it logs errors but **never returns `Err`**.
     /// Used to clean up partially-woken models that hold GPU memory.
-    pub async fn force_sleep(&self, model: &str, level: SleepLevel) {
-        if let Err(e) = self.sleep_model(model, level).await {
-            if level == SleepLevel::Stop {
-                // Already at the highest level, nothing to escalate to
+    pub async fn force_sleep(&self, model: &str, eviction: EvictionPolicy) {
+        if let Err(e) = self.sleep_model(model, eviction).await {
+            if eviction.process == ProcessStrategy::Stop {
+                // Already at the most drastic level, nothing to escalate to
                 error!(model, error = %e, "force_sleep: Stop failed");
             } else {
-                warn!(model, error = %e, "force_sleep: {:?} failed, escalating to Stop", level);
-                if let Err(e2) = self.sleep_model(model, SleepLevel::Stop).await {
+                warn!(model, error = %e, "force_sleep: {:?} failed, escalating to Stop", eviction);
+                if let Err(e2) = self.sleep_model(model, EvictionPolicy::STOP).await {
                     error!(model, error = %e2, "force_sleep: Stop escalation also failed");
                 }
             }
@@ -1482,7 +1476,7 @@ mod tests {
                 model_path: "test/model".to_string(),
                 port: 8001,
                 extra_args: vec![],
-                sleep_level: 1,
+                eviction: EvictionPolicy::from(1),
             },
         );
 

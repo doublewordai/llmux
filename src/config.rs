@@ -1,6 +1,7 @@
 //! Configuration for llmux
 
 use crate::policy::{CostAwarePolicy, FifoPolicy, SwitchPolicy, TimeSlicePolicy};
+use crate::switcher::EvictionPolicy;
 use anyhow::{Context, Result};
 use onwards::target::Targets;
 use serde::{Deserialize, Serialize};
@@ -35,16 +36,17 @@ pub struct Config {
     #[serde(default = "default_vllm_command")]
     pub vllm_command: String,
 
-    /// CRIU/CUDA checkpoint configuration (enables sleep levels 3 and 4)
+    /// CRIU/CUDA checkpoint configuration.
+    /// Required when any model uses CudaSuspend or Checkpoint process strategy.
     #[serde(default)]
     pub checkpoint: Option<CheckpointConfig>,
 }
 
-/// Configuration for CUDA/CRIU-based checkpointing (sleep levels 3 and 4).
+/// Configuration for CUDA/CRIU-based checkpointing.
 ///
-/// When present, enables `SleepLevel::Checkpoint` which uses `cuda-checkpoint`
-/// and `criu` to snapshot the entire vLLM process to disk, freeing all GPU
-/// memory while preserving full state (KV cache, CUDA graphs, warmed allocator).
+/// Required when any model uses `ProcessStrategy::CudaSuspend` or
+/// `ProcessStrategy::Checkpoint`. Provides paths to `cuda-checkpoint` and
+/// `criu` binaries, and the CUDA plugin directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointConfig {
     /// Path to the criu binary (default: "criu" on PATH)
@@ -116,14 +118,14 @@ impl Config {
 
     /// Validate configuration, warning about common misconfigurations.
     ///
-    /// Checks that models using CudaSuspend (level 3) or Checkpoint (level 4)
+    /// Checks that models using CudaSuspend or Checkpoint process strategies
     /// with tensor parallelism have the required vLLM flags.
     pub fn validate(&self) {
+        use crate::switcher::ProcessStrategy;
         use tracing::warn;
 
         for (name, model) in &self.models {
-            let level = model.sleep_level;
-            if level != 3 && level != 4 {
+            if !model.eviction.needs_cuda_checkpoint() {
                 continue;
             }
 
@@ -133,10 +135,10 @@ impl Config {
                 continue;
             }
 
-            let level_name = if level == 3 {
-                "CudaSuspend"
-            } else {
-                "Checkpoint"
+            let strategy_name = match model.eviction.process {
+                ProcessStrategy::CudaSuspend => "CudaSuspend",
+                ProcessStrategy::Checkpoint => "Checkpoint",
+                _ => continue,
             };
 
             if !model.extra_args.contains(&"--enforce-eager".to_string()) {
@@ -144,7 +146,7 @@ impl Config {
                     model = %name,
                     "Model uses {} at TP={} but is missing --enforce-eager. \
                      CUDA graphs hold stale NCCL handles and will crash on resume.",
-                    level_name, tp
+                    strategy_name, tp
                 );
             }
 
@@ -156,7 +158,7 @@ impl Config {
                     model = %name,
                     "Model uses {} at TP={} but is missing --disable-custom-all-reduce. \
                      CustomAllReduce IPC buffers cannot survive cuda-checkpoint.",
-                    level_name, tp
+                    strategy_name, tp
                 );
             }
         }
@@ -201,7 +203,15 @@ impl Config {
     }
 }
 
-/// Configuration for a single model
+/// Configuration for a single model.
+///
+/// ```json
+/// {
+///   "model_path": "...",
+///   "port": 8001,
+///   "eviction": { "weights": "discard", "process": "checkpoint" }
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Path to the model (HuggingFace model ID or local path)
@@ -214,18 +224,10 @@ pub struct ModelConfig {
     #[serde(default)]
     pub extra_args: Vec<String>,
 
-    /// Sleep level when hibernating:
-    /// - 1: Offload weights to CPU RAM (fastest wake)
-    /// - 2: Discard weights (slower wake, less RAM)
-    /// - 3: CUDA suspend (process stays alive, GPU freed, state in host RAM)
-    /// - 4: CRIU checkpoint (snapshot to disk, frees all GPU/CPU memory)
-    /// - 5: Stop the vLLM process entirely (full restart on wake)
-    #[serde(default = "default_sleep_level")]
-    pub sleep_level: u8,
-}
-
-fn default_sleep_level() -> u8 {
-    5
+    /// Eviction policy: controls what happens to weights and to the process
+    /// when this model is put to sleep.
+    #[serde(default)]
+    pub eviction: EvictionPolicy,
 }
 
 impl ModelConfig {
@@ -238,7 +240,11 @@ impl ModelConfig {
             .unwrap_or(1)
     }
 
-    /// Build vLLM command line arguments
+    /// Build vLLM command line arguments.
+    ///
+    /// Always includes `--enable-sleep-mode` for consistency across all
+    /// eviction strategies. The dev mode endpoints (sleep/wake/collective_rpc)
+    /// are available regardless.
     pub fn vllm_args(&self) -> Vec<String> {
         let mut args = vec![
             "serve".to_string(),
@@ -268,9 +274,9 @@ pub struct PolicyConfig {
     #[serde(default = "default_drain_before_switch")]
     pub drain_before_switch: bool,
 
-    /// Default sleep level (1-5)
-    #[serde(default = "default_sleep_level")]
-    pub sleep_level: u8,
+    /// Default eviction policy for models that don't specify one
+    #[serde(default)]
+    pub eviction: EvictionPolicy,
 
     /// Minimum seconds a model must stay active before it can be put to sleep.
     /// Prevents rapid wake/sleep thrashing that can cause GPU page faults.
@@ -309,7 +315,7 @@ impl Default for PolicyConfig {
             policy_type: default_policy_type(),
             request_timeout_secs: default_request_timeout(),
             drain_before_switch: default_drain_before_switch(),
-            sleep_level: default_sleep_level(),
+            eviction: EvictionPolicy::default(),
             min_active_secs: default_min_active_secs(),
             coalesce_window_ms: default_coalesce_window_ms(),
             amortization_factor: default_amortization_factor(),
@@ -362,7 +368,7 @@ impl PolicyConfig {
     pub fn build_policy(&self, model_names: &[String]) -> Box<dyn SwitchPolicy> {
         match self.policy_type.as_str() {
             "cost_aware" => Box::new(CostAwarePolicy::new(
-                self.sleep_level,
+                self.eviction,
                 Duration::from_secs(self.request_timeout_secs),
                 Duration::from_secs(self.min_active_secs),
                 Duration::from_millis(self.coalesce_window_ms),
@@ -371,7 +377,7 @@ impl PolicyConfig {
                 model_names.to_vec(),
             )),
             "time_slice" => Box::new(TimeSlicePolicy::new(
-                self.sleep_level,
+                self.eviction,
                 Duration::from_secs(self.request_timeout_secs),
                 Duration::from_secs(self.min_active_secs),
                 Duration::from_secs(self.max_wait_secs),
@@ -380,7 +386,7 @@ impl PolicyConfig {
                 model_names.to_vec(),
             )),
             _ => Box::new(FifoPolicy::new(
-                self.sleep_level,
+                self.eviction,
                 Duration::from_secs(self.request_timeout_secs),
                 self.drain_before_switch,
                 Duration::from_secs(self.min_active_secs),
@@ -431,12 +437,31 @@ mod tests {
                 "--max-model-len".to_string(),
                 "4096".to_string(),
             ],
-            sleep_level: 1,
+            eviction: EvictionPolicy::from(1),
         };
 
         let args = config.vllm_args();
         assert!(args.contains(&"--enable-sleep-mode".to_string()));
         assert!(args.contains(&"--tensor-parallel-size".to_string()));
         assert!(args.contains(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_eviction_policy_deserialize() {
+        let json = r#"{
+            "models": {
+                "llama": {
+                    "model_path": "meta-llama/Llama-2-7b",
+                    "port": 8001,
+                    "eviction": { "weights": "discard", "process": "checkpoint" }
+                }
+            },
+            "port": 3000
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        let model = &config.models["llama"];
+        assert_eq!(model.eviction.weights, crate::switcher::WeightStrategy::Discard);
+        assert_eq!(model.eviction.process, crate::switcher::ProcessStrategy::Checkpoint);
     }
 }

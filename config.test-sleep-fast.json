@@ -6,8 +6,9 @@
       "eviction": { "weights": "offload", "process": "keep_running" },
       "extra_args": [
         "--max-model-len", "4096",
-        "--gpu-memory-utilization", "0.85",
-        "--enforce-eager"
+        "--gpu-memory-utilization", "0.70",
+        "--enforce-eager",
+        "--load-format", "fastsafetensors"
       ]
     }
   },

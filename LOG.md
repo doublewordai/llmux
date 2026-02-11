@@ -126,3 +126,163 @@ warning about not using `--init`.
 - vLLM: v0.15.1 with sleep mode and NCCL suspend/resume patches
 - Required env vars for B300: `TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`,
   `VLLM_USE_FLASHINFER_MOE_FP8=0`
+
+---
+
+## New session: gotenks (bare metal, 6x RTX 4090)
+
+### Key realization
+
+The existing LOG.md documents a **working** CRIU + vLLM implementation on B300/Docker.
+Critical difference from our failed attempts: **the CUDA plugin handles cuda-checkpoint
+internally**. We were running cuda-checkpoint BEFORE CRIU, which conflicts with the plugin.
+
+From item 5 above: "If cuda-checkpoint --toggle is called before CRIU dump, the restore
+thread is already gone and the plugin errors. Skipping the pre-toggle lets the plugin
+handle cuda-checkpoint internally."
+
+### New approach
+
+Instead of: sleep → cuda-checkpoint → criu dump (plugin conflicts)
+Do: sleep → criu dump (plugin handles cuda-checkpoint internally)
+
+This means the plugin is not optional — it's the mechanism that makes CRIU work with CUDA.
+
+### External unix socket problem
+
+The `subprocess.PIPE` approach creates unix socketpairs between the parent (benchmark
+script) and the child (vLLM). One end of each socketpair is outside the dump tree,
+so CRIU can't dump it. The fix from orchestrator.rs: redirect stdout/stderr to **files**
+and stdin to `/dev/null`. This eliminates the external socket entirely.
+
+### L2 wake requires reload_weights
+
+After CRIU restore, calling `/wake_up` alone for L2 produces garbage output because
+the weights were discarded during L2 sleep. The orchestrator.rs does a 3-step wake:
+1. `POST /wake_up` — re-enables scheduling (0.06s)
+2. `POST /collective_rpc {"method": "reload_weights"}` — reloads weights from disk (~5s)
+3. `POST /reset_prefix_cache` — clears stale cache entries
+
+Without step 2, inference returns `'!!!!!!!!!!'` (random garbage from uninitialized
+GPU memory).
+
+### CRIU benchmark results (gotenks, RTX 4090, Llama 8B)
+
+Both L1 and L2 checkpoint/restore cycles produce **correct inference** after restore.
+
+#### L2 + CRIU (recommended for local eviction)
+
+| Step | Time |
+|------|------|
+| L2 sleep | 0.3s |
+| CRIU dump | 10.1s |
+| **Total sleep** | **10.4s** |
+| CRIU restore | 9.4s |
+| L2 wake (wake_up + reload_weights + reset_prefix_cache) | 4.9s |
+| **Total wake** | **14.4s** |
+| **Round-trip** | **24.8s** |
+| CRIU images on disk | 3128 MB |
+
+#### L1 + CRIU (self-contained portable images)
+
+| Step | Time |
+|------|------|
+| L1 sleep (first, with pinned alloc) | 14.9-18.9s |
+| CRIU dump | 33.5-35.9s |
+| **Total sleep** | **~50s** |
+| CRIU restore | 35.2-38.2s |
+| L1 wake | 0.7s |
+| **Total wake** | **~37s** |
+| **Round-trip** | **~87s** |
+| CRIU images on disk | 21385 MB |
+
+L1 images are ~7x larger than L2 because they contain the model weights in pinned
+CPU memory. This makes dump/restore proportionally slower. L1 images are self-contained
+(portable to any node), while L2 images require the model files to be present locally.
+
+### CRIU flags (matching orchestrator.rs)
+
+**Dump:**
+```
+criu dump -t PID --images-dir DIR --shell-job --ext-unix-sk --tcp-established \
+  --link-remap --enable-external-masters -L /tmp/criu/plugins/cuda -v4 --log-file dump.log
+```
+
+**Restore:**
+```
+criu restore --images-dir DIR --shell-job --ext-unix-sk --tcp-established \
+  --enable-external-masters -L /tmp/criu/plugins/cuda --restore-detached \
+  -v4 --log-file restore.log
+```
+
+### Required environment variables
+
+```
+VLLM_SERVER_DEV_MODE=1    # enables sleep/wake/collective_rpc endpoints
+UV_USE_IO_URING=0         # disable io_uring in uvloop
+USE_LIBUV=0               # belt-and-suspenders io_uring disable
+VLLM_NO_USAGE_STATS=1     # prevent telemetry connections
+DO_NOT_TRACK=1            # prevent telemetry connections
+```
+
+Plus system-wide: `echo 2 > /proc/sys/kernel/io_uring_disabled`
+
+### CUDA plugin behavior
+
+The plugin handles the full CUDA checkpoint/restore lifecycle:
+- **Dump**: Finds CUDA processes, runs `cuda-checkpoint` to suspend them
+- **Restore**: Finds restore threads, runs `cuda-checkpoint --action restore` + `--action unlock`
+- Non-GPU processes (like the APIServer monitoring process) log "Could not find restore thread" — this is a non-fatal warning
+
+The plugin reports `err 0` on both dump and restore when everything works correctly.
+
+### TP=2 CRIU results (Qwen3-32B-FP8, 2x RTX 4090)
+
+Cold start: ~88-120s to first inference (varies by run).
+
+#### L2 + CRIU: FIXED with patch
+
+`reload_weights` via `collective_rpc` was failing with `'Parameter' object has no
+attribute 'load_row_parallel_weight'`. Root cause: `replace_parameter()` in
+`vllm/model_executor/utils.py` creates a plain `nn.Parameter`, losing the original
+subclass (e.g. `RowvLLMParameter`, `ModelWeightParameter`) and its methods.
+
+Fix in `patches/fix-reload-weights-tp-v0.15.1.patch`:
+1. `replace_parameter()` now preserves `__class__` and copies all `__dict__` attrs
+   from old to new parameter, keeping subclass methods and instance attributes
+2. `marlin_utils_fp4.py` uses `replace_parameter()` instead of raw `setattr()`
+
+Related: doublewordai/vllm PR #2 (similar but only does `__dict__` copy, misses
+`__class__` preservation which is needed for methods like `load_row_parallel_weight`)
+
+#### Full comparison (cold start = 89.1s to first inference)
+
+| Method | CRIU image | Restore | Wake | 1st infer | Total | Speedup |
+|--------|-----------|---------|------|-----------|-------|---------|
+| **L2+CRIU** | **6.7 GB** | **8.8s** | **14.9s** | 1.5s | **25.2s** | **3.5x** |
+| L1+CRIU | 45.4 GB | 80.7s | 1.3s | 1.8s | 83.8s | 1.1x |
+| NoSleep+CRIU | 50.1 GB | 71.7s | 0.3s | 1.7s | 73.7s | 1.2x |
+
+L2+CRIU is the clear winner for TP=2: 3.5x faster than cold start with only 6.7 GB
+images. The reload_weights step (14.4s) dominates the wake time but is still much
+faster than cold start's full model init + weight loading (87s).
+
+#### TP=2 wake sequence
+
+1. `resume_nccl` — must be first (NCCL needed for any TP collective ops)
+2. `wake_up` — only if vLLM sleep was used (L1/L2)
+3. `reload_weights` — only for L2 (BROKEN with TP>1)
+4. `reset_prefix_cache`
+
+For NoSleep (CudaSuspend) mode, only `resume_nccl` is needed after restore.
+
+#### TCP connection issue with TP>1
+
+CRIU built without nftables support cannot use `--network-lock nftables`.
+With `--tcp-established` and iptables (default), dump/restore works but the
+PyTorch distributed store TCP connections are preserved. Using `--tcp-close`
+breaks those connections, causing NCCL resume to fail with "Broken pipe".
+With `--tcp-established`, the connections survive and NCCL resume works.
+
+The TIME_WAIT issue from the first attempt (bind error on restore) was a red
+herring — it was caused by stale processes from a previous run, not by CRIU.
