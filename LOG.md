@@ -286,3 +286,10 @@ With `--tcp-established`, the connections survive and NCCL resume works.
 
 The TIME_WAIT issue from the first attempt (bind error on restore) was a red
 herring — it was caused by stale processes from a previous run, not by CRIU.
+
+**Important:** Do NOT pass `--network-lock nftables` to CRIU. Use the default
+(iptables) everywhere. The bare-metal CRIU on gotenks was built without
+libnftables, so `--network-lock nftables` caused dump to fail with "Failed to
+lock TCP connection". Fixed by removing the flag and standardizing on iptables:
+the Docker image now installs `iptables` instead of `libnftables`, and CRIU is
+built without nftables support so there's no ambiguity.

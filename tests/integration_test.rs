@@ -298,6 +298,7 @@ async fn test_orchestrator_spawns_and_manages_process() {
             port: 0, // Will use dynamic port, but orchestrator needs a fixed port
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -383,6 +384,7 @@ async fn test_orchestrator_multiple_models() {
             port: port_alpha,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     models.insert(
@@ -392,6 +394,7 @@ async fn test_orchestrator_multiple_models() {
             port: port_beta,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -482,6 +485,7 @@ async fn test_switcher_basic_registration() {
             port: 8001,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     configs.insert(
@@ -491,6 +495,7 @@ async fn test_switcher_basic_registration() {
             port: 8002,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -516,6 +521,7 @@ async fn test_switcher_unregistered_model_error() {
             port: 8001,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -541,6 +547,7 @@ async fn test_switcher_in_flight_tracking() {
             port: 8001,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -586,6 +593,7 @@ async fn test_switcher_initial_state() {
             port: 8001,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -619,6 +627,7 @@ async fn test_switcher_ensure_model_ready() {
             port,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -673,6 +682,7 @@ async fn test_switcher_model_switching() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     configs.insert(
@@ -682,6 +692,7 @@ async fn test_switcher_model_switching() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -749,6 +760,7 @@ async fn test_switcher_same_model_no_switch() {
             port,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -805,6 +817,7 @@ async fn test_orchestrator_unknown_model() {
             port: 8001,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -855,6 +868,7 @@ async fn test_end_to_end_single_model() {
             port: backend_port,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -953,6 +967,7 @@ async fn test_end_to_end_model_switching() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     models.insert(
@@ -962,6 +977,7 @@ async fn test_end_to_end_model_switching() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1090,6 +1106,7 @@ async fn test_end_to_end_unknown_model_passthrough() {
             port: backend_port,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1171,6 +1188,7 @@ async fn test_l3_fallback_on_sleep_failure() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     configs.insert(
@@ -1180,6 +1198,7 @@ async fn test_l3_fallback_on_sleep_failure() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1284,6 +1303,7 @@ async fn test_drain_waits_for_in_flight_before_sleep() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     configs.insert(
@@ -1293,6 +1313,7 @@ async fn test_drain_waits_for_in_flight_before_sleep() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1443,6 +1464,7 @@ async fn test_end_to_end_concurrent_requests() {
             port: backend_port,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1537,6 +1559,7 @@ async fn test_switch_cooldown_enforced() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     configs.insert(
@@ -1546,6 +1569,7 @@ async fn test_switch_cooldown_enforced() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1621,6 +1645,7 @@ async fn test_zombie_process_recovery() {
             port,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1704,6 +1729,7 @@ async fn test_zombie_detection_on_wake() {
             port,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1794,6 +1820,7 @@ async fn test_wake_failure_cleans_up_target_model() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     configs.insert(
@@ -1803,6 +1830,7 @@ async fn test_wake_failure_cleans_up_target_model() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1902,6 +1930,7 @@ async fn test_control_status() {
             port: 8001,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -1952,6 +1981,7 @@ async fn test_control_mode_switching() {
             port: 8001,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -2043,6 +2073,7 @@ async fn test_control_pin_and_unpin() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     configs.insert(
@@ -2052,6 +2083,7 @@ async fn test_control_pin_and_unpin() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -2142,6 +2174,7 @@ async fn test_control_force_switch() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     configs.insert(
@@ -2151,6 +2184,7 @@ async fn test_control_force_switch() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 
@@ -2254,6 +2288,7 @@ async fn test_control_pin_blocks_auto_switching() {
             port: port_a,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
     models.insert(
@@ -2263,6 +2298,7 @@ async fn test_control_pin_blocks_auto_switching() {
             port: port_b,
             extra_args: vec![],
             eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
         },
     );
 

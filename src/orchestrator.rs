@@ -44,7 +44,11 @@ pub enum ProcessState {
     /// Process failed to start or crashed
     Failed { reason: String },
     /// Process has been checkpointed to disk via CRIU (not running, but restorable)
-    Checkpointed { images_dir: PathBuf },
+    Checkpointed {
+        images_dir: PathBuf,
+        /// The eviction policy used when checkpointing (needed for wake sequence)
+        eviction: EvictionPolicy,
+    },
 }
 
 /// Internal state for a managed process
@@ -253,11 +257,25 @@ impl Orchestrator {
         let processes = DashMap::new();
 
         for (name, config) in &configs {
+            let initial_state = if let Some(ref path) = config.checkpoint_path {
+                info!(
+                    model = %name,
+                    path = %path.display(),
+                    "Model has checkpoint_path, will restore from checkpoint on first request"
+                );
+                ProcessState::Checkpointed {
+                    images_dir: path.clone(),
+                    eviction: config.eviction,
+                }
+            } else {
+                ProcessState::NotStarted
+            };
+
             processes.insert(
                 name.clone(),
                 Arc::new(Mutex::new(ManagedProcess {
                     config: config.clone(),
-                    state: ProcessState::NotStarted,
+                    state: initial_state,
                     child: None,
                     ready_notify: Arc::new(Notify::new()),
                     engine_core_pids: vec![],
@@ -679,11 +697,16 @@ impl Orchestrator {
                 .get(model)
                 .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
             let guard = process.lock().await;
-            if let ProcessState::Checkpointed { ref images_dir } = guard.state {
+            if let ProcessState::Checkpointed {
+                ref images_dir,
+                eviction,
+            } = guard.state
+            {
                 let images_dir = images_dir.clone();
+                let eviction = eviction;
                 drop(guard);
                 drop(process);
-                return self.restore_checkpoint(model, &images_dir).await;
+                return self.restore_checkpoint(model, &images_dir, eviction).await;
             }
         }
 
@@ -817,7 +840,7 @@ impl Orchestrator {
     }
 
     /// Put a model to sleep using the given eviction policy.
-    /// Set a model's state to Checkpointed (for CLI --restore).
+    /// Set a model's state to Checkpointed (for CLI --restore-detached and checkpoint_path config).
     ///
     /// Used to indicate a pre-existing checkpoint on disk so that
     /// `wake_model` will run CRIU restore instead of starting fresh.
@@ -825,13 +848,17 @@ impl Orchestrator {
         &self,
         model: &str,
         images_dir: std::path::PathBuf,
+        eviction: EvictionPolicy,
     ) -> Result<(), OrchestratorError> {
         let process = self
             .processes
             .get(model)
             .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
         let mut guard = process.lock().await;
-        guard.state = ProcessState::Checkpointed { images_dir };
+        guard.state = ProcessState::Checkpointed {
+            images_dir,
+            eviction,
+        };
         Ok(())
     }
 
@@ -891,7 +918,7 @@ impl Orchestrator {
             let mut guard = process.lock().await;
 
             // If checkpointed, just clean up images dir and reset state
-            if let ProcessState::Checkpointed { ref images_dir } = guard.state {
+            if let ProcessState::Checkpointed { ref images_dir, .. } = guard.state {
                 info!(model = %model, "Cleaning up checkpoint images");
                 let _ = std::fs::remove_dir_all(images_dir);
                 guard.state = ProcessState::NotStarted;
@@ -981,7 +1008,7 @@ impl Orchestrator {
                     })?;
                 }
 
-                return self.checkpoint_model(model, &process).await;
+                return self.checkpoint_model(model, &process, eviction).await;
             }
             ProcessStrategy::Stop => unreachable!(), // handled above
         }
@@ -1089,6 +1116,7 @@ impl Orchestrator {
         &self,
         model: &str,
         process: &Arc<Mutex<ManagedProcess>>,
+        eviction: EvictionPolicy,
     ) -> Result<(), OrchestratorError> {
         let ckpt_cfg =
             self.checkpoint_config
@@ -1158,8 +1186,6 @@ impl Orchestrator {
                 "--shell-job",
                 "--ext-unix-sk",
                 "--tcp-established",
-                "--network-lock",
-                "nftables",
                 "--link-remap",
                 "--enable-external-masters",
                 "-L",
@@ -1195,10 +1221,28 @@ impl Orchestrator {
             guard.child = None;
             guard.state = ProcessState::Checkpointed {
                 images_dir: images_dir.clone(),
+                eviction,
             };
         }
 
         info!(model = %model, images_dir = %images_dir.display(), "Model checkpointed to disk");
+
+        // Upload to S3 if object store is configured
+        if let Some(ref obj_cfg) = ckpt_cfg.object_store {
+            match crate::object_store::CheckpointStore::new(obj_cfg) {
+                Ok(store) => {
+                    info!(model = %model, "Uploading checkpoint to object store");
+                    if let Err(e) = store.upload_checkpoint(model, &images_dir).await {
+                        warn!(model = %model, error = %e,
+                              "Failed to upload checkpoint to object store (local copy preserved)");
+                    }
+                }
+                Err(e) => {
+                    warn!(model = %model, error = %e, "Failed to initialize object store client");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1211,6 +1255,7 @@ impl Orchestrator {
         &self,
         model: &str,
         images_dir: &Path,
+        eviction: EvictionPolicy,
     ) -> Result<(), OrchestratorError> {
         let ckpt_cfg =
             self.checkpoint_config
@@ -1227,6 +1272,41 @@ impl Orchestrator {
 
         info!(model = %model, images_dir = %images_dir.display(), "Restoring from CRIU checkpoint");
 
+        // Download from S3 if local images are missing
+        let needs_download = !images_dir.exists()
+            || std::fs::read_dir(images_dir)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true);
+
+        if needs_download {
+            if let Some(ref obj_cfg) = ckpt_cfg.object_store {
+                let store =
+                    crate::object_store::CheckpointStore::new(obj_cfg).map_err(|e| {
+                        OrchestratorError::WakeFailed {
+                            model: model.to_string(),
+                            reason: format!("Failed to init object store: {}", e),
+                        }
+                    })?;
+
+                info!(model = %model, "Local checkpoint not found, downloading from S3");
+                store
+                    .download_checkpoint(model, images_dir)
+                    .await
+                    .map_err(|e| OrchestratorError::WakeFailed {
+                        model: model.to_string(),
+                        reason: format!("Failed to download checkpoint from S3: {}", e),
+                    })?;
+            } else {
+                return Err(OrchestratorError::WakeFailed {
+                    model: model.to_string(),
+                    reason: format!(
+                        "Checkpoint images not found at {} and no object store configured",
+                        images_dir.display()
+                    ),
+                });
+            }
+        }
+
         // Run criu restore
         let criu_restore = maybe_sudo(&ckpt_cfg.criu_path)
             .args([
@@ -1234,8 +1314,6 @@ impl Orchestrator {
                 "--shell-job",
                 "--ext-unix-sk",
                 "--tcp-established",
-                "--network-lock",
-                "nftables",
                 "--enable-external-masters",
                 "-L",
                 &ckpt_cfg.cuda_plugin_dir,
@@ -1323,6 +1401,47 @@ impl Orchestrator {
                 model: model.to_string(),
                 reason: format!("Failed to resume NCCL: {}", e),
             })?;
+        }
+
+        // If vLLM sleep was used before checkpoint, run the wake sequence
+        // (wake_up → reload_weights → reset_prefix_cache)
+        if eviction.needs_vllm_sleep() {
+            let base_url = format!("http://localhost:{}", config.port);
+
+            info!(model = %model, "Post-restore: waking vLLM (POST /wake_up)");
+            self.post_request(
+                &format!("{}/wake_up", base_url),
+                None,
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|e| OrchestratorError::WakeFailed {
+                model: model.to_string(),
+                reason: format!("Post-restore wake_up failed: {}", e),
+            })?;
+
+            if eviction.weights == WeightStrategy::Discard {
+                info!(model = %model, "Post-restore: reloading weights (POST /collective_rpc)");
+                self.post_request(
+                    &format!("{}/collective_rpc", base_url),
+                    Some(r#"{"method": "reload_weights"}"#),
+                    Duration::from_secs(60),
+                )
+                .await
+                .map_err(|e| OrchestratorError::WakeFailed {
+                    model: model.to_string(),
+                    reason: format!("Post-restore reload_weights failed: {}", e),
+                })?;
+
+                info!(model = %model, "Post-restore: resetting prefix cache");
+                self.post_request(
+                    &format!("{}/reset_prefix_cache", base_url),
+                    None,
+                    Duration::from_secs(30),
+                )
+                .await
+                .ok(); // non-fatal
+            }
         }
 
         if !ckpt_cfg.keep_images {
@@ -1495,6 +1614,7 @@ mod tests {
                 port: 8001,
                 extra_args: vec![],
                 eviction: EvictionPolicy::from(1),
+                checkpoint_path: None,
             },
         );
 

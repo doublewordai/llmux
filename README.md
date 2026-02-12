@@ -212,6 +212,7 @@ curl http://localhost:3000/v1/chat/completions \
 | `port` | *required* | Port for this model's vLLM instance |
 | `eviction` | `retain` + `stop` | Eviction policy (see below) |
 | `extra_args` | `[]` | Additional vLLM CLI arguments |
+| `checkpoint_path` | *none* | Path to CRIU checkpoint images for lazy restore on first request |
 
 The `eviction` field takes an object with `weights` and `process` keys:
 
@@ -368,8 +369,8 @@ llmux --config config.json --checkpoint qwen-14b --eviction retain+checkpoint
 # Skip warmup inference before checkpointing
 llmux --config config.json --checkpoint qwen-14b --no-warmup
 
-# Restore from checkpoint (CRIU restore, health check, exit)
-llmux --config config.json --restore qwen-14b
+# Restore detached (CRIU restore, health check, exit — process keeps running)
+llmux --config config.json --restore-detached qwen-14b
 ```
 
 The default eviction for `--checkpoint` is `discard+checkpoint`, which produces
@@ -377,8 +378,34 @@ small CRIU images (weights are reloaded from the HF cache on restore). Use
 `retain+checkpoint` or `offload+checkpoint` for larger images that restore
 faster (weights already in the snapshot).
 
-After `--restore`, the vLLM process continues running on its configured port.
-The daemon can then manage it normally when started.
+After `--restore-detached`, the vLLM process continues running on its configured
+port. This is useful for testing checkpoints or running a single model without
+the daemon.
+
+### Lazy restore via config
+
+Instead of restoring manually, set `checkpoint_path` in your model config so
+the daemon restores from checkpoint on first request:
+
+```json
+{
+  "models": {
+    "qwen-14b": {
+      "model_path": "Qwen/Qwen3-14B",
+      "port": 8001,
+      "eviction": { "weights": "discard", "process": "checkpoint" },
+      "checkpoint_path": "/tmp/llmux-checkpoints/qwen-14b/images"
+    }
+  }
+}
+```
+
+When the daemon starts, models with `checkpoint_path` are initialized in
+checkpointed state. The first request triggers a CRIU restore instead of a
+cold start — typically 3-5x faster.
+
+`keep_images` must be `true` (the default) in the `checkpoint` config when
+using `checkpoint_path`, since the images must persist across daemon restarts.
 
 ## Docker Compose
 

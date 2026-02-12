@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `checkpoint_path` per-model config option for lazy CRIU restore on first request
+- `--restore-detached` CLI flag (renamed from `--restore`) to restore a checkpoint and exit
+
+### Fixed
+
+- CRIU dump failure on systems without nftables (removed `--network-lock nftables`, standardized on iptables)
+- CRIU restore not waking vLLM after restoring L2-checkpointed models (added wake_up + reload_weights sequence)
+
 ## [0.5.0](https://github.com/doublewordai/llmux/compare/v0.4.1...v0.5.0) - 2026-02-11
 
 ### Added

@@ -394,6 +394,19 @@ pub async fn run_checkpoint(
         "  GPU freed: {} MiB → {} MiB",
         gpu_before, gpu_after
     );
+    println!();
+    println!("To restore this checkpoint with the daemon, add to your model config:");
+    println!("  \"checkpoint_path\": \"{}\"", images_dir.display());
+    if let Some(ref obj_cfg) = config
+        .checkpoint
+        .as_ref()
+        .and_then(|c| c.object_store.as_ref())
+    {
+        println!(
+            "  S3:        s3://{}/{}/images/",
+            obj_cfg.bucket, model_name
+        );
+    }
 
     Ok(true)
 }
@@ -417,15 +430,17 @@ pub async fn run_restore(config: &Config, model_name: &str) -> Result<bool> {
     let ckpt_cfg = config
         .checkpoint
         .as_ref()
-        .context("Checkpoint config required in config.json for --restore")?;
+        .context("Checkpoint config required in config.json for --restore-detached")?;
 
     let images_dir = ckpt_cfg.images_dir.join(model_name).join("images");
-    if !images_dir.exists() {
+    if !images_dir.exists() && ckpt_cfg.object_store.is_none() {
         bail!(
             "No checkpoint found at {}. Run --checkpoint {} first.",
             images_dir.display(),
             model_name,
         );
+    } else if !images_dir.exists() {
+        println!("Local checkpoint not found, will download from S3...");
     }
 
     let port = model_config.port;
@@ -441,9 +456,12 @@ pub async fn run_restore(config: &Config, model_name: &str) -> Result<bool> {
         config.checkpoint.clone(),
     ));
 
-    // Set initial state to Checkpointed so wake_model runs CRIU restore
+    // Set initial state to Checkpointed so wake_model runs CRIU restore.
+    // Use the model's configured eviction policy so the wake sequence knows
+    // whether to reload weights (Discard) or just wake up (Offload/Retain).
+    let eviction = model_config.eviction;
     orchestrator
-        .set_checkpointed(model_name, images_dir.clone())
+        .set_checkpointed(model_name, images_dir.clone(), eviction)
         .await
         .context("Failed to set checkpointed state")?;
 

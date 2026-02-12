@@ -43,7 +43,6 @@ RUN apt-get update && apt-get install -y \
   libcap-dev \
   libaio-dev \
   libgnutls28-dev \
-  libnftables-dev \
   libnet1-dev \
   uuid-dev \
   git \
@@ -82,7 +81,7 @@ COPY --from=criu-builder /criu/plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_pl
 RUN apt-get update && apt-get install -y --no-install-recommends \
   libnl-3-200 \
   libprotobuf-c1 \
-  libnftables1 \
+  iptables \
   libnet1 \
   && rm -rf /var/lib/apt/lists/*
 

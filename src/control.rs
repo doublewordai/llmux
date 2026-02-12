@@ -444,6 +444,7 @@ mod tests {
                 port: 8001,
                 extra_args: vec![],
                 eviction: EvictionPolicy::from(1),
+                checkpoint_path: None,
             },
         );
         configs.insert(
@@ -453,6 +454,7 @@ mod tests {
                 port: 8002,
                 extra_args: vec![],
                 eviction: EvictionPolicy::from(1),
+                checkpoint_path: None,
             },
         );
         let orchestrator = std::sync::Arc::new(Orchestrator::new(configs));

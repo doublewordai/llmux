@@ -28,7 +28,7 @@ struct Args {
     verbose: bool,
 
     /// Run a sleep/wake validation cycle for the given model and exit
-    #[arg(long, value_name = "MODEL", conflicts_with_all = ["checkpoint", "restore"])]
+    #[arg(long, value_name = "MODEL", conflicts_with_all = ["checkpoint", "restore_detached"])]
     validate: Option<String>,
 
     /// Eviction policies to validate (default: offload+keep_running,discard+keep_running).
@@ -44,13 +44,13 @@ struct Args {
 
     /// Create a CRIU checkpoint for the given model and exit.
     /// Starts the model, warms it up, then checkpoints to disk.
-    #[arg(long, value_name = "MODEL", conflicts_with_all = ["validate", "restore"])]
+    #[arg(long, value_name = "MODEL", conflicts_with_all = ["validate", "restore_detached"])]
     checkpoint: Option<String>,
 
     /// Restore a model from a CRIU checkpoint, verify health, and exit.
     /// The restored vLLM process keeps running after llmux exits.
     #[arg(long, value_name = "MODEL", conflicts_with_all = ["validate", "checkpoint"])]
-    restore: Option<String>,
+    restore_detached: Option<String>,
 
     /// Eviction policy for --checkpoint (default: discard+checkpoint).
     /// Only the weight strategy matters — process is always checkpoint.
@@ -126,8 +126,8 @@ async fn main() -> Result<()> {
         std::process::exit(if success { 0 } else { 1 });
     }
 
-    // Restore from checkpoint if --restore is specified
-    if let Some(model_name) = args.restore {
+    // Restore from checkpoint if --restore-detached is specified
+    if let Some(model_name) = args.restore_detached {
         let success = llmux::validate::run_restore(&config, &model_name).await?;
         std::process::exit(if success { 0 } else { 1 });
     }

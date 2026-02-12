@@ -39,12 +39,13 @@
 mod config;
 pub mod control;
 mod middleware;
+pub mod object_store;
 mod orchestrator;
 mod policy;
 mod switcher;
 pub mod validate;
 
-pub use config::{CheckpointConfig, Config, ModelConfig, PolicyConfig};
+pub use config::{CheckpointConfig, Config, ModelConfig, ObjectStoreConfig, PolicyConfig};
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
 pub use orchestrator::{Orchestrator, OrchestratorError, ProcessState};
 pub use policy::{

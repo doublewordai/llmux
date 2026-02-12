@@ -70,6 +70,28 @@ pub struct CheckpointConfig {
     /// restored multiple times without re-checkpointing.
     #[serde(default = "default_keep_images")]
     pub keep_images: bool,
+
+    /// Optional S3-compatible object store for checkpoint persistence.
+    /// When configured, checkpoints are uploaded after creation and
+    /// downloaded on demand before restore.
+    #[serde(default)]
+    pub object_store: Option<ObjectStoreConfig>,
+}
+
+/// S3-compatible object store configuration for checkpoint persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectStoreConfig {
+    /// S3-compatible endpoint URL (e.g. "http://localhost:9200")
+    pub endpoint: String,
+    /// Bucket name
+    pub bucket: String,
+    /// Access key (AWS_ACCESS_KEY_ID equivalent)
+    pub access_key: String,
+    /// Secret key (AWS_SECRET_ACCESS_KEY equivalent)
+    pub secret_key: String,
+    /// Region (default: "us-east-1")
+    #[serde(default = "default_region")]
+    pub region: String,
 }
 
 fn default_vllm_command() -> String {
@@ -94,6 +116,10 @@ fn default_cuda_checkpoint_path() -> String {
 
 fn default_keep_images() -> bool {
     true
+}
+
+fn default_region() -> String {
+    "us-east-1".to_string()
 }
 
 fn default_port() -> u16 {
@@ -162,6 +188,41 @@ impl Config {
                 );
             }
         }
+
+        // Validate checkpoint_path entries
+        let has_object_store = self
+            .checkpoint
+            .as_ref()
+            .and_then(|c| c.object_store.as_ref())
+            .is_some();
+
+        for (name, model) in &self.models {
+            if let Some(ref checkpoint_path) = model.checkpoint_path {
+                if !checkpoint_path.exists() && !has_object_store {
+                    tracing::error!(
+                        model = %name,
+                        path = %checkpoint_path.display(),
+                        "checkpoint_path does not exist. Remove it from config or \
+                         create the checkpoint with --checkpoint first."
+                    );
+                    std::process::exit(1);
+                } else if !checkpoint_path.exists() {
+                    tracing::info!(
+                        model = %name,
+                        path = %checkpoint_path.display(),
+                        "checkpoint_path does not exist locally; will download from object store on first request"
+                    );
+                }
+                if self.checkpoint.is_none() {
+                    tracing::error!(
+                        model = %name,
+                        "checkpoint_path is set but no top-level 'checkpoint' config section. \
+                         Add a 'checkpoint' section with criu_path, cuda_plugin_dir, etc."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     /// Build onwards Targets from model configs
@@ -228,6 +289,11 @@ pub struct ModelConfig {
     /// when this model is put to sleep.
     #[serde(default)]
     pub eviction: EvictionPolicy,
+
+    /// Path to existing CRIU checkpoint images. When set, the daemon restores
+    /// from checkpoint on first request instead of cold-starting vLLM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 impl ModelConfig {
@@ -438,6 +504,7 @@ mod tests {
                 "4096".to_string(),
             ],
             eviction: EvictionPolicy::from(1),
+            checkpoint_path: None,
         };
 
         let args = config.vllm_args();
