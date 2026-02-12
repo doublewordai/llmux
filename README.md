@@ -34,11 +34,11 @@ When a model is evicted, llmux applies two independent strategies:
 
 **Weight strategy** — what to do with model weights:
 
-| Strategy | vLLM API | Speed | GPU freed | CPU RAM | State |
-|----------|----------|-------|-----------|---------|-------|
-| `retain` | (none) | Instant | None | None | Full |
-| `offload` | sleep L1 | Slow (~35s) | Most | High (holds weights) | Partial |
-| `discard` | sleep L2 | Fast (~1s) | Most | None | Lost (KV cache, CUDA graphs) |
+| Strategy | Speed | GPU freed | CPU RAM | State |
+|----------|-------|-----------|---------|-------|
+| `retain` | Instant | None | None | Full |
+| `offload` | Slow (~35s) | Most | High (holds weights) | Partial |
+| `discard` | Fast (~1s) | Most | None | Lost (KV cache, CUDA graphs) |
 
 **Process strategy** — what to do with the OS process:
 
@@ -51,13 +51,13 @@ When a model is evicted, llmux applies two independent strategies:
 
 These combine freely. Common combinations:
 
-| Config | Equivalent to old | Use case |
-|--------|-------------------|----------|
-| `offload` + `keep_running` | L1 | Model you expect to return to soon |
-| `discard` + `keep_running` | L2 | Model you may not need for a while |
-| `retain` + `cuda_suspend` | L3 | Like offload, but frees 100% GPU |
-| `discard` + `checkpoint` | L4 | Many models; lowest resource usage |
-| `retain` + `stop` | L5 | Fallback / cleanup |
+| Config | Use case |
+|--------|----------|
+| `offload` + `keep_running` | Model you expect to return to soon |
+| `discard` + `keep_running` | Model you may not need for a while |
+| `retain` + `cuda_suspend` | Like offload, but frees 100% GPU |
+| `discard` + `checkpoint` | Many models; lowest resource usage |
+| `retain` + `stop` | Fallback / cleanup |
 
 If eviction fails, llmux automatically escalates to `stop` to guarantee GPU
 memory is freed.
@@ -326,10 +326,10 @@ llmux --config config.json --validate qwen-14b --levels 1,2,3,4 --verbose
 Output:
 
 ```
-Level     Sleep (s)   Wake (s)   GPU Before    GPU After     GPU Wake   Response   Pass
-----------------------------------------------------------------------------------------
-L1             35.9        1.2      45899 MiB       1341 MiB      44033 MiB      match     OK
-L2              0.3        8.2      44033 MiB       1341 MiB      44033 MiB      match     OK
+Eviction          Sleep (s)   Wake (s)   GPU Before    GPU After     GPU Wake   Response   Pass
+------------------------------------------------------------------------------------------------
+Offload+KeepRun        35.9        1.2      45899 MiB       1341 MiB      44033 MiB      match     OK
+Discard+KeepRun         0.3        8.2      44033 MiB       1341 MiB      44033 MiB      match     OK
 
 Result: ALL PASSED
 ```
