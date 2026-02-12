@@ -28,7 +28,7 @@ struct Args {
     verbose: bool,
 
     /// Run a sleep/wake validation cycle for the given model and exit
-    #[arg(long, value_name = "MODEL")]
+    #[arg(long, value_name = "MODEL", conflicts_with_all = ["checkpoint", "restore"])]
     validate: Option<String>,
 
     /// Eviction policies to validate (default: offload+keep_running,discard+keep_running).
@@ -41,6 +41,25 @@ struct Args {
         requires = "validate"
     )]
     policies: Vec<String>,
+
+    /// Create a CRIU checkpoint for the given model and exit.
+    /// Starts the model, warms it up, then checkpoints to disk.
+    #[arg(long, value_name = "MODEL", conflicts_with_all = ["validate", "restore"])]
+    checkpoint: Option<String>,
+
+    /// Restore a model from a CRIU checkpoint, verify health, and exit.
+    /// The restored vLLM process keeps running after llmux exits.
+    #[arg(long, value_name = "MODEL", conflicts_with_all = ["validate", "checkpoint"])]
+    restore: Option<String>,
+
+    /// Eviction policy for --checkpoint (default: discard+checkpoint).
+    /// Only the weight strategy matters — process is always checkpoint.
+    #[arg(long, value_name = "POLICY", requires = "checkpoint")]
+    eviction: Option<String>,
+
+    /// Skip warmup inference before checkpointing
+    #[arg(long, requires = "checkpoint")]
+    no_warmup: bool,
 }
 
 #[tokio::main]
@@ -91,6 +110,25 @@ async fn main() -> Result<()> {
         };
         let success =
             llmux::validate::run_validation(&config, &model_name, policies.as_deref()).await?;
+        std::process::exit(if success { 0 } else { 1 });
+    }
+
+    // Create checkpoint if --checkpoint is specified
+    if let Some(model_name) = args.checkpoint {
+        let eviction = args.eviction.as_deref().unwrap_or("discard+checkpoint");
+        let success = llmux::validate::run_checkpoint(
+            &config,
+            &model_name,
+            eviction,
+            !args.no_warmup,
+        )
+        .await?;
+        std::process::exit(if success { 0 } else { 1 });
+    }
+
+    // Restore from checkpoint if --restore is specified
+    if let Some(model_name) = args.restore {
+        let success = llmux::validate::run_restore(&config, &model_name).await?;
         std::process::exit(if success { 0 } else { 1 });
     }
 

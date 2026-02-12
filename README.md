@@ -354,6 +354,32 @@ Discard+KeepRun         0.3        8.2      44033 MiB       1341 MiB      44033 
 Result: ALL PASSED
 ```
 
+## Checkpoint management
+
+Pre-create CRIU checkpoints for fast model switching:
+
+```bash
+# Create checkpoint (start model, warm up, CRIU dump to disk)
+llmux --config config.json --checkpoint qwen-14b
+
+# Use a different weight strategy (affects CRIU image size)
+llmux --config config.json --checkpoint qwen-14b --eviction retain+checkpoint
+
+# Skip warmup inference before checkpointing
+llmux --config config.json --checkpoint qwen-14b --no-warmup
+
+# Restore from checkpoint (CRIU restore, health check, exit)
+llmux --config config.json --restore qwen-14b
+```
+
+The default eviction for `--checkpoint` is `discard+checkpoint`, which produces
+small CRIU images (weights are reloaded from the HF cache on restore). Use
+`retain+checkpoint` or `offload+checkpoint` for larger images that restore
+faster (weights already in the snapshot).
+
+After `--restore`, the vLLM process continues running on its configured port.
+The daemon can then manage it normally when started.
+
 ## Docker Compose
 
 ### Basic setup

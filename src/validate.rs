@@ -298,6 +298,200 @@ fn query_gpu_memory() -> u64 {
     }
 }
 
+/// Create a CRIU checkpoint for the given model.
+///
+/// Starts the model, optionally warms it up with one inference request
+/// (to compile CUDA graphs and warm the allocator), then checkpoints to disk.
+///
+/// Returns `true` on success.
+pub async fn run_checkpoint(
+    config: &Config,
+    model_name: &str,
+    eviction_str: &str,
+    warmup: bool,
+) -> Result<bool> {
+    let eviction = parse_policy(eviction_str)?;
+    if eviction.process != ProcessStrategy::Checkpoint {
+        bail!(
+            "Process strategy must be 'checkpoint' for --checkpoint, got '{:?}'. \
+             Did you mean '{:?}+checkpoint'?",
+            eviction.process,
+            eviction.weights,
+        );
+    }
+
+    let model_config = config.models.get(model_name).with_context(|| {
+        let available: Vec<_> = config.models.keys().collect();
+        format!(
+            "Model '{}' not found in config. Available: {:?}",
+            model_name, available
+        )
+    })?;
+
+    if config.checkpoint.is_none() {
+        bail!("Checkpoint config required in config.json for --checkpoint");
+    }
+
+    let port = model_config.port;
+    let model_path = model_config.model_path.clone();
+
+    // Create orchestrator with just this model
+    let mut models = HashMap::new();
+    models.insert(model_name.to_string(), model_config.clone());
+
+    let orchestrator = Arc::new(Orchestrator::with_options(
+        models,
+        config.vllm_command.clone(),
+        config.checkpoint.clone(),
+    ));
+
+    // Start the model
+    println!("Starting model '{}'...", model_name);
+    let start = Instant::now();
+    orchestrator
+        .ensure_running(model_name)
+        .await
+        .context("Failed to start model")?;
+    println!("Model started in {:.1}s", start.elapsed().as_secs_f64());
+
+    // Warmup: run one inference to compile CUDA graphs and warm allocator
+    if warmup {
+        println!("Running warmup inference...");
+        let response = run_deterministic_request(port, &model_path).await?;
+        println!("Warmup response: {:?}", response);
+    }
+
+    let gpu_before = query_gpu_memory();
+    println!("GPU memory before checkpoint: {} MiB", gpu_before);
+
+    // Checkpoint
+    println!("Checkpointing with {:?}+{:?}...", eviction.weights, eviction.process);
+    let ckpt_start = Instant::now();
+    orchestrator
+        .sleep_model(model_name, eviction)
+        .await
+        .context("Checkpoint failed")?;
+    let ckpt_secs = ckpt_start.elapsed().as_secs_f64();
+
+    let gpu_after = query_gpu_memory();
+
+    // Report
+    let images_dir = config
+        .checkpoint
+        .as_ref()
+        .unwrap()
+        .images_dir
+        .join(model_name)
+        .join("images");
+    let image_size = dir_size(&images_dir);
+
+    println!();
+    println!("Checkpoint complete:");
+    println!("  Time:      {:.1}s", ckpt_secs);
+    println!("  Location:  {}", images_dir.display());
+    println!("  Size:      {:.1} GB", image_size as f64 / 1_073_741_824.0);
+    println!(
+        "  GPU freed: {} MiB → {} MiB",
+        gpu_before, gpu_after
+    );
+
+    Ok(true)
+}
+
+/// Restore a model from a CRIU checkpoint on disk.
+///
+/// Verifies the checkpoint exists, runs CRIU restore, health-checks
+/// the endpoint, and runs one inference to verify correctness.
+/// The restored vLLM process continues running after llmux exits.
+///
+/// Returns `true` on success.
+pub async fn run_restore(config: &Config, model_name: &str) -> Result<bool> {
+    let model_config = config.models.get(model_name).with_context(|| {
+        let available: Vec<_> = config.models.keys().collect();
+        format!(
+            "Model '{}' not found in config. Available: {:?}",
+            model_name, available
+        )
+    })?;
+
+    let ckpt_cfg = config
+        .checkpoint
+        .as_ref()
+        .context("Checkpoint config required in config.json for --restore")?;
+
+    let images_dir = ckpt_cfg.images_dir.join(model_name).join("images");
+    if !images_dir.exists() {
+        bail!(
+            "No checkpoint found at {}. Run --checkpoint {} first.",
+            images_dir.display(),
+            model_name,
+        );
+    }
+
+    let port = model_config.port;
+    let model_path = model_config.model_path.clone();
+
+    // Create orchestrator with just this model
+    let mut models = HashMap::new();
+    models.insert(model_name.to_string(), model_config.clone());
+
+    let orchestrator = Arc::new(Orchestrator::with_options(
+        models,
+        config.vllm_command.clone(),
+        config.checkpoint.clone(),
+    ));
+
+    // Set initial state to Checkpointed so wake_model runs CRIU restore
+    orchestrator
+        .set_checkpointed(model_name, images_dir.clone())
+        .await
+        .context("Failed to set checkpointed state")?;
+
+    // Restore
+    println!("Restoring '{}' from {}...", model_name, images_dir.display());
+    let start = Instant::now();
+    orchestrator
+        .wake_model(model_name)
+        .await
+        .context("Restore failed")?;
+    let restore_secs = start.elapsed().as_secs_f64();
+
+    let gpu_after = query_gpu_memory();
+
+    // Verify with inference
+    println!("Running verification inference...");
+    let response = run_deterministic_request(port, &model_path).await?;
+
+    println!();
+    println!("Restore complete:");
+    println!("  Time:     {:.1}s", restore_secs);
+    println!("  Port:     {}", port);
+    println!("  GPU:      {} MiB", gpu_after);
+    println!("  Response: {:?}", response);
+    println!();
+    println!("Model is running on port {}. Kill with: kill $(lsof -ti tcp:{})", port, port);
+
+    Ok(true)
+}
+
+/// Calculate total size of a directory in bytes.
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let meta = entry.metadata();
+            if let Ok(m) = meta {
+                if m.is_file() {
+                    total += m.len();
+                } else if m.is_dir() {
+                    total += dir_size(&entry.path());
+                }
+            }
+        }
+    }
+    total
+}
+
 fn print_results(results: &[LevelResult]) {
     println!();
     println!(

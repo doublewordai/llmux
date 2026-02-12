@@ -817,6 +817,24 @@ impl Orchestrator {
     }
 
     /// Put a model to sleep using the given eviction policy.
+    /// Set a model's state to Checkpointed (for CLI --restore).
+    ///
+    /// Used to indicate a pre-existing checkpoint on disk so that
+    /// `wake_model` will run CRIU restore instead of starting fresh.
+    pub async fn set_checkpointed(
+        &self,
+        model: &str,
+        images_dir: std::path::PathBuf,
+    ) -> Result<(), OrchestratorError> {
+        let process = self
+            .processes
+            .get(model)
+            .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
+        let mut guard = process.lock().await;
+        guard.state = ProcessState::Checkpointed { images_dir };
+        Ok(())
+    }
+
     ///
     /// The sleep sequence is:
     /// 1. Apply weight strategy (vLLM sleep API if Offload/Discard)
