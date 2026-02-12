@@ -30,34 +30,52 @@ a configurable two-axis policy.
 
 ### Eviction policy
 
-When a model is evicted, llmux applies two independent strategies:
+When a model is evicted, llmux applies two strategies in sequence:
 
-**Weight strategy** — what to do with model weights:
+1. **Weight strategy** — what vLLM does with model weights (via the sleep API)
+2. **Process strategy** — what happens to the OS process afterward
 
-| Strategy | Speed | GPU freed | CPU RAM | State |
-|----------|-------|-----------|---------|-------|
-| `retain` | Instant | None | None | Full |
-| `offload` | Slow (~35s) | Most | High (holds weights) | Partial |
-| `discard` | Fast (~1s) | Most | None | Lost (KV cache, CUDA graphs) |
+#### Weight strategy
 
-**Process strategy** — what to do with the OS process:
+Applied first, via vLLM's sleep endpoint. Controls what happens to weights and KV cache:
 
-| Strategy | Mechanism | Speed | GPU freed | CPU RAM | State |
-|----------|-----------|-------|-----------|---------|-------|
-| `keep_running` | (none) | Instant | None | Process stays | — |
-| `cuda_suspend` | `cuda-checkpoint --toggle` | ~3s (TP=1), ~15s (TP=2) | All (100%) | High (holds VRAM) | Full |
-| `checkpoint` | CRIU dump | ~27s | All (100%) | None | Full |
-| `stop` | Kill process | Instant | All | None | Lost |
+| Strategy | Description |
+|----------|-------------|
+| `retain` | Nothing happens. Weights and KV cache stay on GPU. |
+| `offload` | Weights copied to pinned CPU RAM. KV cache and CUDA graphs discarded. Frees most GPU memory but uses significant host RAM. |
+| `discard` | Weights dropped entirely (reloaded from disk on wake). KV cache and CUDA graphs discarded. Frees most GPU memory with no CPU RAM cost. |
 
-These combine freely. Common combinations:
+Both `offload` and `discard` leave a small CUDA context (~500 MiB) on the GPU.
 
-| Config | Use case |
-|--------|----------|
-| `offload` + `keep_running` | Model you expect to return to soon |
-| `discard` + `keep_running` | Model you may not need for a while |
-| `retain` + `cuda_suspend` | Like offload, but frees 100% GPU |
-| `discard` + `checkpoint` | Many models; lowest resource usage |
-| `retain` + `stop` | Fallback / cleanup |
+#### Process strategy
+
+Applied second, to the process left behind by the weight strategy:
+
+| Strategy | Description |
+|----------|-------------|
+| `keep_running` | Process stays as-is. Fast, but whatever's still on GPU stays there. |
+| `cuda_suspend` | Snapshots remaining VRAM to host RAM via `cuda-checkpoint`, freeing 100% of GPU memory. Process stays alive. |
+| `checkpoint` | CRIU dumps the entire process (including host RAM) to disk, then kills it. Frees 100% of GPU and CPU memory. |
+| `stop` | Kills the process. Everything is lost. |
+
+#### How they interact
+
+The weight strategy determines what's on GPU vs. CPU before the process strategy runs.
+This affects speed, memory usage, and what survives a wake cycle:
+
+| | `keep_running` | `cuda_suspend` | `checkpoint` | `stop` |
+|---|---|---|---|---|
+| **`retain`** | No-op (model stays loaded) | Full VRAM snapshot to CPU — weights, KV cache, CUDA graphs all preserved | Full process checkpoint to disk — large image (includes VRAM) | Everything lost |
+| **`offload`** | Weights on CPU, KV lost, ~500 MiB CUDA context remains on GPU | Remaining CUDA context → CPU, weights already on CPU | Large CRIU image (weights in host RAM get written to disk) | Everything lost |
+| **`discard`** | Weights gone, KV lost, ~500 MiB CUDA context remains on GPU | Remaining CUDA context → CPU, weights gone | Small CRIU image (no weights — reloaded from HF cache on wake) | Everything lost |
+
+Common choices:
+
+- **`offload` + `keep_running`** — Fast wake (weights already in RAM), but holds CPU memory and ~500 MiB GPU
+- **`discard` + `keep_running`** — No CPU RAM cost, but slow wake (reload from disk) and ~500 MiB GPU
+- **`retain` + `cuda_suspend`** — Frees 100% GPU, full state preserved, but holds all VRAM in CPU RAM
+- **`discard` + `checkpoint`** — Frees 100% GPU *and* CPU, small CRIU image; wake reloads weights from disk but restores KV cache, CUDA graphs, and warmed allocator from checkpoint
+- **`offload` + `checkpoint`** — Like above but CRIU image is large (includes weights); wake is faster (no disk reload) but checkpoint is slower and uses more disk
 
 If eviction fails, llmux automatically escalates to `stop` to guarantee GPU
 memory is freed.
