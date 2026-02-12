@@ -320,7 +320,9 @@ against a running model, verifying GPU memory is freed and responses are
 deterministic after wake:
 
 ```bash
-llmux --config config.json --validate qwen-14b --levels 1,2,3,4 --verbose
+llmux --config config.json --validate qwen-14b \
+  --policies offload+keep_running,discard+keep_running,retain+cuda_suspend \
+  --verbose
 ```
 
 Output:

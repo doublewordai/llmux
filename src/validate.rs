@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use crate::orchestrator::Orchestrator;
-use crate::switcher::EvictionPolicy;
+use crate::switcher::{EvictionPolicy, ProcessStrategy, WeightStrategy};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,16 +24,41 @@ struct LevelResult {
     pass: bool,
 }
 
+/// Parse a policy string like "offload+keep_running" into an EvictionPolicy.
+fn parse_policy(s: &str) -> Result<EvictionPolicy> {
+    let parts: Vec<&str> = s.split('+').collect();
+    if parts.len() != 2 {
+        bail!("Invalid policy '{}': expected format 'weights+process' (e.g. offload+keep_running)", s);
+    }
+
+    let weights = match parts[0] {
+        "retain" => WeightStrategy::Retain,
+        "offload" => WeightStrategy::Offload,
+        "discard" => WeightStrategy::Discard,
+        other => bail!("Unknown weight strategy '{}': expected retain, offload, or discard", other),
+    };
+
+    let process = match parts[1] {
+        "keep_running" => ProcessStrategy::KeepRunning,
+        "cuda_suspend" => ProcessStrategy::CudaSuspend,
+        "checkpoint" => ProcessStrategy::Checkpoint,
+        "stop" => ProcessStrategy::Stop,
+        other => bail!("Unknown process strategy '{}': expected keep_running, cuda_suspend, checkpoint, or stop", other),
+    };
+
+    Ok(EvictionPolicy { weights, process })
+}
+
 /// Run a full validation cycle for the given model.
 ///
-/// If `levels` is `Some`, only test those levels (1=L1, 2=L2).
-/// If `None`, test all levels (L1, L2).
+/// If `policies` is `Some`, test those eviction policies.
+/// If `None`, test offload+keep_running and discard+keep_running.
 ///
-/// Returns `true` if all tested levels pass, `false` if any fail.
+/// Returns `true` if all tested policies pass, `false` if any fail.
 pub async fn run_validation(
     config: &Config,
     model_name: &str,
-    levels: Option<&[u8]>,
+    policies: Option<&[String]>,
 ) -> Result<bool> {
     let model_config = config.models.get(model_name).with_context(|| {
         let available: Vec<_> = config.models.keys().collect();
@@ -74,9 +99,15 @@ pub async fn run_validation(
     println!("Baseline GPU memory: {} MiB", baseline_gpu);
 
     // Test each eviction policy
-    let test_policies: Vec<EvictionPolicy> = match levels {
-        Some(nums) => nums.iter().map(|&n| EvictionPolicy::from(n)).collect(),
-        None => vec![EvictionPolicy::from(1), EvictionPolicy::from(2)],
+    let test_policies: Vec<EvictionPolicy> = match policies {
+        Some(strs) => strs
+            .iter()
+            .map(|s| parse_policy(s))
+            .collect::<Result<Vec<_>>>()?,
+        None => vec![
+            EvictionPolicy { weights: WeightStrategy::Offload, process: ProcessStrategy::KeepRunning },
+            EvictionPolicy { weights: WeightStrategy::Discard, process: ProcessStrategy::KeepRunning },
+        ],
     };
     let mut results = Vec::new();
 

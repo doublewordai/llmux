@@ -31,14 +31,16 @@ struct Args {
     #[arg(long, value_name = "MODEL")]
     validate: Option<String>,
 
-    /// Sleep levels to validate (default: all). Comma-separated: 1,2,3,4
+    /// Eviction policies to validate (default: offload+keep_running,discard+keep_running).
+    /// Format: weights+process, comma-separated.
+    /// Example: offload+keep_running,retain+cuda_suspend
     #[arg(
         long,
-        value_name = "LEVELS",
+        value_name = "POLICIES",
         value_delimiter = ',',
         requires = "validate"
     )]
-    levels: Vec<u8>,
+    policies: Vec<String>,
 }
 
 #[tokio::main]
@@ -82,13 +84,13 @@ async fn main() -> Result<()> {
 
     // Run validation if --validate is specified
     if let Some(model_name) = args.validate {
-        let levels = if args.levels.is_empty() {
+        let policies = if args.policies.is_empty() {
             None
         } else {
-            Some(args.levels)
+            Some(args.policies)
         };
         let success =
-            llmux::validate::run_validation(&config, &model_name, levels.as_deref()).await?;
+            llmux::validate::run_validation(&config, &model_name, policies.as_deref()).await?;
         std::process::exit(if success { 0 } else { 1 });
     }
 
