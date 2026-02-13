@@ -13,7 +13,15 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Models to manage
+    #[serde(default)]
     pub models: HashMap<String, ModelConfig>,
+
+    /// Dynamic LoRA serving configuration.
+    ///
+    /// When set, llmux runs in single-base-model mode and routes requests by
+    /// LoRA adapter alias instead of by base model name.
+    #[serde(default)]
+    pub lora: Option<LoraConfig>,
 
     /// Switch policy configuration
     #[serde(default)]
@@ -94,6 +102,54 @@ pub struct ObjectStoreConfig {
     pub region: String,
 }
 
+/// Dynamic LoRA serving configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoraConfig {
+    /// Single base model process shared by all LoRA adapters.
+    pub base_model: LoraBaseModelConfig,
+    /// Client-facing adapter aliases.
+    pub adapters: HashMap<String, LoraAdapterConfig>,
+}
+
+/// Base model process config for dynamic LoRA serving mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoraBaseModelConfig {
+    /// Path to the base model (HuggingFace model ID or local path)
+    pub model_path: String,
+    /// Port for the base model's vLLM instance
+    pub port: u16,
+    /// Additional vLLM CLI arguments
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+impl LoraBaseModelConfig {
+    /// Convert LoRA base model config into a standard ModelConfig used by the
+    /// process orchestrator.
+    pub fn to_model_config(&self) -> ModelConfig {
+        ModelConfig {
+            model_path: self.model_path.clone(),
+            port: self.port,
+            extra_args: self.extra_args.clone(),
+            eviction: EvictionPolicy::default(),
+            checkpoint_path: None,
+        }
+    }
+}
+
+/// Runtime-loadable LoRA adapter config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoraAdapterConfig {
+    /// Path (local or remote, depending on vLLM setup) to adapter weights.
+    pub lora_path: String,
+    /// Optional base model name hint for multi-base deployments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model_name: Option<String>,
+    /// Whether vLLM should replace an existing adapter with the same name.
+    #[serde(default)]
+    pub load_inplace: bool,
+}
+
 fn default_vllm_command() -> String {
     "vllm".to_string()
 }
@@ -130,7 +186,6 @@ fn default_metrics_port() -> u16 {
     9090
 }
 
-
 impl Config {
     /// Load configuration from a JSON file
     pub async fn from_file(path: &Path) -> Result<Self> {
@@ -149,6 +204,15 @@ impl Config {
     pub fn validate(&self) {
         use crate::switcher::ProcessStrategy;
         use tracing::warn;
+
+        if let Err(msg) = self.validate_mode_selection() {
+            tracing::error!("{}", msg);
+            std::process::exit(1);
+        }
+
+        if self.is_lora_mode() {
+            return;
+        }
 
         for (name, model) in &self.models {
             if !model.eviction.needs_cuda_checkpoint() {
@@ -234,26 +298,52 @@ impl Config {
 
         let targets_map: DashMap<String, ProviderPool> = DashMap::new();
 
-        for (name, model_config) in &self.models {
-            let url = format!("http://localhost:{}", model_config.port)
+        if let Some(lora) = &self.lora {
+            let base_url: url::Url = format!("http://localhost:{}", lora.base_model.port)
                 .parse()
-                .with_context(|| format!("Invalid URL for model {}", name))?;
+                .with_context(|| "Invalid URL for LoRA base model".to_string())?;
 
-            let target = Target {
-                url,
-                keys: None,
-                onwards_key: None,
-                onwards_model: Some(model_config.model_path.clone()),
-                limiter: None,
-                concurrency_limiter: None,
-                upstream_auth_header_name: None,
-                upstream_auth_header_prefix: None,
-                response_headers: None,
-                sanitize_response: false,
-            };
+            for adapter_alias in lora.adapters.keys() {
+                let target = Target {
+                    url: base_url.clone(),
+                    keys: None,
+                    onwards_key: None,
+                    // Rewrite upstream model to adapter alias so vLLM applies
+                    // the matching loaded adapter.
+                    onwards_model: Some(adapter_alias.clone()),
+                    limiter: None,
+                    concurrency_limiter: None,
+                    upstream_auth_header_name: None,
+                    upstream_auth_header_prefix: None,
+                    response_headers: None,
+                    sanitize_response: false,
+                };
 
-            let pool = target.into_pool();
-            targets_map.insert(name.clone(), pool);
+                let pool = target.into_pool();
+                targets_map.insert(adapter_alias.clone(), pool);
+            }
+        } else {
+            for (name, model_config) in &self.models {
+                let url = format!("http://localhost:{}", model_config.port)
+                    .parse()
+                    .with_context(|| format!("Invalid URL for model {}", name))?;
+
+                let target = Target {
+                    url,
+                    keys: None,
+                    onwards_key: None,
+                    onwards_model: Some(model_config.model_path.clone()),
+                    limiter: None,
+                    concurrency_limiter: None,
+                    upstream_auth_header_name: None,
+                    upstream_auth_header_prefix: None,
+                    response_headers: None,
+                    sanitize_response: false,
+                };
+
+                let pool = target.into_pool();
+                targets_map.insert(name.clone(), pool);
+            }
         }
 
         Ok(Targets {
@@ -261,6 +351,57 @@ impl Config {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
         })
+    }
+
+    /// Returns true when running in dynamic LoRA mode.
+    pub fn is_lora_mode(&self) -> bool {
+        self.lora.is_some()
+    }
+
+    fn validate_mode_selection(&self) -> std::result::Result<(), String> {
+        let has_legacy_models = !self.models.is_empty();
+        let has_lora = self.lora.is_some();
+
+        if has_legacy_models && has_lora {
+            return Err(
+                "Config cannot specify both 'models' and 'lora'. Choose one mode.".to_string(),
+            );
+        }
+        if !has_legacy_models && !has_lora {
+            return Err("Config must specify either non-empty 'models' (legacy mode) or 'lora' (dynamic LoRA mode).".to_string());
+        }
+
+        if let Some(lora) = &self.lora {
+            if lora.adapters.is_empty() {
+                return Err(
+                    "LoRA mode requires at least one adapter under 'lora.adapters'.".to_string(),
+                );
+            }
+            if self.checkpoint.is_some() {
+                return Err(
+                    "LoRA mode does not support top-level 'checkpoint' configuration.".to_string(),
+                );
+            }
+            if self.policy.eviction != EvictionPolicy::default() {
+                return Err(
+                    "LoRA mode does not support policy.eviction overrides. Remove 'policy.eviction'."
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the client-facing routable model names for policy/switching.
+    pub fn routing_model_names(&self) -> Vec<String> {
+        if let Some(lora) = &self.lora {
+            let mut names: Vec<String> = lora.adapters.keys().cloned().collect();
+            names.sort();
+            names
+        } else {
+            self.models.keys().cloned().collect()
+        }
     }
 }
 
@@ -487,9 +628,86 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.models.len(), 2);
+        assert!(config.lora.is_none());
         assert_eq!(config.models["llama"].port, 8001);
         assert_eq!(config.models["mistral"].extra_args.len(), 2);
         assert_eq!(config.policy.request_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_parse_lora_config() {
+        let json = r#"{
+            "lora": {
+                "base_model": {
+                    "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+                    "port": 8010
+                },
+                "adapters": {
+                    "sql-lora": { "lora_path": "/tmp/sql" },
+                    "math-lora": {
+                        "lora_path": "/tmp/math",
+                        "base_model_name": "meta-llama/Llama-3.1-8B-Instruct",
+                        "load_inplace": true
+                    }
+                }
+            },
+            "port": 3000
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.models.is_empty());
+        let lora = config.lora.as_ref().unwrap();
+        assert_eq!(lora.base_model.port, 8010);
+        assert_eq!(lora.adapters.len(), 2);
+        assert_eq!(lora.adapters["sql-lora"].load_inplace, false);
+        assert_eq!(lora.adapters["math-lora"].load_inplace, true);
+    }
+
+    #[test]
+    fn test_validate_mode_rejects_mixed_mode() {
+        let json = r#"{
+            "models": {
+                "llama": {
+                    "model_path": "meta-llama/Llama-2-7b",
+                    "port": 8001
+                }
+            },
+            "lora": {
+                "base_model": {
+                    "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+                    "port": 8010
+                },
+                "adapters": {
+                    "sql-lora": { "lora_path": "/tmp/sql" }
+                }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.validate_mode_selection().is_err());
+    }
+
+    #[test]
+    fn test_validate_mode_rejects_empty_mode() {
+        let json = r#"{
+            "policy": { "request_timeout_secs": 30 }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.validate_mode_selection().is_err());
+    }
+
+    #[test]
+    fn test_validate_mode_rejects_lora_without_adapters() {
+        let json = r#"{
+            "lora": {
+                "base_model": {
+                    "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+                    "port": 8010
+                },
+                "adapters": {}
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.validate_mode_selection().is_err());
     }
 
     #[test]
@@ -528,7 +746,13 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
         let model = &config.models["llama"];
-        assert_eq!(model.eviction.weights, crate::switcher::WeightStrategy::Discard);
-        assert_eq!(model.eviction.process, crate::switcher::ProcessStrategy::Checkpoint);
+        assert_eq!(
+            model.eviction.weights,
+            crate::switcher::WeightStrategy::Discard
+        );
+        assert_eq!(
+            model.eviction.process,
+            crate::switcher::ProcessStrategy::Checkpoint
+        );
     }
 }

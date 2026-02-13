@@ -15,6 +15,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -73,6 +74,10 @@ enum Commands {
         #[arg(long)]
         enable_sleep_mode: bool,
 
+        /// Enable LoRA mode (ignored in mock, accepted for compatibility)
+        #[arg(long)]
+        enable_lora: bool,
+
         /// Max model length (ignored in mock)
         #[arg(long)]
         max_model_len: Option<usize>,
@@ -93,6 +98,8 @@ struct MockState {
     fail_wake: RwLock<bool>,
     /// Artificial sleep delay in milliseconds (for testing timeouts)
     sleep_delay_ms: RwLock<u64>,
+    /// Loaded LoRA adapters keyed by adapter name.
+    loaded_loras: RwLock<HashMap<String, String>>,
 }
 
 #[tokio::main]
@@ -135,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
         fail_sleep: RwLock::new(false),
         fail_wake: RwLock::new(false),
         sleep_delay_ms: RwLock::new(0),
+        loaded_loras: RwLock::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -144,6 +152,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/collective_rpc", post(collective_rpc))
         .route("/reset_prefix_cache", post(reset_prefix_cache))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/load_lora_adapter", post(load_lora_adapter))
+        .route("/v1/unload_lora_adapter", post(unload_lora_adapter))
         .route("/v1/models", get(list_models))
         .route("/stats", get(stats))
         .route("/control/fail-sleep", post(control_fail_sleep))
@@ -254,6 +264,53 @@ async fn reset_prefix_cache() -> impl IntoResponse {
 }
 
 #[derive(Deserialize)]
+struct LoadLoraAdapterRequest {
+    lora_name: String,
+    lora_path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    base_model_name: Option<String>,
+    #[serde(default)]
+    load_inplace: bool,
+}
+
+async fn load_lora_adapter(
+    State(state): State<Arc<MockState>>,
+    Json(request): Json<LoadLoraAdapterRequest>,
+) -> impl IntoResponse {
+    if request.lora_path.starts_with("fail:") {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "forced load failure").into_response();
+    }
+
+    let mut loaded = state.loaded_loras.write().await;
+    if loaded.contains_key(&request.lora_name) && !request.load_inplace {
+        return (
+            StatusCode::BAD_REQUEST,
+            "adapter already loaded (set load_inplace=true to replace)",
+        )
+            .into_response();
+    }
+    loaded.insert(request.lora_name.clone(), request.lora_path.clone());
+    StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
+struct UnloadLoraAdapterRequest {
+    lora_name: String,
+}
+
+async fn unload_lora_adapter(
+    State(state): State<Arc<MockState>>,
+    Json(request): Json<UnloadLoraAdapterRequest>,
+) -> impl IntoResponse {
+    let mut loaded = state.loaded_loras.write().await;
+    if loaded.remove(&request.lora_name).is_none() {
+        return (StatusCode::NOT_FOUND, "adapter not loaded").into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+#[derive(Deserialize)]
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<Message>,
@@ -316,6 +373,17 @@ async fn chat_completions(
         ));
     }
 
+    // Accept either base model name or a loaded LoRA adapter alias.
+    if request.model != state.model {
+        let loaded = state.loaded_loras.read().await;
+        if !loaded.contains_key(&request.model) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("LoRA adapter '{}' is not loaded", request.model),
+            ));
+        }
+    }
+
     // Simulate latency
     tokio::time::sleep(*state.latency.read().await).await;
 
@@ -366,7 +434,7 @@ async fn chat_completions(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        model: state.model.clone(),
+        model: request.model.clone(),
         choices: vec![Choice {
             index: 0,
             message: Message {
@@ -418,15 +486,19 @@ struct StatsResponse {
     sleeping: bool,
     sleep_level: u8,
     request_count: u64,
+    loaded_loras: Vec<String>,
 }
 
 /// Stats endpoint for testing inspection
 async fn stats(State(state): State<Arc<MockState>>) -> impl IntoResponse {
+    let mut loaded_loras: Vec<String> = state.loaded_loras.read().await.keys().cloned().collect();
+    loaded_loras.sort();
     let response = StatsResponse {
         model: state.model.clone(),
         sleeping: *state.sleeping.read().await,
         sleep_level: *state.sleep_level.read().await,
         request_count: *state.request_count.read().await,
+        loaded_loras,
     };
 
     Json(response)

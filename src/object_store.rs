@@ -45,8 +45,8 @@ impl CheckpointStore {
         )
         .context("Failed to create S3 credentials")?;
 
-        let bucket =
-            Bucket::new(&config.bucket, region, credentials).context("Failed to create S3 bucket client")?;
+        let bucket = Bucket::new(&config.bucket, region, credentials)
+            .context("Failed to create S3 bucket client")?;
         let bucket = bucket.with_path_style();
 
         Ok(Self { bucket })
@@ -74,7 +74,11 @@ impl CheckpointStore {
             .map(|o| o.key.clone())
             .collect();
         if !existing.is_empty() {
-            info!(model, files = existing.len(), "Cleaning up previous checkpoint in S3");
+            info!(
+                model,
+                files = existing.len(),
+                "Cleaning up previous checkpoint in S3"
+            );
             for key in &existing {
                 self.bucket
                     .delete_object(key)
@@ -219,10 +223,7 @@ impl CheckpointStore {
 
         for obj in objects {
             let key = obj.key.clone();
-            let filename = key
-                .strip_prefix(&prefix)
-                .unwrap_or(&key)
-                .to_string();
+            let filename = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
             let dest = images_dir.join(&filename);
             let bucket = self.bucket.clone();
             let sem = semaphore.clone();

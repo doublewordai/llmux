@@ -3,13 +3,15 @@
 [![Crates.io](https://img.shields.io/crates/v/llmux)](https://crates.io/crates/llmux)
 [![GitHub](https://img.shields.io/badge/GitHub-doublewordai%2Fllmux-blue)](https://github.com/doublewordai/llmux)
 
-LLM multiplexer for vLLM. Host multiple models on a single GPU, switching
-between them on demand using vLLM's sleep/wake API.
+LLM multiplexer for vLLM with two serving modes:
 
-When a request arrives for a model that isn't currently loaded, llmux puts the
-active model to sleep (freeing GPU memory) and wakes the requested model. The
-OpenAI-compatible API stays up throughout - clients just change the `model`
-field.
+- **Legacy multi-model mode**: host multiple full models on one GPU, switching
+  with vLLM sleep/wake APIs.
+- **Dynamic LoRA mode**: host one fixed base model and time-slice LoRA adapters
+  using vLLM runtime LoRA load/unload APIs.
+
+In both modes the OpenAI-compatible API stays up throughout and clients only
+change the `model` field.
 
 ## How it works
 
@@ -139,6 +141,32 @@ Create a `config.json`:
 }
 ```
 
+See `config.lora.example.json` for a complete LoRA-mode template.
+
+Dynamic LoRA mode uses a single base model plus adapter aliases:
+
+```json
+{
+  "lora": {
+    "base_model": {
+      "model_path": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+      "port": 8001,
+      "extra_args": ["--gpu-memory-utilization", "0.9"]
+    },
+    "adapters": {
+      "sql-assistant": {
+        "lora_path": "/models/lora/sql"
+      },
+      "finance-assistant": {
+        "lora_path": "/models/lora/finance",
+        "load_inplace": true
+      }
+    }
+  },
+  "port": 3000
+}
+```
+
 ### With Docker (recommended)
 
 The Docker image bundles vLLM v0.15.1 with patches for NCCL suspend/resume
@@ -200,9 +228,19 @@ curl http://localhost:3000/v1/chat/completions \
 curl http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gemma-12b", "messages": [{"role": "user", "content": "Hello"}]}'
+
+# LoRA mode: request adapter alias (base model is fixed)
+curl http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "sql-assistant", "messages": [{"role": "user", "content": "Write a SQL query"}]}'
 ```
 
 ## Configuration
+
+Choose exactly one runtime mode:
+
+- **Legacy mode:** set `models` (non-empty), omit `lora`
+- **LoRA mode:** set `lora`, keep `models` empty or omitted
 
 ### Model options
 
@@ -257,15 +295,48 @@ and `--disable-custom-all-reduce` in `extra_args`:
 
 llmux validates the config at startup and warns if these flags are missing.
 
+### Dynamic LoRA options
+
+`lora` mode serves one base model process and switches adapters dynamically.
+Client-facing `model` values are adapter aliases from `lora.adapters`.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `lora.base_model.model_path` | *required* | Base model path/ID |
+| `lora.base_model.port` | *required* | vLLM port for the shared base model |
+| `lora.base_model.extra_args` | `[]` | Extra vLLM args for base model |
+| `lora.adapters.<alias>.lora_path` | *required* | Adapter path/ID |
+| `lora.adapters.<alias>.base_model_name` | *none* | Optional vLLM base-model hint |
+| `lora.adapters.<alias>.load_inplace` | `false` | Pass `load_inplace` when loading adapter |
+
+Notes:
+
+- LoRA mode starts the base model eagerly at daemon startup.
+- llmux enforces single-active-adapter behavior (unload old, then load new).
+- `--enable-lora` is injected automatically for the base model process.
+- `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True` is set automatically.
+
 ### Top-level options
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `models` | `{}` | Legacy multi-model config (mutually exclusive with `lora`) |
+| `lora` | *none* | Dynamic LoRA config (mutually exclusive with `models`) |
 | `port` | `3000` | Proxy listen port |
 | `metrics_port` | `9090` | Prometheus metrics port (0 to disable) |
 | `vllm_command` | `"vllm"` | vLLM binary path |
 
+### LoRA mode limitations
+
+When `lora` mode is enabled:
+
+- `/control/eviction` GET/POST returns `400` (unsupported in LoRA mode)
+- top-level `checkpoint` config is rejected
+- CLI flows `--validate`, `--checkpoint`, and `--restore-detached` are rejected
+
 ### Checkpoint config
+
+Checkpoint config applies only to legacy multi-model mode.
 
 To use `cuda_suspend` or `checkpoint` process strategies, add a `checkpoint` section:
 
@@ -337,6 +408,8 @@ variable is also set on spawned vLLM processes.
 llmux includes a built-in validation tool that tests sleep/wake cycles
 against a running model, verifying GPU memory is freed and responses are
 deterministic after wake:
+
+`--validate` is only available in legacy multi-model mode.
 
 ```bash
 llmux --config config.json --validate qwen-14b \

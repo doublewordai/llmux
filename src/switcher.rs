@@ -147,7 +147,6 @@ impl From<u8> for EvictionPolicy {
     }
 }
 
-
 /// Errors from the switcher
 #[derive(Debug, thiserror::Error)]
 pub enum SwitchError {
@@ -1035,7 +1034,10 @@ mod tests {
 
         // Request for model-b should be rejected
         let result = switcher.ensure_model_ready("model-b").await;
-        assert!(matches!(result, Err(SwitchError::ManualModeRejected { .. })));
+        assert!(matches!(
+            result,
+            Err(SwitchError::ManualModeRejected { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1053,9 +1055,7 @@ mod tests {
         }
 
         // Enter manual mode without pinning a specific model
-        switcher
-            .set_mode(SwitchMode::Manual { pinned: None })
-            .await;
+        switcher.set_mode(SwitchMode::Manual { pinned: None }).await;
 
         // Request for active model should succeed
         let result = switcher.ensure_model_ready("model-a").await;
@@ -1063,7 +1063,10 @@ mod tests {
 
         // Request for other model should be rejected
         let result = switcher.ensure_model_ready("model-b").await;
-        assert!(matches!(result, Err(SwitchError::ManualModeRejected { .. })));
+        assert!(matches!(
+            result,
+            Err(SwitchError::ManualModeRejected { .. })
+        ));
     }
 
     #[tokio::test]

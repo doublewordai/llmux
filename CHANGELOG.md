@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- dynamic LoRA serving mode: one base model process with adapter alias switching via vLLM runtime LoRA APIs
+- new `lora` config schema (`LoraConfig`, `LoraBaseModelConfig`, `LoraAdapterConfig`)
+- eager base-model startup for LoRA mode
+- `config.lora.example.json` and README docs for LoRA mode
 - `checkpoint_path` per-model config option for lazy CRIU restore on first request
 - `--restore-detached` CLI flag (renamed from `--restore`) to restore a checkpoint and exit
 
 ### Fixed
 
+- reject unsupported CLI/control/checkpoint flows in LoRA mode with explicit errors
 - CRIU dump failure on systems without nftables (removed `--network-lock nftables`, standardized on iptables)
 - CRIU restore not waking vLLM after restoring L2-checkpointed models (added wake_up + reload_weights sequence)
 

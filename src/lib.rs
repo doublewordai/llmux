@@ -45,7 +45,10 @@ mod policy;
 mod switcher;
 pub mod validate;
 
-pub use config::{CheckpointConfig, Config, ModelConfig, ObjectStoreConfig, PolicyConfig};
+pub use config::{
+    CheckpointConfig, Config, LoraAdapterConfig, LoraBaseModelConfig, LoraConfig, ModelConfig,
+    ObjectStoreConfig, PolicyConfig,
+};
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
 pub use orchestrator::{Orchestrator, OrchestratorError, ProcessState};
 pub use policy::{
@@ -70,21 +73,43 @@ use tracing::info;
 pub async fn build_app(
     config: Config,
 ) -> Result<(axum::Router, Option<axum::Router>, axum::Router)> {
-    info!("Building llmux with {} models", config.models.len());
+    info!(
+        mode = if config.is_lora_mode() {
+            "lora"
+        } else {
+            "legacy"
+        },
+        "Building llmux"
+    );
 
     // Create orchestrator with configured command
-    let orchestrator = Arc::new(Orchestrator::with_options(
-        config.models.clone(),
-        config.vllm_command.clone(),
-        config.checkpoint.clone(),
-    ));
+    let orchestrator = Arc::new(if let Some(lora) = config.lora.clone() {
+        Orchestrator::with_lora_options(
+            lora,
+            config.vllm_command.clone(),
+            config.checkpoint.clone(),
+        )
+    } else {
+        Orchestrator::with_options(
+            config.models.clone(),
+            config.vllm_command.clone(),
+            config.checkpoint.clone(),
+        )
+    });
 
     // Create policy
-    let model_names: Vec<String> = config.models.keys().cloned().collect();
+    let model_names = config.routing_model_names();
     let policy = config.policy.build_policy(&model_names);
 
     // Create switcher
     let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    // In LoRA mode, eagerly start the single base model process at boot.
+    if config.is_lora_mode()
+        && let Some(first_model) = model_names.first()
+    {
+        orchestrator.ensure_running(first_model).await?;
+    }
 
     // Spawn background scheduler if the policy uses one
     let _scheduler_handle = switcher.clone().spawn_scheduler();

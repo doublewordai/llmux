@@ -6,7 +6,7 @@
 //! - Health checking to confirm processes are ready
 //! - Coordinating with the switcher for wake/sleep operations
 
-use crate::config::{CheckpointConfig, ModelConfig};
+use crate::config::{CheckpointConfig, LoraAdapterConfig, LoraConfig, ModelConfig};
 use crate::switcher::{EvictionPolicy, ProcessStrategy, WeightStrategy};
 use anyhow::Result;
 use dashmap::DashMap;
@@ -17,8 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, error, info, warn};
+
+const LORA_BASE_KEY: &str = "__llmux_lora_base__";
 
 /// Kill an entire process group by sending SIGKILL to -pgid.
 #[cfg(unix)]
@@ -67,6 +69,11 @@ struct ManagedProcess {
     /// CRIU restore with --restore-detached, the tokio Child handle is gone
     /// but the process is running at its original PID.
     parent_pid: Option<u32>,
+}
+
+struct LoraRuntime {
+    adapters: HashMap<String, LoraAdapterConfig>,
+    active_adapter: Arc<RwLock<Option<String>>>,
 }
 
 /// Strip ANSI escape sequences from a string.
@@ -233,6 +240,8 @@ pub struct Orchestrator {
     vllm_command: String,
     /// CRIU checkpoint configuration (None = checkpoint level disabled)
     checkpoint_config: Option<CheckpointConfig>,
+    /// Dynamic LoRA runtime state (when enabled).
+    lora_runtime: Option<LoraRuntime>,
 }
 
 impl Orchestrator {
@@ -246,6 +255,23 @@ impl Orchestrator {
     /// This is useful for testing with mock-vllm
     pub fn with_command(configs: HashMap<String, ModelConfig>, vllm_command: String) -> Self {
         Self::with_options(configs, vllm_command, None)
+    }
+
+    /// Create a dynamic LoRA orchestrator:
+    /// one base process + many adapter aliases.
+    pub fn with_lora_options(
+        lora: LoraConfig,
+        vllm_command: String,
+        checkpoint_config: Option<CheckpointConfig>,
+    ) -> Self {
+        let mut configs = HashMap::new();
+        configs.insert(LORA_BASE_KEY.to_string(), lora.base_model.to_model_config());
+        let mut orchestrator = Self::with_options(configs, vllm_command, checkpoint_config);
+        orchestrator.lora_runtime = Some(LoraRuntime {
+            adapters: lora.adapters,
+            active_adapter: Arc::new(RwLock::new(None)),
+        });
+        orchestrator
     }
 
     /// Create a new orchestrator with full options including checkpoint config
@@ -293,23 +319,80 @@ impl Orchestrator {
             startup_timeout: Duration::from_secs(900), // 15 minutes for large TP models
             vllm_command,
             checkpoint_config,
+            lora_runtime: None,
         }
+    }
+
+    /// Returns true if this orchestrator is running in dynamic LoRA mode.
+    pub fn is_lora_mode(&self) -> bool {
+        self.lora_runtime.is_some()
+    }
+
+    fn lora_runtime(&self) -> Option<&LoraRuntime> {
+        self.lora_runtime.as_ref()
+    }
+
+    fn lora_has_adapter(&self, model: &str) -> bool {
+        self.lora_runtime()
+            .map(|rt| rt.adapters.contains_key(model))
+            .unwrap_or(false)
+    }
+
+    fn lora_adapter_config(&self, model: &str) -> Option<&LoraAdapterConfig> {
+        self.lora_runtime().and_then(|rt| rt.adapters.get(model))
     }
 
     /// Get the current state of a model's process
     pub async fn process_state(&self, model: &str) -> Option<ProcessState> {
-        let process = self.processes.get(model)?;
-        let guard = process.lock().await;
-        Some(guard.state.clone())
+        if self.is_lora_mode() {
+            if !self.lora_has_adapter(model) {
+                return None;
+            }
+
+            let process = self.processes.get(LORA_BASE_KEY)?;
+            let base_state = process.lock().await.state.clone();
+
+            if let ProcessState::Running { sleeping: None } = base_state {
+                let active = self
+                    .lora_runtime()
+                    .unwrap()
+                    .active_adapter
+                    .read()
+                    .await
+                    .clone();
+                if active.as_deref() == Some(model) {
+                    Some(ProcessState::Running { sleeping: None })
+                } else {
+                    Some(ProcessState::Running {
+                        sleeping: Some(EvictionPolicy::STOP),
+                    })
+                }
+            } else {
+                Some(base_state)
+            }
+        } else {
+            let process = self.processes.get(model)?;
+            let guard = process.lock().await;
+            Some(guard.state.clone())
+        }
     }
 
     /// Get all registered model names
     pub fn registered_models(&self) -> Vec<String> {
-        self.configs.keys().cloned().collect()
+        if let Some(lora) = self.lora_runtime() {
+            let mut names: Vec<String> = lora.adapters.keys().cloned().collect();
+            names.sort();
+            names
+        } else {
+            self.configs.keys().cloned().collect()
+        }
     }
 
     /// Get the effective eviction policy for a model (override > config)
     pub fn eviction_policy_for(&self, model: &str) -> Option<EvictionPolicy> {
+        if self.is_lora_mode() {
+            return None;
+        }
         if let Some(policy) = self.eviction_overrides.get(model) {
             return Some(*policy);
         }
@@ -318,6 +401,9 @@ impl Orchestrator {
 
     /// Check if a model is currently in the Checkpointed state
     pub fn is_checkpointed(&self, model: &str) -> bool {
+        if self.is_lora_mode() {
+            return false;
+        }
         if let Some(process) = self.processes.get(model) {
             // try_lock to avoid blocking the switcher
             if let Ok(guard) = process.try_lock() {
@@ -329,6 +415,13 @@ impl Orchestrator {
 
     /// Override the eviction policy for a model at runtime
     pub fn set_eviction_policy(&self, model: &str, policy: EvictionPolicy) {
+        if self.is_lora_mode() {
+            warn!(
+                model = %model,
+                "Ignoring eviction override in LoRA mode (unsupported)"
+            );
+            return;
+        }
         self.eviction_overrides.insert(model.to_string(), policy);
     }
 
@@ -339,6 +432,16 @@ impl Orchestrator {
     /// 2. Wait for it to become healthy
     /// 3. Return once the model is ready to serve requests
     pub async fn ensure_running(&self, model: &str) -> Result<(), OrchestratorError> {
+        if self.is_lora_mode() {
+            if !self.lora_has_adapter(model) {
+                return Err(OrchestratorError::ModelNotFound(model.to_string()));
+            }
+            return self.ensure_running_legacy(LORA_BASE_KEY).await;
+        }
+        self.ensure_running_legacy(model).await
+    }
+
+    async fn ensure_running_legacy(&self, model: &str) -> Result<(), OrchestratorError> {
         let process = self
             .processes
             .get(model)
@@ -429,7 +532,11 @@ impl Orchestrator {
         let needs_criu = eviction.needs_criu();
 
         // vllm_args() always includes --enable-sleep-mode for consistency
-        let args = config.vllm_args();
+        let mut args = config.vllm_args();
+        let is_lora_base = self.is_lora_mode() && model == LORA_BASE_KEY;
+        if is_lora_base && !args.iter().any(|a| a == "--enable-lora") {
+            args.push("--enable-lora".to_string());
+        }
         debug!(model = %model, args = ?args, "vLLM command args");
 
         // Spawn process in its own process group so we can kill the entire
@@ -438,6 +545,9 @@ impl Orchestrator {
         cmd.args(&args)
             .env("NO_COLOR", "1") // Disable color codes in vLLM output
             .process_group(0);
+        if is_lora_base {
+            cmd.env("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "True");
+        }
 
         if needs_criu {
             // CRIU compatibility: disable io_uring and libuv (they create FDs
@@ -480,12 +590,11 @@ impl Orchestrator {
             // than an inherited pipe or host fd. If stdin's mount ID belongs to
             // the host mount namespace, CRIU dump fails with
             // "Can't lookup mount=N for fd=0 path=/dev/null".
-            let devnull = std::fs::File::open("/dev/null").map_err(|e| {
-                OrchestratorError::SpawnFailed {
+            let devnull =
+                std::fs::File::open("/dev/null").map_err(|e| OrchestratorError::SpawnFailed {
                     model: model.to_string(),
                     reason: format!("Failed to open /dev/null: {}", e),
-                }
-            })?;
+                })?;
             cmd.stdin(devnull);
             cmd.stdout(stdout_file);
             cmd.stderr(stderr_file);
@@ -674,6 +783,11 @@ impl Orchestrator {
                     );
                     guard.child = None;
                     guard.state = ProcessState::NotStarted;
+                    if model == LORA_BASE_KEY
+                        && let Some(lora) = self.lora_runtime()
+                    {
+                        *lora.active_adapter.write().await = None;
+                    }
                 }
                 Ok(None) => {
                     // Still running
@@ -685,8 +799,127 @@ impl Orchestrator {
         }
     }
 
+    fn lora_base_port(&self) -> Result<u16, OrchestratorError> {
+        self.configs
+            .get(LORA_BASE_KEY)
+            .map(|c| c.port)
+            .ok_or_else(|| OrchestratorError::ModelNotFound(LORA_BASE_KEY.to_string()))
+    }
+
+    async fn lora_unload_active_if_any(&self) -> Result<(), OrchestratorError> {
+        let Some(lora) = self.lora_runtime() else {
+            return Ok(());
+        };
+        let active = lora.active_adapter.read().await.clone();
+        if let Some(active) = active {
+            self.lora_unload_adapter_by_name(&active).await?;
+            *lora.active_adapter.write().await = None;
+        }
+        Ok(())
+    }
+
+    async fn lora_unload_adapter_by_name(&self, lora_name: &str) -> Result<(), OrchestratorError> {
+        let base_url = format!("http://localhost:{}", self.lora_base_port()?);
+        let body = serde_json::json!({ "lora_name": lora_name }).to_string();
+        self.post_request(
+            &format!("{}/v1/unload_lora_adapter", base_url),
+            Some(&body),
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| OrchestratorError::SleepFailed {
+            model: lora_name.to_string(),
+            reason: format!("Failed to unload LoRA adapter: {}", e),
+        })
+    }
+
+    async fn wake_lora_model(&self, model: &str) -> Result<(), OrchestratorError> {
+        if !self.lora_has_adapter(model) {
+            return Err(OrchestratorError::ModelNotFound(model.to_string()));
+        }
+
+        self.check_process_alive(LORA_BASE_KEY).await;
+        self.ensure_running_legacy(LORA_BASE_KEY).await?;
+
+        let lora = self.lora_runtime().unwrap();
+        if lora.active_adapter.read().await.as_deref() == Some(model) {
+            return Ok(());
+        }
+
+        self.lora_unload_active_if_any().await?;
+
+        let adapter = self
+            .lora_adapter_config(model)
+            .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
+        let mut payload = serde_json::json!({
+            "lora_name": model,
+            "lora_path": adapter.lora_path,
+        });
+        if let Some(ref base_model_name) = adapter.base_model_name {
+            payload["base_model_name"] = serde_json::Value::String(base_model_name.clone());
+        }
+        if adapter.load_inplace {
+            payload["load_inplace"] = serde_json::Value::Bool(true);
+        }
+
+        let base_url = format!("http://localhost:{}", self.lora_base_port()?);
+        self.post_request(
+            &format!("{}/v1/load_lora_adapter", base_url),
+            Some(&payload.to_string()),
+            Duration::from_secs(120),
+        )
+        .await
+        .map_err(|e| OrchestratorError::WakeFailed {
+            model: model.to_string(),
+            reason: format!("Failed to load LoRA adapter: {}", e),
+        })?;
+
+        *lora.active_adapter.write().await = Some(model.to_string());
+        info!(model = %model, "LoRA adapter is now active");
+        Ok(())
+    }
+
+    async fn sleep_lora_model(
+        &self,
+        model: &str,
+        eviction: EvictionPolicy,
+    ) -> Result<(), OrchestratorError> {
+        if !self.lora_has_adapter(model) {
+            return Err(OrchestratorError::ModelNotFound(model.to_string()));
+        }
+
+        if eviction.process == ProcessStrategy::Stop {
+            let result = self
+                .sleep_model_legacy(LORA_BASE_KEY, EvictionPolicy::STOP)
+                .await;
+            if let Some(lora) = self.lora_runtime() {
+                *lora.active_adapter.write().await = None;
+            }
+            return result;
+        }
+
+        let Some(lora) = self.lora_runtime() else {
+            return Ok(());
+        };
+        if lora.active_adapter.read().await.as_deref() != Some(model) {
+            return Ok(());
+        }
+
+        self.lora_unload_adapter_by_name(model).await?;
+        *lora.active_adapter.write().await = None;
+        info!(model = %model, "LoRA adapter unloaded");
+        Ok(())
+    }
+
     /// Wake a model from sleep
     pub async fn wake_model(&self, model: &str) -> Result<(), OrchestratorError> {
+        if self.is_lora_mode() {
+            return self.wake_lora_model(model).await;
+        }
+        self.wake_model_legacy(model).await
+    }
+
+    async fn wake_model_legacy(&self, model: &str) -> Result<(), OrchestratorError> {
         // Check if the process is still alive before trying to talk to it
         self.check_process_alive(model).await;
 
@@ -871,6 +1104,17 @@ impl Orchestrator {
         model: &str,
         eviction: EvictionPolicy,
     ) -> Result<(), OrchestratorError> {
+        if self.is_lora_mode() {
+            return self.sleep_lora_model(model, eviction).await;
+        }
+        self.sleep_model_legacy(model, eviction).await
+    }
+
+    async fn sleep_model_legacy(
+        &self,
+        model: &str,
+        eviction: EvictionPolicy,
+    ) -> Result<(), OrchestratorError> {
         // Check if the process is still alive before trying to talk to it
         self.check_process_alive(model).await;
 
@@ -892,19 +1136,13 @@ impl Orchestrator {
             match &guard.state {
                 ProcessState::Running {
                     sleeping: Some(_), ..
-                } if matches!(
-                    eviction.process,
-                    ProcessStrategy::KeepRunning
-                ) =>
-                {
+                } if matches!(eviction.process, ProcessStrategy::KeepRunning) => {
                     return Ok(());
                 }
                 ProcessState::Running { .. } => {
                     // Proceed with sleep (awake, or sleeping but escalating)
                 }
-                ProcessState::Checkpointed { .. }
-                    if eviction.process == ProcessStrategy::Stop =>
-                {
+                ProcessState::Checkpointed { .. } if eviction.process == ProcessStrategy::Stop => {
                     // Allow Stop to clean up checkpoint images
                 }
                 _ => return Ok(()), // Not running, nothing to sleep
@@ -1280,13 +1518,12 @@ impl Orchestrator {
 
         if needs_download {
             if let Some(ref obj_cfg) = ckpt_cfg.object_store {
-                let store =
-                    crate::object_store::CheckpointStore::new(obj_cfg).map_err(|e| {
-                        OrchestratorError::WakeFailed {
-                            model: model.to_string(),
-                            reason: format!("Failed to init object store: {}", e),
-                        }
-                    })?;
+                let store = crate::object_store::CheckpointStore::new(obj_cfg).map_err(|e| {
+                    OrchestratorError::WakeFailed {
+                        model: model.to_string(),
+                        reason: format!("Failed to init object store: {}", e),
+                    }
+                })?;
 
                 info!(model = %model, "Local checkpoint not found, downloading from S3");
                 store
@@ -1478,10 +1715,34 @@ impl Orchestrator {
 
     /// Check if a model is ready
     pub async fn is_ready(&self, model: &str) -> bool {
+        if self.is_lora_mode() {
+            if !self.lora_has_adapter(model) {
+                return false;
+            }
+            let Some(process) = self.processes.get(LORA_BASE_KEY) else {
+                return false;
+            };
+            let base_ready = {
+                let guard = process.lock().await;
+                matches!(guard.state, ProcessState::Running { sleeping: None })
+            };
+            if !base_ready {
+                return false;
+            }
+
+            return self
+                .lora_runtime()
+                .unwrap()
+                .active_adapter
+                .read()
+                .await
+                .as_deref()
+                == Some(model);
+        }
+
         let Some(process) = self.processes.get(model) else {
             return false;
         };
-
         let guard = process.lock().await;
         matches!(guard.state, ProcessState::Running { sleeping: None })
     }

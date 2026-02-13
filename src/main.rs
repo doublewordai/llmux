@@ -96,10 +96,19 @@ async fn main() -> Result<()> {
     config.validate();
 
     info!(
-        models = ?config.models.keys().collect::<Vec<_>>(),
+        mode = if config.is_lora_mode() { "lora" } else { "legacy" },
+        models = ?config.routing_model_names(),
         port = config.port,
         "Configuration loaded"
     );
+
+    if config.is_lora_mode()
+        && (args.validate.is_some() || args.checkpoint.is_some() || args.restore_detached.is_some())
+    {
+        anyhow::bail!(
+            "--validate, --checkpoint, and --restore-detached are not supported in LoRA mode"
+        );
+    }
 
     // Run validation if --validate is specified
     if let Some(model_name) = args.validate {
@@ -116,13 +125,9 @@ async fn main() -> Result<()> {
     // Create checkpoint if --checkpoint is specified
     if let Some(model_name) = args.checkpoint {
         let eviction = args.eviction.as_deref().unwrap_or("discard+checkpoint");
-        let success = llmux::validate::run_checkpoint(
-            &config,
-            &model_name,
-            eviction,
-            !args.no_warmup,
-        )
-        .await?;
+        let success =
+            llmux::validate::run_checkpoint(&config, &model_name, eviction, !args.no_warmup)
+                .await?;
         std::process::exit(if success { 0 } else { 1 });
     }
 

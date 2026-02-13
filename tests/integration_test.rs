@@ -19,6 +19,42 @@ fn allocate_port() -> u16 {
     NEXT_PORT.fetch_add(1, Ordering::SeqCst)
 }
 
+fn make_lora_config(base_port: u16, adapters: &[(&str, &str)]) -> llmux::LoraConfig {
+    let adapters = adapters
+        .iter()
+        .map(|(name, path)| {
+            (
+                (*name).to_string(),
+                llmux::LoraAdapterConfig {
+                    lora_path: (*path).to_string(),
+                    base_model_name: None,
+                    load_inplace: false,
+                },
+            )
+        })
+        .collect();
+
+    llmux::LoraConfig {
+        base_model: llmux::LoraBaseModelConfig {
+            model_path: "base-model".to_string(),
+            port: base_port,
+            extra_args: vec![],
+        },
+        adapters,
+    }
+}
+
+async fn backend_stats(port: u16) -> serde_json::Value {
+    reqwest::Client::new()
+        .get(format!("http://localhost:{}/stats", port))
+        .send()
+        .await
+        .expect("stats request failed")
+        .json()
+        .await
+        .expect("failed to parse stats")
+}
+
 /// A running mock-vllm server.
 ///
 /// Waits for the server to signal readiness before returning.
@@ -874,6 +910,7 @@ async fn test_end_to_end_single_model() {
 
     let config = Config {
         models: models.clone(),
+        lora: None,
         policy: PolicyConfig::default(),
         port: proxy_port,
         metrics_port: 0,
@@ -942,6 +979,282 @@ async fn test_end_to_end_single_model() {
     server.abort();
 }
 
+// =============================================================================
+// Dynamic LoRA Mode Tests
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_lora_build_app_eager_base_startup() {
+    use llmux::{Config, PolicyConfig};
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let base_port = allocate_port();
+    let proxy_port = allocate_port();
+
+    let config = Config {
+        models: HashMap::new(),
+        lora: Some(make_lora_config(base_port, &[("adapter-a", "/tmp/a")])),
+        policy: PolicyConfig::default(),
+        port: proxy_port,
+        metrics_port: 0,
+        vllm_command: mock_vllm_path.to_string(),
+        checkpoint: None,
+        admin_port: None,
+    };
+
+    let (_app, _metrics, _control) = llmux::build_app(config).await.unwrap();
+
+    let response = reqwest::Client::new()
+        .get(format!("http://localhost:{}/health", base_port))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_lora_orchestrator_load_unload_switch() {
+    use llmux::{EvictionPolicy, Orchestrator, ProcessState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let base_port = allocate_port();
+    let lora_cfg = make_lora_config(
+        base_port,
+        &[("adapter-a", "/tmp/a"), ("adapter-b", "/tmp/b")],
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_lora_options(
+        lora_cfg,
+        mock_vllm_path.to_string(),
+        None,
+    ));
+
+    orchestrator.wake_model("adapter-a").await.unwrap();
+    assert!(orchestrator.is_ready("adapter-a").await);
+    let stats = backend_stats(base_port).await;
+    assert_eq!(stats["loaded_loras"], serde_json::json!(["adapter-a"]));
+
+    orchestrator
+        .sleep_model("adapter-a", EvictionPolicy::from(1))
+        .await
+        .unwrap();
+    assert!(!orchestrator.is_ready("adapter-a").await);
+    let stats = backend_stats(base_port).await;
+    assert_eq!(stats["loaded_loras"], serde_json::json!([]));
+
+    orchestrator.wake_model("adapter-b").await.unwrap();
+    assert!(orchestrator.is_ready("adapter-b").await);
+    assert!(!orchestrator.is_ready("adapter-a").await);
+    let stats = backend_stats(base_port).await;
+    assert_eq!(stats["loaded_loras"], serde_json::json!(["adapter-b"]));
+
+    assert_eq!(
+        orchestrator.process_state("adapter-b").await,
+        Some(ProcessState::Running { sleeping: None })
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_lora_switcher_same_adapter_no_switch() {
+    use llmux::{FifoPolicy, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let base_port = allocate_port();
+    let lora_cfg = make_lora_config(
+        base_port,
+        &[("adapter-a", "/tmp/a"), ("adapter-b", "/tmp/b")],
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_lora_options(
+        lora_cfg,
+        mock_vllm_path.to_string(),
+        None,
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    switcher.ensure_model_ready("adapter-a").await.unwrap();
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "adapter-a".to_string()
+        }
+    );
+
+    let start = std::time::Instant::now();
+    switcher.ensure_model_ready("adapter-a").await.unwrap();
+    assert!(
+        start.elapsed() < Duration::from_millis(100),
+        "same-adapter ensure took too long"
+    );
+
+    let stats = backend_stats(base_port).await;
+    assert_eq!(stats["loaded_loras"], serde_json::json!(["adapter-a"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_lora_load_failure_cleans_up_and_recovers() {
+    use llmux::{FifoPolicy, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let base_port = allocate_port();
+    let lora_cfg = make_lora_config(
+        base_port,
+        &[("good-adapter", "/tmp/good"), ("bad-adapter", "fail://bad")],
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_lora_options(
+        lora_cfg,
+        mock_vllm_path.to_string(),
+        None,
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    switcher.ensure_model_ready("good-adapter").await.unwrap();
+    let stats = backend_stats(base_port).await;
+    assert_eq!(stats["loaded_loras"], serde_json::json!(["good-adapter"]));
+
+    let failed = tokio::time::timeout(
+        Duration::from_secs(15),
+        switcher.ensure_model_ready("bad-adapter"),
+    )
+    .await
+    .unwrap();
+    assert!(failed.is_err());
+    assert_eq!(switcher.state().await, SwitcherState::Idle);
+
+    // Wake failure cleanup should stop the base process and clear loaded adapters.
+    assert!(!orchestrator.is_ready("good-adapter").await);
+
+    tokio::time::sleep(Duration::from_secs(3)).await; // switcher backoff window
+    switcher.ensure_model_ready("good-adapter").await.unwrap();
+    let stats = backend_stats(base_port).await;
+    assert_eq!(stats["loaded_loras"], serde_json::json!(["good-adapter"]));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_end_to_end_lora_alias_routing_and_unknown_passthrough() {
+    use llmux::{Config, PolicyConfig};
+    use tokio::net::TcpListener;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let base_port = allocate_port();
+    let proxy_port = allocate_port();
+
+    let config = Config {
+        models: HashMap::new(),
+        lora: Some(make_lora_config(base_port, &[("adapter-a", "/tmp/a")])),
+        policy: PolicyConfig::default(),
+        port: proxy_port,
+        metrics_port: 0,
+        vllm_command: mock_vllm_path.to_string(),
+        checkpoint: None,
+        admin_port: None,
+    };
+
+    let (app, _metrics, _control) = llmux::build_app(config).await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let ok = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .json(&serde_json::json!({
+            "model": "adapter-a",
+            "messages": [{"role": "user", "content": "hello from lora"}]
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success());
+
+    let unknown = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            proxy_port
+        ))
+        .json(&serde_json::json!({
+            "model": "unknown-adapter",
+            "messages": [{"role": "user", "content": "nope"}]
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_lora_control_eviction_unsupported() {
+    use llmux::{FifoPolicy, ModelSwitcher, Orchestrator};
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let base_port = allocate_port();
+    let admin_port = allocate_port();
+    let lora_cfg = make_lora_config(base_port, &[("adapter-a", "/tmp/a")]);
+
+    let orchestrator = Arc::new(Orchestrator::with_lora_options(
+        lora_cfg,
+        mock_vllm_path.to_string(),
+        None,
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+    let control = llmux::control::control_router(switcher);
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", admin_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, control).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let get_resp = client
+        .get(format!("http://127.0.0.1:{}/control/eviction", admin_port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let post_resp = client
+        .post(format!("http://127.0.0.1:{}/control/eviction", admin_port))
+        .json(&serde_json::json!({
+            "model":"adapter-a",
+            "eviction":{"weights":"discard","process":"stop"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+}
+
 #[tokio::test]
 #[serial]
 async fn test_end_to_end_model_switching() {
@@ -983,6 +1296,7 @@ async fn test_end_to_end_model_switching() {
 
     let config = Config {
         models: models.clone(),
+        lora: None,
         policy: PolicyConfig::default(),
         port: proxy_port,
         metrics_port: 0,
@@ -1112,6 +1426,7 @@ async fn test_end_to_end_unknown_model_passthrough() {
 
     let config = Config {
         models: models.clone(),
+        lora: None,
         policy: PolicyConfig::default(),
         port: proxy_port,
         metrics_port: 0,
@@ -1470,6 +1785,7 @@ async fn test_end_to_end_concurrent_requests() {
 
     let config = Config {
         models: models.clone(),
+        lora: None,
         policy: PolicyConfig::default(),
         port: proxy_port,
         metrics_port: 0,
@@ -2129,10 +2445,7 @@ async fn test_control_pin_and_unpin() {
             pinned: Some("model-a".to_string())
         }
     );
-    assert_eq!(
-        switcher.active_model().await,
-        Some("model-a".to_string())
-    );
+    assert_eq!(switcher.active_model().await, Some("model-a".to_string()));
 
     // Pin to unknown model returns 404
     let response = client
@@ -2304,6 +2617,7 @@ async fn test_control_pin_blocks_auto_switching() {
 
     let config = Config {
         models: models.clone(),
+        lora: None,
         policy: PolicyConfig::default(),
         port: proxy_port,
         metrics_port: 0,
