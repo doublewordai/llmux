@@ -889,13 +889,10 @@ impl Orchestrator {
         }
 
         if eviction.process == ProcessStrategy::Stop {
-            let result = self
-                .sleep_model_legacy(LORA_BASE_KEY, EvictionPolicy::STOP)
-                .await;
-            if let Some(lora) = self.lora_runtime() {
-                *lora.active_adapter.write().await = None;
-            }
-            return result;
+            debug!(
+                model = %model,
+                "Ignoring Stop process strategy in LoRA mode; keeping base vLLM process alive"
+            );
         }
 
         let Some(lora) = self.lora_runtime() else {
@@ -1890,6 +1887,54 @@ mod tests {
         assert_eq!(
             strip_ansi("\x1b[1;32mgreen bold\x1b[0m text"),
             "green bold text"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lora_sleep_stop_does_not_stop_base_process() {
+        let mut adapters = HashMap::new();
+        adapters.insert(
+            "adapter-a".to_string(),
+            LoraAdapterConfig {
+                lora_path: "/tmp/fake-adapter-a".to_string(),
+                base_model_name: None,
+                load_inplace: false,
+            },
+        );
+
+        let orchestrator = Orchestrator::with_lora_options(
+            LoraConfig {
+                base_model: crate::config::LoraBaseModelConfig {
+                    model_path: "test/base".to_string(),
+                    port: 9001,
+                    extra_args: vec![],
+                },
+                adapters,
+            },
+            "vllm".to_string(),
+            None,
+        );
+
+        let base = orchestrator
+            .processes
+            .get(LORA_BASE_KEY)
+            .expect("missing LoRA base process state");
+
+        {
+            let mut guard = base.lock().await;
+            guard.state = ProcessState::Running { sleeping: None };
+            guard.child = None;
+        }
+
+        orchestrator
+            .sleep_model("adapter-a", EvictionPolicy::STOP)
+            .await
+            .expect("LoRA sleep should succeed without stopping base process");
+
+        let guard = base.lock().await;
+        assert!(
+            matches!(guard.state, ProcessState::Running { sleeping: None }),
+            "LoRA Stop eviction must not stop the base process"
         );
     }
 }

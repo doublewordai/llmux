@@ -55,6 +55,20 @@ async fn backend_stats(port: u16) -> serde_json::Value {
         .expect("failed to parse stats")
 }
 
+fn listening_pid_on_port(port: u16) -> Option<i32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{}", port), "-sTCP:LISTEN"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.trim().parse::<i32>().ok())
+}
+
 /// A running mock-vllm server.
 ///
 /// Waits for the server to signal readiness before returning.
@@ -1055,6 +1069,57 @@ async fn test_lora_orchestrator_load_unload_switch() {
         orchestrator.process_state("adapter-b").await,
         Some(ProcessState::Running { sleeping: None })
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_lora_switching_does_not_restart_base_process() {
+    use llmux::{EvictionPolicy, Orchestrator, ProcessState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let base_port = allocate_port();
+    let lora_cfg = make_lora_config(
+        base_port,
+        &[("adapter-a", "/tmp/a"), ("adapter-b", "/tmp/b")],
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_lora_options(
+        lora_cfg,
+        mock_vllm_path.to_string(),
+        None,
+    ));
+
+    orchestrator.wake_model("adapter-a").await.unwrap();
+    let pid_before = listening_pid_on_port(base_port).expect("base vLLM PID missing");
+
+    orchestrator
+        .sleep_model("adapter-a", EvictionPolicy::STOP)
+        .await
+        .unwrap();
+
+    let pid_after_sleep = listening_pid_on_port(base_port).expect("base vLLM PID missing after sleep");
+    assert_eq!(
+        pid_before, pid_after_sleep,
+        "LoRA sleep must not restart base vLLM process"
+    );
+    assert!(
+        matches!(
+            orchestrator.process_state("adapter-a").await,
+            Some(ProcessState::Running { .. })
+        ),
+        "Base process should stay running after LoRA sleep"
+    );
+
+    orchestrator.wake_model("adapter-b").await.unwrap();
+    let pid_after_wake = listening_pid_on_port(base_port).expect("base vLLM PID missing after wake");
+    assert_eq!(
+        pid_before, pid_after_wake,
+        "LoRA wake must not restart base vLLM process"
+    );
+
+    let stats = backend_stats(base_port).await;
+    assert_eq!(stats["loaded_loras"], serde_json::json!(["adapter-b"]));
 }
 
 #[tokio::test]
