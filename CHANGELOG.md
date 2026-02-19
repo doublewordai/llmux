@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4](https://github.com/doublewordai/llmux/compare/v0.7.3...v0.7.4) - 2026-02-19
+
+### Added
+
+- checkpoint reuse, stray GPU cleanup, and reload_weights patch ([#25](https://github.com/doublewordai/llmux/pull/25))
+
 ## [0.7.3](https://github.com/doublewordai/llmux/compare/v0.7.2...v0.7.3) - 2026-02-19
 
 ### Fixed
