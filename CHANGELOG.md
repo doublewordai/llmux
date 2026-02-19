@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5](https://github.com/doublewordai/llmux/compare/v0.7.4...v0.7.5) - 2026-02-19
+
+### Fixed
+
+- regenerate reload_weights patch with correct v0.15.1 line numbers
+
 ## [0.7.4](https://github.com/doublewordai/llmux/compare/v0.7.3...v0.7.4) - 2026-02-19
 
 ### Added
