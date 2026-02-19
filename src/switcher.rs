@@ -663,26 +663,13 @@ impl ModelSwitcher {
 
         // Phase 3: Sleep old model — use per-model eviction policy from config,
         // falling back to the global policy default.
-        // Exception: if the target model is already checkpointed on disk,
-        // downgrade the process strategy to Stop (kill) to avoid needing disk space
-        // for two simultaneous CRIU checkpoints.
         let sleep_start = Instant::now();
         if let Some(ref from) = from_model {
-            let mut eviction = self
+            let eviction = self
                 .inner
                 .orchestrator
                 .eviction_policy_for(from)
                 .unwrap_or_else(|| self.inner.policy.eviction_policy());
-            if eviction.process == ProcessStrategy::Checkpoint
-                && self.inner.orchestrator.is_checkpointed(target_model)
-            {
-                info!(
-                    from = %from,
-                    to = %target_model,
-                    "Target is checkpointed; downgrading process to Stop to avoid dual checkpoint"
-                );
-                eviction.process = ProcessStrategy::Stop;
-            }
             debug!(model = %from, eviction = ?eviction, "Sleeping model");
             self.inner.orchestrator.force_sleep(from, eviction).await;
         }
