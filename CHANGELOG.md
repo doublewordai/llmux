@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6](https://github.com/doublewordai/llmux/compare/v0.7.5...v0.7.6) - 2026-02-19
+
+### Fixed
+
+- increase startup timeout to 30 minutes for large MoE models
+
 ## [0.7.5](https://github.com/doublewordai/llmux/compare/v0.7.4...v0.7.5) - 2026-02-19
 
 ### Fixed
