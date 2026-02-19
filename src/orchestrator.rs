@@ -1174,21 +1174,15 @@ impl Orchestrator {
         // find the restore thread, which is gone after --toggle.
         info!(model = %model, "Checkpoint step 1/2: skipping pre-toggle (CRIU plugin handles cuda-checkpoint)");
 
-        // Clean up stale CRIU link_remap artifacts in /dev/shm before dump.
-        // CRIU's --link-remap creates temporary hardlinks named link_remap.N
-        // in /dev/shm for POSIX semaphores. These aren't cleaned up after
-        // dump and cause "File exists" errors on subsequent dumps.
-        if let Ok(entries) = std::fs::read_dir("/dev/shm") {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with("link_remap.") {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
-        }
-
         // Step 2: CRIU dump (snapshots process tree to disk, kills it)
+        //
+        // Use --ghost-limit instead of --link-remap for deleted files (e.g.
+        // Python multiprocessing semaphores in /dev/shm that are sem_unlink'd
+        // while the fd is still open). Ghost files embed the deleted file's
+        // contents directly in the checkpoint image, making each checkpoint
+        // self-contained. --link-remap creates temporary hardlinks in /dev/shm
+        // that get destroyed when a *different* model is checkpointed, breaking
+        // restore of the first model.
         info!(model = %model, parent_pid, "Checkpoint step 2/2: criu dump");
         let criu_dump = maybe_sudo(&ckpt_cfg.criu_path)
             .args([
@@ -1196,7 +1190,8 @@ impl Orchestrator {
                 "--shell-job",
                 "--ext-unix-sk",
                 "--tcp-established",
-                "--link-remap",
+                "--ghost-limit",
+                "1048576",
                 "--enable-external-masters",
                 "-L",
                 &ckpt_cfg.cuda_plugin_dir,
