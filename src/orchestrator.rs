@@ -215,6 +215,33 @@ fn maybe_sudo(program: &str) -> tokio::process::Command {
     }
 }
 
+/// Find all PIDs on the system that have NVIDIA GPU device mappings,
+/// excluding any that belong to the given set of known PIDs.
+///
+/// Uses /proc to scan for processes with /dev/nvidia in their memory maps.
+/// This is Linux-only.
+#[cfg(unix)]
+fn find_stray_gpu_pids(known_pids: &[u32]) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return vec![];
+    };
+
+    let mut strays = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if known_pids.contains(&pid) {
+            continue;
+        }
+        if has_nvidia_mappings(pid) {
+            strays.push(pid);
+        }
+    }
+    strays
+}
+
 /// Orchestrator manages vLLM process lifecycle
 pub struct Orchestrator {
     /// Model configurations
@@ -340,6 +367,54 @@ impl Orchestrator {
     /// Override the eviction policy for a model at runtime
     pub fn set_eviction_policy(&self, model: &str, policy: EvictionPolicy) {
         self.eviction_overrides.insert(model.to_string(), policy);
+    }
+
+    /// Kill any GPU-holding processes that don't belong to any managed model.
+    ///
+    /// This catches zombie processes left behind by OOM kills, failed starts,
+    /// or CRIU restore failures that still hold GPU memory and would cause the
+    /// next model load to OOM.
+    #[cfg(unix)]
+    pub async fn kill_stray_gpu_processes(&self) {
+        // Collect PIDs of all processes we know about
+        let mut known_pids: Vec<u32> = Vec::new();
+        for entry in self.processes.iter() {
+            let guard = entry.value().lock().await;
+            if let Some(ref child) = guard.child {
+                if let Some(pid) = child.id() {
+                    // Include all descendants of our managed processes
+                    known_pids.push(pid);
+                    known_pids.extend(find_all_descendants(pid));
+                }
+            }
+            if let Some(pid) = guard.parent_pid {
+                known_pids.push(pid);
+                known_pids.extend(find_all_descendants(pid));
+            }
+            known_pids.extend(guard.engine_core_pids.iter());
+        }
+
+        let strays = find_stray_gpu_pids(&known_pids);
+        if strays.is_empty() {
+            return;
+        }
+
+        warn!(
+            pids = ?strays,
+            "Found {} stray GPU process(es), killing them to free GPU memory",
+            strays.len()
+        );
+
+        for pid in strays {
+            // SAFETY: Killing a process we identified as a stray GPU holder.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            info!(pid, "Killed stray GPU process");
+        }
+
+        // Give the kernel a moment to reclaim GPU memory
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     /// Ensure a model's process is running and ready
@@ -699,6 +774,11 @@ impl Orchestrator {
     pub async fn wake_model(&self, model: &str) -> Result<(), OrchestratorError> {
         // Check if the process is still alive before trying to talk to it
         self.check_process_alive(model).await;
+
+        // Kill any stray GPU processes before attempting to load a model.
+        // This prevents OOM from zombie processes left by previous failures.
+        #[cfg(unix)]
+        self.kill_stray_gpu_processes().await;
 
         // Check for checkpointed state first — needs CRIU restore, not ensure_running
         {
@@ -1122,6 +1202,11 @@ impl Orchestrator {
     /// 1. Toggle CUDA state (suspends GPU, copies VRAM to host memory)
     /// 2. Dump the process tree via CRIU (writes everything to disk, kills process)
     /// 3. Update state to Checkpointed
+    ///
+    /// When `keep_images` is true and a valid checkpoint already exists on disk,
+    /// the CRIU dump is skipped — the process is simply killed and the existing
+    /// images are reused. This is safe because there's no meaningful runtime
+    /// state to preserve (KV cache is discarded during sleep anyway).
     async fn checkpoint_model(
         &self,
         model: &str,
@@ -1149,8 +1234,43 @@ impl Orchestrator {
                 })?
         };
 
-        // Prepare images directory (clean up old checkpoint first)
         let images_dir = ckpt_cfg.images_dir.join(model).join("images");
+
+        // Reuse existing checkpoint: if keep_images is true and a valid
+        // checkpoint already exists, skip the expensive CRIU dump and just
+        // kill the process. The existing images will be used for restore.
+        let has_existing_checkpoint = images_dir.exists()
+            && std::fs::read_dir(&images_dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+
+        if ckpt_cfg.keep_images && has_existing_checkpoint {
+            info!(
+                model = %model,
+                images_dir = %images_dir.display(),
+                "Reusing existing checkpoint images, killing process instead of re-checkpointing"
+            );
+
+            // Kill the process group to free GPU memory
+            let mut guard = process.lock().await;
+            if let Some(ref mut child) = guard.child {
+                if let Some(pid) = child.id() {
+                    kill_process_group(pid);
+                } else {
+                    let _ = child.kill().await;
+                }
+                let _ = child.wait().await;
+            }
+            guard.child = None;
+            guard.state = ProcessState::Checkpointed {
+                images_dir: images_dir.clone(),
+                eviction,
+            };
+
+            return Ok(());
+        }
+
+        // Prepare images directory (clean up old checkpoint first)
         if images_dir.exists() {
             std::fs::remove_dir_all(&images_dir).map_err(|e| OrchestratorError::SleepFailed {
                 model: model.to_string(),
