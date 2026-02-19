@@ -229,6 +229,16 @@ async fn test_sleep_level(
     })
 }
 
+/// Run a warmup inference request against a vLLM endpoint.
+///
+/// Sends a single deterministic chat completion request to trigger CUDA graph
+/// compilation and warm the KV cache allocator. This is the same request used
+/// by the validation tool.
+pub async fn run_warmup_inference(port: u16, model_path: &str) -> Result<()> {
+    run_deterministic_request(port, model_path).await?;
+    Ok(())
+}
+
 /// Run a deterministic inference request against a vLLM endpoint
 async fn run_deterministic_request(port: u16, model_path: &str) -> Result<String> {
     let client = reqwest::Client::new();

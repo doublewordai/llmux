@@ -880,6 +880,7 @@ async fn test_end_to_end_single_model() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        warmup: false,
     };
 
     // Build the full app stack
@@ -989,6 +990,7 @@ async fn test_end_to_end_model_switching() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        warmup: false,
     };
 
     // Build the full app stack
@@ -1118,6 +1120,7 @@ async fn test_end_to_end_unknown_model_passthrough() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        warmup: false,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(
@@ -1476,6 +1479,7 @@ async fn test_end_to_end_concurrent_requests() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        warmup: false,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(
@@ -2310,6 +2314,7 @@ async fn test_control_pin_blocks_auto_switching() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        warmup: false,
     };
 
     let orchestrator = Arc::new(Orchestrator::with_command(
@@ -2417,4 +2422,70 @@ async fn test_control_pin_blocks_auto_switching() {
     );
 
     server.abort();
+}
+
+// =============================================================================
+// Warmup Tests
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_warmup_leaves_all_models_sleeping() {
+    use llmux::{
+        FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, ProcessState,
+    };
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+
+    let mut models = HashMap::new();
+    models.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            extra_args: vec![],
+            eviction: llmux::EvictionPolicy::from(1), // Offload+KeepRunning
+            checkpoint_path: None,
+        },
+    );
+    models.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            extra_args: vec![],
+            eviction: llmux::EvictionPolicy::from(2), // Discard+KeepRunning
+            checkpoint_path: None,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        models.clone(),
+        mock_vllm_path.to_string(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    // Run warmup
+    llmux::run_warmup(&switcher)
+        .await
+        .expect("Warmup failed");
+
+    // Both models should be running but sleeping
+    let state_a = orchestrator.process_state("model-a").await;
+    assert!(
+        matches!(state_a, Some(ProcessState::Running { sleeping: Some(_) })),
+        "model-a should be sleeping after warmup, got {:?}",
+        state_a
+    );
+
+    let state_b = orchestrator.process_state("model-b").await;
+    assert!(
+        matches!(state_b, Some(ProcessState::Running { sleeping: Some(_) })),
+        "model-b should be sleeping after warmup, got {:?}",
+        state_b
+    );
 }

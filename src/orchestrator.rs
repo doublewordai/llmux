@@ -308,6 +308,16 @@ impl Orchestrator {
         self.configs.keys().cloned().collect()
     }
 
+    /// Get the configured port for a model
+    pub fn model_port(&self, model: &str) -> Option<u16> {
+        self.configs.get(model).map(|c| c.port)
+    }
+
+    /// Get the configured model path (HuggingFace ID or local path) for a model
+    pub fn model_path(&self, model: &str) -> Option<String> {
+        self.configs.get(model).map(|c| c.model_path.clone())
+    }
+
     /// Get the effective eviction policy for a model (override > config)
     pub fn eviction_policy_for(&self, model: &str) -> Option<EvictionPolicy> {
         if let Some(policy) = self.eviction_overrides.get(model) {

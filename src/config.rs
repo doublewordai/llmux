@@ -40,6 +40,15 @@ pub struct Config {
     /// Required when any model uses CudaSuspend or Checkpoint process strategy.
     #[serde(default)]
     pub checkpoint: Option<CheckpointConfig>,
+
+    /// Whether to warm up all models before accepting traffic.
+    ///
+    /// When enabled, the daemon sequentially starts each model, runs a warmup
+    /// inference, then sleeps it using the model's configured eviction policy.
+    /// After warmup, every model is in its warm sleeping state, so the first
+    /// real request triggers a fast wake rather than a cold start.
+    #[serde(default)]
+    pub warmup: bool,
 }
 
 /// Configuration for CUDA/CRIU-based checkpointing.
@@ -511,6 +520,39 @@ mod tests {
         assert!(args.contains(&"--enable-sleep-mode".to_string()));
         assert!(args.contains(&"--tensor-parallel-size".to_string()));
         assert!(args.contains(&"2".to_string()));
+    }
+
+    #[test]
+    fn test_warmup_defaults_to_false() {
+        let json = r#"{
+            "models": {
+                "llama": {
+                    "model_path": "meta-llama/Llama-2-7b",
+                    "port": 8001
+                }
+            },
+            "port": 3000
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.warmup);
+    }
+
+    #[test]
+    fn test_warmup_parses_when_set() {
+        let json = r#"{
+            "models": {
+                "llama": {
+                    "model_path": "meta-llama/Llama-2-7b",
+                    "port": 8001
+                }
+            },
+            "port": 3000,
+            "warmup": true
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.warmup);
     }
 
     #[test]

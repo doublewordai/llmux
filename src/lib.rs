@@ -67,9 +67,10 @@ use tracing::info;
 /// - The main Axum router (proxy + middleware)
 /// - An optional metrics router (when `config.metrics_port > 0`)
 /// - The control API router (for the admin port)
+/// - The model switcher (for driving warmup before serving)
 pub async fn build_app(
     config: Config,
-) -> Result<(axum::Router, Option<axum::Router>, axum::Router)> {
+) -> Result<(axum::Router, Option<axum::Router>, axum::Router, ModelSwitcher)> {
     info!("Building llmux with {} models", config.models.len());
 
     // Create orchestrator with configured command
@@ -100,7 +101,7 @@ pub async fn build_app(
     let onwards_router = onwards::build_router(onwards_state);
 
     // Wrap with model switcher middleware
-    let mut app = onwards_router.layer(ModelSwitcherLayer::new(switcher));
+    let mut app = onwards_router.layer(ModelSwitcherLayer::new(switcher.clone()));
 
     // Install metrics layer and build metrics router if enabled
     let metrics_router = if config.metrics_port > 0 {
@@ -111,5 +112,55 @@ pub async fn build_app(
         None
     };
 
-    Ok((app, metrics_router, control))
+    Ok((app, metrics_router, control, switcher))
+}
+
+/// Run the warmup phase: start each model, run one inference, then sleep it.
+///
+/// Iterates all models sequentially. Each model is cold-started, warmed with
+/// a single inference request (to compile CUDA graphs and warm the allocator),
+/// then put to sleep using its configured eviction policy. After warmup,
+/// every model is in its warm sleeping state so the first real request
+/// triggers a fast wake rather than a cold start.
+pub async fn run_warmup(switcher: &ModelSwitcher) -> Result<()> {
+    let orchestrator = switcher.orchestrator();
+    let models = orchestrator.registered_models();
+
+    info!(count = models.len(), "Starting warmup phase");
+
+    for model in &models {
+        let eviction = orchestrator
+            .eviction_policy_for(model)
+            .expect("model registered but no eviction policy");
+
+        let port = switcher
+            .orchestrator()
+            .model_port(model)
+            .expect("model registered but no port");
+
+        let model_path = switcher
+            .orchestrator()
+            .model_path(model)
+            .expect("model registered but no model_path");
+
+        info!(model = %model, "Warmup: starting");
+        orchestrator
+            .ensure_running(model)
+            .await
+            .map_err(|e| anyhow::anyhow!("warmup: failed to start {}: {}", model, e))?;
+
+        info!(model = %model, "Warmup: running inference");
+        validate::run_warmup_inference(port, &model_path).await?;
+
+        info!(model = %model, ?eviction, "Warmup: sleeping");
+        orchestrator
+            .sleep_model(model, eviction)
+            .await
+            .map_err(|e| anyhow::anyhow!("warmup: failed to sleep {}: {}", model, e))?;
+
+        info!(model = %model, "Warmup: complete");
+    }
+
+    info!("Warmup phase complete — all models warmed and sleeping");
+    Ok(())
 }

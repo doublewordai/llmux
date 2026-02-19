@@ -133,9 +133,16 @@ async fn main() -> Result<()> {
     }
 
     // Build the application
-    let (app, metrics_router, control_router) = llmux::build_app(config.clone())
+    let (app, metrics_router, control_router, switcher) = llmux::build_app(config.clone())
         .await
         .context("Failed to build application")?;
+
+    // Run warmup phase if enabled
+    if config.warmup {
+        llmux::run_warmup(&switcher)
+            .await
+            .context("Warmup phase failed")?;
+    }
 
     // Spawn metrics server if enabled
     if let Some(metrics_router) = metrics_router {
