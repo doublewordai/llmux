@@ -1,17 +1,10 @@
+diff --git a/vllm/model_executor/utils.py b/vllm/model_executor/utils.py
+index d4e87707c..487c0554e 100644
 --- a/vllm/model_executor/utils.py
 +++ b/vllm/model_executor/utils.py
-@@ -60,14 +60,22 @@ def replace_parameter(
-     # should not be used on a tied/shared param
-
-     # If new_data is None, set the parameter to None
-     if new_data is None:
-         setattr(layer, param_name, None)
-         return
-
-     if isinstance(new_data, torch.nn.Parameter):
-         new_data = new_data.data
+@@ -62,9 +62,16 @@ def replace_parameter(layer: torch.nn.Module, param_name: str, new_data: torch.T
      new_param = torch.nn.Parameter(new_data, requires_grad=False)
-
+ 
      old_param: torch.nn.Parameter | None = getattr(layer, param_name, None)
 -    if old_param is not None and hasattr(old_param, "weight_loader"):
 -        weight_loader = old_param.weight_loader
@@ -26,5 +19,6 @@
 +        for attr, value in old_param.__dict__.items():
 +            if attr not in ("data",):
 +                setattr(new_param, attr, value)
-
+ 
      setattr(layer, param_name, new_param)
+ 
