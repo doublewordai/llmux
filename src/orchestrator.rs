@@ -1176,13 +1176,15 @@ impl Orchestrator {
 
         // Step 2: CRIU dump (snapshots process tree to disk, kills it)
         //
-        // Use --ghost-limit instead of --link-remap for deleted files (e.g.
-        // Python multiprocessing semaphores in /dev/shm that are sem_unlink'd
-        // while the fd is still open). Ghost files embed the deleted file's
-        // contents directly in the checkpoint image, making each checkpoint
-        // self-contained. --link-remap creates temporary hardlinks in /dev/shm
-        // that get destroyed when a *different* model is checkpointed, breaking
-        // restore of the first model.
+        // --link-remap is required for CRIU to handle deleted-but-open files
+        // (e.g. Python multiprocessing semaphores in /dev/shm that are
+        // sem_unlink'd while the fd is still open). During dump, CRIU creates
+        // temporary hardlinks (link_remap.N) to preserve these inodes.
+        //
+        // --ghost-limit embeds deleted file contents directly in the checkpoint
+        // image. This makes restores self-contained: even if the link_remap
+        // hardlinks are destroyed (e.g. by a different model's checkpoint),
+        // CRIU can still restore from the embedded ghost file.
         info!(model = %model, parent_pid, "Checkpoint step 2/2: criu dump");
         let criu_dump = maybe_sudo(&ckpt_cfg.criu_path)
             .args([
@@ -1190,6 +1192,7 @@ impl Orchestrator {
                 "--shell-job",
                 "--ext-unix-sk",
                 "--tcp-established",
+                "--link-remap",
                 "--ghost-limit",
                 "1048576",
                 "--enable-external-masters",
