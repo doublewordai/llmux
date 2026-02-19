@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/doublewordai/llmux/compare/v0.5.0...v0.6.0) - 2026-02-12
+
+### Added
+
+- add S3 object store for CRIU checkpoint persistence
+- add --checkpoint and --restore CLI commands
+
+### Other
+
+- rewrite eviction policy section with interaction matrix
+- replace --levels with --policies in validate CLI
+- remove old L1-L5 references from README
+- update README for two-axis eviction policy
+- replace SleepLevel with two-axis EvictionPolicy (weights + process)
+
 ### Added
 
 - `checkpoint_path` per-model config option for lazy CRIU restore on first request
