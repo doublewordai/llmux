@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3](https://github.com/doublewordai/llmux/compare/v0.7.2...v0.7.3) - 2026-02-19
+
+### Fixed
+
+- use both --link-remap and --ghost-limit for CRIU dumps ([#23](https://github.com/doublewordai/llmux/pull/23))
+
 ## [0.7.2](https://github.com/doublewordai/llmux/compare/v0.7.1...v0.7.2) - 2026-02-19
 
 ### Fixed
