@@ -317,7 +317,7 @@ impl Orchestrator {
             eviction_overrides: DashMap::new(),
             operation_lock: Mutex::new(()),
             health_timeout: Duration::from_secs(5),
-            startup_timeout: Duration::from_secs(900), // 15 minutes for large TP models
+            startup_timeout: Duration::from_secs(1800), // 30 minutes for large MoE models with DeepGEMM warmup
             vllm_command,
             checkpoint_config,
         }
