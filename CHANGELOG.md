@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/doublewordai/llmux/compare/v0.6.0...v0.7.0) - 2026-02-19
+
+### Added
+
+- add toggleable warmup phase
+
 ## [0.6.0](https://github.com/doublewordai/llmux/compare/v0.5.0...v0.6.0) - 2026-02-12
 
 ### Added
