@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.12](https://github.com/doublewordai/llmux/compare/v0.7.11...v0.7.12) - 2026-02-20
+
+### Fixed
+
+- exclude parent process from TP size calculation
+
 ## [0.7.11](https://github.com/doublewordai/llmux/compare/v0.7.10...v0.7.11) - 2026-02-20
 
 ### Fixed
