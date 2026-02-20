@@ -424,7 +424,7 @@ pub async fn run_checkpoint(
     println!();
     println!("To restore this checkpoint with the daemon, add to your model config:");
     println!("  \"checkpoint_path\": \"{}\"", images_dir.display());
-    if let Some(ref obj_cfg) = config
+    if let Some(obj_cfg) = config
         .checkpoint
         .as_ref()
         .and_then(|c| c.object_store.as_ref())

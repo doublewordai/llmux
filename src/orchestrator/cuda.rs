@@ -230,12 +230,12 @@ impl Orchestrator {
         let mut known_pids: Vec<u32> = Vec::new();
         for entry in self.processes.iter() {
             let guard = entry.value().lock().await;
-            if let Some(ref child) = guard.child {
-                if let Some(pid) = child.id() {
-                    // Include all descendants of our managed processes
-                    known_pids.push(pid);
-                    known_pids.extend(find_all_descendants(pid));
-                }
+            if let Some(ref child) = guard.child
+                && let Some(pid) = child.id()
+            {
+                // Include all descendants of our managed processes
+                known_pids.push(pid);
+                known_pids.extend(find_all_descendants(pid));
             }
             if let Some(pid) = guard.parent_pid {
                 known_pids.push(pid);

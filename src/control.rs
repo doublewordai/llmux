@@ -228,18 +228,18 @@ async fn pin_model(
 
     // If the pinned model isn't already active, force-switch to it
     let active = switcher.active_model().await;
-    if active.as_deref() != Some(&body.model) {
-        if let Err(e) = switcher.force_switch(&body.model).await {
-            // Rollback to previous mode so the switcher isn't stuck in a
-            // broken manual state with a pin that was never activated.
-            switcher.set_mode(prev_mode).await;
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to switch to pinned model: {}", e),
-                }),
-            ));
-        }
+    if active.as_deref() != Some(&body.model)
+        && let Err(e) = switcher.force_switch(&body.model).await
+    {
+        // Rollback to previous mode so the switcher isn't stuck in a
+        // broken manual state with a pin that was never activated.
+        switcher.set_mode(prev_mode).await;
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to switch to pinned model: {}", e),
+            }),
+        ));
     }
 
     Ok(Json(MessageResponse {

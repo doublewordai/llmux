@@ -132,7 +132,7 @@ impl From<u8> for EvictionPolicy {
                 weights: WeightStrategy::Discard,
                 process: ProcessStrategy::Checkpoint,
             },
-            5 | _ => EvictionPolicy {
+            _ => EvictionPolicy {
                 weights: WeightStrategy::Retain,
                 process: ProcessStrategy::Stop,
             },

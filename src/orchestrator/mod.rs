@@ -326,7 +326,6 @@ impl Orchestrator {
             } = guard.state
             {
                 let images_dir = images_dir.clone();
-                let eviction = eviction;
                 drop(guard);
                 drop(process);
                 return self.restore_checkpoint(model, &images_dir, eviction).await;

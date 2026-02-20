@@ -467,11 +467,11 @@ impl Orchestrator {
             // Read the parent PID from the checkpoint so the stray GPU detector
             // knows this process is ours (not a stray to be killed).
             let pid_file = images_dir.join("parent_pid");
-            if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-                if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                    guard.parent_pid = Some(pid);
-                    info!(model = %model, pid, "Restored parent PID from checkpoint");
-                }
+            if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = pid_str.trim().parse::<u32>()
+            {
+                guard.parent_pid = Some(pid);
+                info!(model = %model, pid, "Restored parent PID from checkpoint");
             }
         }
 
