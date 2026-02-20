@@ -202,8 +202,8 @@ impl Orchestrator {
         //
         // The CRIU CUDA plugin (-L) handles GPU device file descriptors
         // and the CUDA driver's kernel-level state during dump/restore.
-        // For retain strategy, CUDA was pre-suspended via --toggle above.
-        // For offload/discard, vLLM sleep quiesced CUDA enough for the plugin.
+        // It works for all weight strategies: retain (CUDA fully active),
+        // offload (L1 sleep), and discard (L2 sleep).
         //
         // --link-remap is required for CRIU to handle deleted-but-open files
         // (e.g. Python multiprocessing semaphores in /dev/shm that are
@@ -365,7 +365,7 @@ impl Orchestrator {
         Self::restore_ephemeral_files(images_dir);
 
         // Run criu restore with CUDA plugin (-L) to properly restore GPU
-        // device fds. After restore, we resume CUDA via manual toggle.
+        // device fds and CUDA driver state.
         let criu_restore = maybe_sudo(&ckpt_cfg.criu_path)
             .args([
                 "restore",
