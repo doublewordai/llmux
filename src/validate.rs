@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use crate::orchestrator::Orchestrator;
-use crate::switcher::{EvictionPolicy, ProcessStrategy, WeightStrategy};
+use crate::types::{EvictionPolicy, ProcessStrategy, WeightStrategy};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::sync::Arc;

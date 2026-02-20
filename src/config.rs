@@ -1,7 +1,7 @@
 //! Configuration for llmux
 
 use crate::policy::{CostAwarePolicy, FifoPolicy, SwitchPolicy, TimeSlicePolicy};
-use crate::switcher::EvictionPolicy;
+use crate::types::EvictionPolicy;
 use anyhow::{Context, Result};
 use onwards::target::Targets;
 use serde::{Deserialize, Serialize};
@@ -155,7 +155,7 @@ impl Config {
     /// Checks that models using CudaSuspend or Checkpoint process strategies
     /// with tensor parallelism have the required vLLM flags.
     pub fn validate(&self) {
-        use crate::switcher::ProcessStrategy;
+        use crate::types::ProcessStrategy;
         use tracing::warn;
 
         for (name, model) in &self.models {
@@ -571,11 +571,11 @@ mod tests {
         let model = &config.models["llama"];
         assert_eq!(
             model.eviction.weights,
-            crate::switcher::WeightStrategy::Discard
+            crate::types::WeightStrategy::Discard
         );
         assert_eq!(
             model.eviction.process,
-            crate::switcher::ProcessStrategy::Checkpoint
+            crate::types::ProcessStrategy::Checkpoint
         );
     }
 }

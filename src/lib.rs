@@ -43,6 +43,7 @@ pub mod object_store;
 mod orchestrator;
 mod policy;
 mod switcher;
+pub(crate) mod types;
 pub mod validate;
 
 pub use config::{CheckpointConfig, Config, ModelConfig, ObjectStoreConfig, PolicyConfig};
@@ -52,9 +53,9 @@ pub use policy::{
     CostAwarePolicy, FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy,
     TimeSlicePolicy,
 };
-pub use switcher::{
-    EvictionPolicy, ModelSwitcher, ProcessStrategy, SwitchError, SwitchMode, SwitcherState,
-    WeightStrategy,
+pub use switcher::{InFlightGuard, ModelSwitcher};
+pub use types::{
+    EvictionPolicy, ProcessStrategy, SwitchError, SwitchMode, SwitcherState, WeightStrategy,
 };
 
 use anyhow::Result;

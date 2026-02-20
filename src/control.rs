@@ -19,7 +19,8 @@
 //! | POST   | `/control/wake`         | Wake a sleeping model                     |
 
 use crate::orchestrator::ProcessState;
-use crate::switcher::{EvictionPolicy, ModelSwitcher, SwitchMode, SwitcherState};
+use crate::switcher::ModelSwitcher;
+use crate::types::{EvictionPolicy, SwitchMode, SwitcherState};
 use axum::{
     Json, Router,
     extract::State,
@@ -435,7 +436,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn make_test_switcher() -> ModelSwitcher {
-        use crate::switcher::EvictionPolicy;
+        use crate::types::EvictionPolicy;
         let mut configs = std::collections::HashMap::new();
         configs.insert(
             "model-a".to_string(),

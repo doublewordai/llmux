@@ -3,7 +3,8 @@
 //! This layer intercepts requests, extracts the model name, ensures the model
 //! is ready, and then passes the request through to the inner service (onwards).
 
-use crate::switcher::{InFlightGuard, ModelSwitcher, SwitchError};
+use crate::switcher::{InFlightGuard, ModelSwitcher};
+use crate::types::SwitchError;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use bytes::Bytes;
