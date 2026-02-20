@@ -888,6 +888,8 @@ impl Orchestrator {
 
         info!(model = %model, eviction = ?eviction, "Waking model from sleep");
 
+        let base_url = format!("http://localhost:{}", config.port);
+
         // CudaSuspend: toggle CUDA back on, then rebuild NCCL for TP>1
         if eviction.process == ProcessStrategy::CudaSuspend {
             self.cuda_suspend_toggle(model, &process, false).await?;
@@ -895,7 +897,6 @@ impl Orchestrator {
             // For TP>1: rebuild NCCL communicators after cuda-checkpoint restore
             let gpu_count = process.lock().await.tp_size;
             if gpu_count > 1 {
-                let base_url = format!("http://localhost:{}", config.port);
                 info!(model = %model, tp = gpu_count, "Resuming NCCL communicators");
                 self.post_request(
                     &format!("{}/collective_rpc", base_url),
@@ -909,13 +910,17 @@ impl Orchestrator {
                 })?;
             }
 
-            let mut guard = process.lock().await;
-            guard.state = ProcessState::Running { sleeping: None };
-            info!(model = %model, "Model resumed from CUDA suspend");
-            return Ok(());
-        }
+            // If weights were retained (no vLLM sleep), CUDA restore fully
+            // reconstructed GPU state — we're done.
+            if !eviction.needs_vllm_sleep() {
+                let mut guard = process.lock().await;
+                guard.state = ProcessState::Running { sleeping: None };
+                info!(model = %model, "Model resumed from CUDA suspend");
+                return Ok(());
+            }
 
-        let base_url = format!("http://localhost:{}", config.port);
+            info!(model = %model, "CUDA resumed, continuing to vLLM wake sequence");
+        }
 
         // If vLLM sleep was used (Offload or Discard weights), wake via API
         if eviction.needs_vllm_sleep() {
@@ -1265,6 +1270,73 @@ impl Orchestrator {
         }
     }
 
+    /// Directories in the container's ephemeral filesystem that vLLM creates at
+    /// runtime. These don't exist in a fresh container, so CRIU restore fails if
+    /// they're not recreated. We save them into the checkpoint directory during
+    /// dump and restore them before CRIU restore.
+    const EPHEMERAL_DIRS: &'static [&'static str] = &[
+        "/root/.cache/flashinfer",
+        "/root/.cache/tvm-ffi",
+        "/root/.triton/cache",
+    ];
+
+    /// Save runtime-generated files from the container's ephemeral filesystem
+    /// into the checkpoint directory. Called after CRIU dump (the files are still
+    /// on disk even though the process is killed).
+    fn save_ephemeral_files(images_dir: &Path) {
+        let rootfs_dir = images_dir.join("rootfs");
+        for dir in Self::EPHEMERAL_DIRS {
+            let src = Path::new(dir);
+            if !src.exists() {
+                continue;
+            }
+            let dest = rootfs_dir.join(dir.trim_start_matches('/'));
+            if let Err(e) = Self::copy_dir_recursive(src, &dest) {
+                warn!(src = %src.display(), error = %e, "Failed to save ephemeral dir (non-fatal)");
+            } else {
+                info!(src = %src.display(), dest = %dest.display(), "Saved ephemeral dir to checkpoint");
+            }
+        }
+    }
+
+    /// Restore runtime-generated files from the checkpoint directory back into
+    /// the container's filesystem. Called before CRIU restore.
+    fn restore_ephemeral_files(images_dir: &Path) {
+        let rootfs_dir = images_dir.join("rootfs");
+        if !rootfs_dir.exists() {
+            return;
+        }
+        for dir in Self::EPHEMERAL_DIRS {
+            let src = rootfs_dir.join(dir.trim_start_matches('/'));
+            let dest = Path::new(dir);
+            if !src.exists() {
+                continue;
+            }
+            if let Err(e) = Self::copy_dir_recursive(&src, dest) {
+                warn!(src = %src.display(), dest = %dest.display(), error = %e,
+                      "Failed to restore ephemeral dir (non-fatal)");
+            } else {
+                info!(src = %src.display(), dest = %dest.display(), "Restored ephemeral dir from checkpoint");
+            }
+        }
+    }
+
+    /// Recursively copy a directory tree.
+    fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dest)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dest_path = dest.join(entry.file_name());
+            if src_path.is_dir() {
+                Self::copy_dir_recursive(&src_path, &dest_path)?;
+            } else {
+                std::fs::copy(&src_path, &dest_path)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Checkpoint a model to disk using CRIU with the CUDA plugin.
     ///
     /// 1. Clean stale /dev/shm entries
@@ -1426,6 +1498,11 @@ impl Orchestrator {
 
         info!(model = %model, images_dir = %images_dir.display(), "Model checkpointed to disk");
 
+        // Save runtime-generated files so cross-container restore works.
+        // These files live in the container's ephemeral OverlayFS and won't
+        // exist in a new container.
+        Self::save_ephemeral_files(&images_dir);
+
         // Upload to S3 if object store is configured
         if let Some(ref obj_cfg) = ckpt_cfg.object_store {
             match crate::object_store::CheckpointStore::new(obj_cfg) {
@@ -1507,6 +1584,11 @@ impl Orchestrator {
 
         // Clean stale /dev/shm entries before restore
         Self::clean_devshm();
+
+        // Restore runtime-generated files that were saved during checkpoint.
+        // These files live in the container's ephemeral OverlayFS and won't
+        // exist in a fresh container (cross-container restore).
+        Self::restore_ephemeral_files(images_dir);
 
         // Run criu restore
         let criu_restore = maybe_sudo(&ckpt_cfg.criu_path)
