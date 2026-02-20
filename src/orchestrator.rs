@@ -1285,14 +1285,10 @@ impl Orchestrator {
         // Step 1: Toggle CUDA checkpoint on all GPU processes.
         // This suspends CUDA state (copies VRAM to host RAM, frees GPU memory)
         // for each GPU-holding process. With TP>1, all ranks are toggled in
-        // parallel. The CRIU CUDA plugin gracefully handles pre-checkpointed
-        // processes: pause_devices skips the lock step, checkpoint_devices
-        // skips the checkpoint step, and resume_devices_late always restores.
-        //
-        // NOTE: Skip pre-toggle — let the CRIU CUDA plugin handle
-        // cuda-checkpoint internally. On driver 580+ the plugin expects to
-        // find the restore thread, which is gone after --toggle.
-        info!(model = %model, "Checkpoint step 1/2: skipping pre-toggle (CRIU plugin handles cuda-checkpoint)");
+        // parallel. The CRIU CUDA plugin needs the restore thread to already
+        // exist when it runs during dump — cuda-checkpoint --toggle creates it.
+        info!(model = %model, "Checkpoint step 1/2: cuda-checkpoint --toggle");
+        self.cuda_suspend_toggle(model, &process, true).await?;
 
         // Step 2: CRIU dump (snapshots process tree to disk, kills it)
         //
