@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8](https://github.com/doublewordai/llmux/compare/v0.7.7...v0.7.8) - 2026-02-20
+
+### Fixed
+
+- discover all CUDA-holding processes for checkpoint pre-toggle
+
 ## [0.7.7](https://github.com/doublewordai/llmux/compare/v0.7.6...v0.7.7) - 2026-02-20
 
 ### Fixed
