@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.11](https://github.com/doublewordai/llmux/compare/v0.7.10...v0.7.11) - 2026-02-20
+
+### Fixed
+
+- separate tp_size from CUDA process count
+
+### Other
+
+- move config files into configs/ directory
+
 ## [0.7.10](https://github.com/doublewordai/llmux/compare/v0.7.9...v0.7.10) - 2026-02-20
 
 ### Fixed
