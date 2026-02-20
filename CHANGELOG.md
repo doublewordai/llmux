@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/doublewordai/llmux/compare/v0.7.14...v0.8.0) - 2026-02-20
+
+### Fixed
+
+- update stale comments referencing removed cuda-checkpoint toggle
+
+### Other
+
+- split orchestrator and policy into sub-modules ([#39](https://github.com/doublewordai/llmux/pull/39))
+- various logs, cleanups
+
 ## [0.7.14](https://github.com/doublewordai/llmux/compare/v0.7.13...v0.7.14) - 2026-02-20
 
 ### Added
