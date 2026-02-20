@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.10](https://github.com/doublewordai/llmux/compare/v0.7.9...v0.7.10) - 2026-02-20
+
+### Fixed
+
+- let CRIU CUDA plugin handle GPU toggle, clean /dev/shm
+
 ## [0.7.9](https://github.com/doublewordai/llmux/compare/v0.7.8...v0.7.9) - 2026-02-20
 
 ### Fixed
