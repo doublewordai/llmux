@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.14](https://github.com/doublewordai/llmux/compare/v0.7.13...v0.7.14) - 2026-02-20
+
+### Added
+
+- save/restore ephemeral container files for cross-container CRIU restore
+
+### Fixed
+
+- save/restore parent PID for cross-container CRIU checkpoint
+
+### Other
+
+- remove verbose CRIU logging
+- add verbose CRIU logging (-v4) for dump and restore
+
 ## [0.7.13](https://github.com/doublewordai/llmux/compare/v0.7.12...v0.7.13) - 2026-02-20
 
 ### Fixed
