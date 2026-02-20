@@ -1,4 +1,4 @@
-use super::{maybe_sudo, ManagedProcess, Orchestrator, OrchestratorError};
+use super::{ManagedProcess, Orchestrator, OrchestratorError, maybe_sudo};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;

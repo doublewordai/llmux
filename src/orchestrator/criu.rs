@@ -1,4 +1,6 @@
-use super::{kill_process_group, maybe_sudo, ManagedProcess, Orchestrator, OrchestratorError, ProcessState};
+use super::{
+    ManagedProcess, Orchestrator, OrchestratorError, ProcessState, kill_process_group, maybe_sudo,
+};
 use crate::types::{EvictionPolicy, WeightStrategy};
 use std::path::Path;
 use std::sync::Arc;
@@ -185,7 +187,11 @@ impl Orchestrator {
         // but the processes run at their original PIDs).
         {
             let guard = process.lock().await;
-            let pids: Vec<String> = guard.engine_core_pids.iter().map(|p| p.to_string()).collect();
+            let pids: Vec<String> = guard
+                .engine_core_pids
+                .iter()
+                .map(|p| p.to_string())
+                .collect();
             let pids_file = images_dir.join("cuda_pids");
             if let Err(e) = std::fs::write(&pids_file, pids.join("\n")) {
                 warn!(model = %model, error = %e, "Failed to save CUDA PIDs (non-fatal)");
