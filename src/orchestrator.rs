@@ -1496,6 +1496,14 @@ impl Orchestrator {
             };
         }
 
+        // Save the parent PID so cross-container restore can track the process.
+        // After CRIU --restore-detached, there's no child handle, but the process
+        // runs at its original PID. We need this for the stray GPU detector.
+        let pid_file = images_dir.join("parent_pid");
+        if let Err(e) = std::fs::write(&pid_file, parent_pid.to_string()) {
+            warn!(model = %model, error = %e, "Failed to save parent PID (non-fatal)");
+        }
+
         info!(model = %model, images_dir = %images_dir.display(), "Model checkpointed to disk");
 
         // Save runtime-generated files so cross-container restore works.
@@ -1668,9 +1676,16 @@ impl Orchestrator {
                 .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
             let mut guard = process.lock().await;
             guard.state = ProcessState::Running { sleeping: None };
-            // Note: child handle is not available after criu restore --restore-detached.
-            // The process runs independently. We track it by PID / health check.
-            // Engine core PID is preserved from before checkpoint.
+            // After criu restore --restore-detached, there's no tokio Child handle.
+            // Read the parent PID from the checkpoint so the stray GPU detector
+            // knows this process is ours (not a stray to be killed).
+            let pid_file = images_dir.join("parent_pid");
+            if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                    guard.parent_pid = Some(pid);
+                    info!(model = %model, pid, "Restored parent PID from checkpoint");
+                }
+            }
         }
 
         // For TP>1: rebuild NCCL communicators after restore
