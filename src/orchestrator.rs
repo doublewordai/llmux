@@ -1228,9 +1228,23 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Checkpoint a model to disk using cuda-checkpoint + CRIU.
+    /// Clean stale /dev/shm entries that interfere with CRIU dumps.
+    fn clean_devshm() {
+        let shm = Path::new("/dev/shm");
+        if let Ok(entries) = std::fs::read_dir(shm) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("link_remap.") || name.starts_with("sem.mp-") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    /// Checkpoint a model to disk using CRIU with the CUDA plugin.
     ///
-    /// 1. Toggle CUDA state (suspends GPU, copies VRAM to host memory)
+    /// 1. Clean stale /dev/shm entries
     /// 2. Dump the process tree via CRIU (writes everything to disk, kills process)
     /// 3. Update state to Checkpointed
     ///
@@ -1313,15 +1327,19 @@ impl Orchestrator {
             reason: format!("Failed to create images dir: {}", e),
         })?;
 
-        // Step 1: Toggle CUDA checkpoint on all GPU processes.
-        // This suspends CUDA state (copies VRAM to host RAM, frees GPU memory)
-        // for each GPU-holding process. With TP>1, all ranks are toggled in
-        // parallel. The CRIU CUDA plugin needs the restore thread to already
-        // exist when it runs during dump — cuda-checkpoint --toggle creates it.
-        info!(model = %model, "Checkpoint step 1/2: cuda-checkpoint --toggle");
-        self.cuda_suspend_toggle(model, &process, true).await?;
+        // Clean stale /dev/shm entries from previous CRIU dumps.
+        // CRIU --link-remap creates hardlinks (link_remap.N) for deleted-but-open
+        // files. If these accumulate, subsequent dumps fail with "File exists".
+        // Python multiprocessing semaphores (sem.mp-*) from killed processes also
+        // linger. Cleaning these before dump prevents conflicts.
+        Self::clean_devshm();
 
-        // Step 2: CRIU dump (snapshots process tree to disk, kills it)
+        // CRIU dump (snapshots process tree to disk, kills it).
+        //
+        // The CRIU CUDA plugin (loaded via -L) handles GPU state automatically
+        // using cuda-checkpoint --action (lock → checkpoint → restore → unlock).
+        // No manual pre-toggle is needed — the plugin manages the entire CUDA
+        // suspend/resume lifecycle during dump and restore.
         //
         // --link-remap is required for CRIU to handle deleted-but-open files
         // (e.g. Python multiprocessing semaphores in /dev/shm that are
@@ -1332,7 +1350,7 @@ impl Orchestrator {
         // image. This makes restores self-contained: even if the link_remap
         // hardlinks are destroyed (e.g. by a different model's checkpoint),
         // CRIU can still restore from the embedded ghost file.
-        info!(model = %model, parent_pid, "Checkpoint step 2/2: criu dump");
+        info!(model = %model, parent_pid, "Checkpointing: criu dump");
         let criu_dump = maybe_sudo(&ckpt_cfg.criu_path)
             .args([
                 "dump",
@@ -1461,6 +1479,9 @@ impl Orchestrator {
                 });
             }
         }
+
+        // Clean stale /dev/shm entries before restore
+        Self::clean_devshm();
 
         // Run criu restore
         let criu_restore = maybe_sudo(&ckpt_cfg.criu_path)
