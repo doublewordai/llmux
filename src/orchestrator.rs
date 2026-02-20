@@ -88,19 +88,61 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Find all descendant processes that hold GPU memory.
+/// Find all descendant processes that have active CUDA contexts.
 ///
-/// vLLM spawns a child process tree. With TP=1, there's a single EngineCore
-/// process. With TP>1, the EngineCore spawns worker processes (one per rank),
-/// each holding a GPU. We find all descendants that have NVIDIA device
-/// mappings in /proc/PID/maps.
-fn find_gpu_pids(parent_pid: u32) -> Vec<u32> {
+/// vLLM spawns a child process tree. The EngineCore parent initialises CUDA
+/// before forking GPU workers. Both the parent and its worker children may
+/// therefore hold CUDA contexts that must be toggled before CRIU dump.
+///
+/// Primary method: `cuda-checkpoint --get-state --pid <PID>` on every
+/// descendant. Processes whose state is "running" have active CUDA contexts.
+///
+/// Fallback (if cuda-checkpoint is unavailable): check for `/dev/nvidia`
+/// device mappings in `/proc/PID/maps`.
+fn find_cuda_pids(parent_pid: u32, cuda_checkpoint_path: &str) -> Vec<u32> {
     let all_descendants = find_all_descendants(parent_pid);
     if all_descendants.is_empty() {
         return vec![];
     }
 
-    // Filter to processes that have NVIDIA GPU mappings
+    // Primary: use cuda-checkpoint --get-state to probe each descendant.
+    // A process with state "running" has an active CUDA context.
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let cuda_pids: Vec<u32> = all_descendants
+        .iter()
+        .copied()
+        .filter(|&pid| {
+            let mut cmd = if is_root {
+                std::process::Command::new(cuda_checkpoint_path)
+            } else {
+                let mut c = std::process::Command::new("sudo");
+                c.arg(cuda_checkpoint_path);
+                c
+            };
+            let output = cmd
+                .args(["--get-state", "--pid", &pid.to_string()])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let state = stdout.trim();
+                    if state == "running" {
+                        debug!(pid, state, "cuda-checkpoint: CUDA context found");
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
+        })
+        .collect();
+
+    if !cuda_pids.is_empty() {
+        return cuda_pids;
+    }
+
+    // Fallback: check /dev/nvidia device mappings in /proc/PID/maps
     let gpu_pids: Vec<u32> = all_descendants
         .iter()
         .copied()
@@ -109,22 +151,6 @@ fn find_gpu_pids(parent_pid: u32) -> Vec<u32> {
 
     if !gpu_pids.is_empty() {
         return gpu_pids;
-    }
-
-    // Fallback: look for processes named EngineCore
-    let engine_pids: Vec<u32> = all_descendants
-        .iter()
-        .copied()
-        .filter(|&pid| {
-            let cmdline_path = format!("/proc/{}/cmdline", pid);
-            std::fs::read_to_string(&cmdline_path)
-                .map(|c| c.contains("EngineCore") || c.contains("engine_core"))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if !engine_pids.is_empty() {
-        return engine_pids;
     }
 
     // Last resort: return all direct children
@@ -656,20 +682,24 @@ impl Orchestrator {
                 Ok(true) => {
                     info!(model = %model, "vLLM process is ready");
                     let mut guard = process.lock().await;
-                    // Discover GPU-holding PIDs for cuda-checkpoint-enabled models
-                    // (CudaSuspend and Checkpoint). With TP=1 this is a single
-                    // EngineCore process; with TP>1 one process per rank.
+                    // Discover all PIDs with active CUDA contexts for
+                    // cuda-checkpoint-enabled models (CudaSuspend and Checkpoint).
+                    // This includes both the EngineCore parent (which initialises
+                    // CUDA before forking) and the GPU worker(s).
                     if needs_cuda_checkpoint
                         && let Some(ref child) = guard.child
                         && let Some(pid) = child.id()
                     {
-                        let gpu_pids = find_gpu_pids(pid);
-                        if gpu_pids.is_empty() {
-                            warn!(model = %model, pid, "Could not find GPU processes, will use parent PID for cuda-checkpoint");
+                        let cuda_path = self.checkpoint_config.as_ref()
+                            .map(|c| c.cuda_checkpoint_path.as_str())
+                            .unwrap_or("cuda-checkpoint");
+                        let cuda_pids = find_cuda_pids(pid, cuda_path);
+                        if cuda_pids.is_empty() {
+                            warn!(model = %model, pid, "Could not find CUDA processes, will use parent PID for cuda-checkpoint");
                             guard.engine_core_pids = vec![pid];
                         } else {
-                            info!(model = %model, pid, gpu_pids = ?gpu_pids, "Found {} GPU process(es)", gpu_pids.len());
-                            guard.engine_core_pids = gpu_pids;
+                            info!(model = %model, pid, cuda_pids = ?cuda_pids, "Found {} CUDA process(es)", cuda_pids.len());
+                            guard.engine_core_pids = cuda_pids;
                         }
                     }
                     guard.state = ProcessState::Running { sleeping: None };
