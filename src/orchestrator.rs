@@ -703,10 +703,13 @@ impl Orchestrator {
                             guard.engine_core_pids = vec![pid];
                             guard.tp_size = 1;
                         } else {
-                            // TP size = number of actual GPU workers (with nvidia device maps).
-                            // engine_core_pids may include the parent process which has a
-                            // CUDA context but no GPU memory — don't count it for TP.
-                            let tp = cuda_pids.iter().filter(|&&p| has_nvidia_mappings(p)).count().max(1);
+                            // TP size = number of descendant GPU workers (with nvidia device maps).
+                            // Exclude the parent process — it has nvidia maps from CUDA init
+                            // but is not a TP rank.
+                            let tp = cuda_pids.iter()
+                                .filter(|&&p| p != pid && has_nvidia_mappings(p))
+                                .count()
+                                .max(1);
                             info!(model = %model, pid, cuda_pids = ?cuda_pids, tp, "Found {} CUDA process(es)", cuda_pids.len());
                             guard.engine_core_pids = cuda_pids;
                             guard.tp_size = tp;
