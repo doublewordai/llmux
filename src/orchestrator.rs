@@ -59,10 +59,12 @@ struct ManagedProcess {
     child: Option<Child>,
     /// Notifies waiters when process becomes ready
     ready_notify: Arc<Notify>,
-    /// PIDs of processes holding GPU memory (engine core + TP workers).
-    /// Discovered after startup for checkpoint-enabled models.
-    /// With TP=1 this is a single PID; with TP>1 one per rank.
+    /// PIDs of all processes with active CUDA contexts. Includes the parent
+    /// vLLM process and EngineCore worker(s). Used for cuda-checkpoint toggle.
     engine_core_pids: Vec<u32>,
+    /// Number of tensor-parallel GPU workers (processes with nvidia device maps).
+    /// Used to decide whether NCCL suspend/resume is needed (only for TP > 1).
+    tp_size: usize,
     /// Parent PID of the vLLM process. Stored separately because after
     /// CRIU restore with --restore-detached, the tokio Child handle is gone
     /// but the process is running at its original PID.
@@ -333,6 +335,7 @@ impl Orchestrator {
                     child: None,
                     ready_notify: Arc::new(Notify::new()),
                     engine_core_pids: vec![],
+                    tp_size: 0,
                     parent_pid: None,
                 })),
             );
@@ -698,9 +701,15 @@ impl Orchestrator {
                         if cuda_pids.is_empty() {
                             warn!(model = %model, pid, "Could not find CUDA processes, will use parent PID for cuda-checkpoint");
                             guard.engine_core_pids = vec![pid];
+                            guard.tp_size = 1;
                         } else {
-                            info!(model = %model, pid, cuda_pids = ?cuda_pids, "Found {} CUDA process(es)", cuda_pids.len());
+                            // TP size = number of actual GPU workers (with nvidia device maps).
+                            // engine_core_pids may include the parent process which has a
+                            // CUDA context but no GPU memory — don't count it for TP.
+                            let tp = cuda_pids.iter().filter(|&&p| has_nvidia_mappings(p)).count().max(1);
+                            info!(model = %model, pid, cuda_pids = ?cuda_pids, tp, "Found {} CUDA process(es)", cuda_pids.len());
                             guard.engine_core_pids = cuda_pids;
+                            guard.tp_size = tp;
                         }
                     }
                     guard.state = ProcessState::Running { sleeping: None };
@@ -866,7 +875,7 @@ impl Orchestrator {
             self.cuda_suspend_toggle(model, &process, false).await?;
 
             // For TP>1: rebuild NCCL communicators after cuda-checkpoint restore
-            let gpu_count = process.lock().await.engine_core_pids.len();
+            let gpu_count = process.lock().await.tp_size;
             if gpu_count > 1 {
                 let base_url = format!("http://localhost:{}", config.port);
                 info!(model = %model, tp = gpu_count, "Resuming NCCL communicators");
@@ -1045,6 +1054,7 @@ impl Orchestrator {
                 guard.state = ProcessState::NotStarted;
                 guard.parent_pid = None;
                 guard.engine_core_pids.clear();
+                guard.tp_size = 0;
                 return Ok(());
             }
 
@@ -1060,6 +1070,7 @@ impl Orchestrator {
             guard.child = None;
             guard.parent_pid = None;
             guard.engine_core_pids.clear();
+            guard.tp_size = 0;
             guard.state = ProcessState::NotStarted;
             info!(model = %model, "vLLM process stopped");
             return Ok(());
@@ -1085,7 +1096,7 @@ impl Orchestrator {
                 // Process stays alive, just update state
             }
             ProcessStrategy::CudaSuspend => {
-                let gpu_count = process.lock().await.engine_core_pids.len();
+                let gpu_count = process.lock().await.tp_size;
 
                 // For TP>1: tear down NCCL communicators before cuda-checkpoint
                 // (NCCL IPC handles cannot be checkpointed)
@@ -1112,7 +1123,7 @@ impl Orchestrator {
                 return Ok(());
             }
             ProcessStrategy::Checkpoint => {
-                let gpu_count = process.lock().await.engine_core_pids.len();
+                let gpu_count = process.lock().await.tp_size;
 
                 // For TP>1: tear down NCCL communicators before checkpoint
                 if gpu_count > 1 {
@@ -1546,7 +1557,7 @@ impl Orchestrator {
                 .processes
                 .get(model)
                 .ok_or_else(|| OrchestratorError::ModelNotFound(model.to_string()))?;
-            process.lock().await.engine_core_pids.len()
+            process.lock().await.tp_size
         };
         // Update state before NCCL resume — the process is already live after
         // CRIU restore, so mark it Running so cleanup paths (e.g. force_sleep)
