@@ -62,7 +62,7 @@ FROM vllm/vllm-openai:v0.15.1
 # 1. Fix sleep mode regression (vllm#32714): `with A and B:` -> `with A, B:`
 # 2. NCCL suspend/resume for cuda-checkpoint at TP>1
 # 3. Fix reload_weights for TP>1: preserve parameter subclass in replace_parameter()
-# 4. Fix MXFP4 MoE reload: use replace_parameter() instead of raw setattr() (doublewordai/vllm#2)
+# 4. Fix MXFP4 MoE reload: use replace_parameter() in all backends (Marlin, Triton, SM100, SM90)
 COPY patches/fix-sleep-mode-v0.15.1.patch /tmp/
 COPY patches/nccl-suspend-resume-v0.15.1.patch /tmp/
 COPY patches/fix-reload-weights-tp-v0.15.1.patch /tmp/
