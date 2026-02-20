@@ -608,12 +608,11 @@ impl Orchestrator {
             // than an inherited pipe or host fd. If stdin's mount ID belongs to
             // the host mount namespace, CRIU dump fails with
             // "Can't lookup mount=N for fd=0 path=/dev/null".
-            let devnull = std::fs::File::open("/dev/null").map_err(|e| {
-                OrchestratorError::SpawnFailed {
+            let devnull =
+                std::fs::File::open("/dev/null").map_err(|e| OrchestratorError::SpawnFailed {
                     model: model.to_string(),
                     reason: format!("Failed to open /dev/null: {}", e),
-                }
-            })?;
+                })?;
             cmd.stdin(devnull);
             cmd.stdout(stdout_file);
             cmd.stderr(stderr_file);
@@ -707,7 +706,9 @@ impl Orchestrator {
                         && let Some(ref child) = guard.child
                         && let Some(pid) = child.id()
                     {
-                        let cuda_path = self.checkpoint_config.as_ref()
+                        let cuda_path = self
+                            .checkpoint_config
+                            .as_ref()
                             .map(|c| c.cuda_checkpoint_path.as_str())
                             .unwrap_or("cuda-checkpoint");
                         let cuda_pids = find_cuda_pids(pid, cuda_path);
@@ -719,7 +720,8 @@ impl Orchestrator {
                             // TP size = number of descendant GPU workers (with nvidia device maps).
                             // Exclude the parent process — it has nvidia maps from CUDA init
                             // but is not a TP rank.
-                            let tp = cuda_pids.iter()
+                            let tp = cuda_pids
+                                .iter()
                                 .filter(|&&p| p != pid && has_nvidia_mappings(p))
                                 .count()
                                 .max(1);
@@ -1038,19 +1040,13 @@ impl Orchestrator {
             match &guard.state {
                 ProcessState::Running {
                     sleeping: Some(_), ..
-                } if matches!(
-                    eviction.process,
-                    ProcessStrategy::KeepRunning
-                ) =>
-                {
+                } if matches!(eviction.process, ProcessStrategy::KeepRunning) => {
                     return Ok(());
                 }
                 ProcessState::Running { .. } => {
                     // Proceed with sleep (awake, or sleeping but escalating)
                 }
-                ProcessState::Checkpointed { .. }
-                    if eviction.process == ProcessStrategy::Stop =>
-                {
+                ProcessState::Checkpointed { .. } if eviction.process == ProcessStrategy::Stop => {
                     // Allow Stop to clean up checkpoint images
                 }
                 _ => return Ok(()), // Not running, nothing to sleep
@@ -1480,13 +1476,12 @@ impl Orchestrator {
 
         if needs_download {
             if let Some(ref obj_cfg) = ckpt_cfg.object_store {
-                let store =
-                    crate::object_store::CheckpointStore::new(obj_cfg).map_err(|e| {
-                        OrchestratorError::WakeFailed {
-                            model: model.to_string(),
-                            reason: format!("Failed to init object store: {}", e),
-                        }
-                    })?;
+                let store = crate::object_store::CheckpointStore::new(obj_cfg).map_err(|e| {
+                    OrchestratorError::WakeFailed {
+                        model: model.to_string(),
+                        reason: format!("Failed to init object store: {}", e),
+                    }
+                })?;
 
                 info!(model = %model, "Local checkpoint not found, downloading from S3");
                 store

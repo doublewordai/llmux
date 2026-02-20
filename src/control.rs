@@ -20,7 +20,13 @@
 
 use crate::orchestrator::ProcessState;
 use crate::switcher::{EvictionPolicy, ModelSwitcher, SwitchMode, SwitcherState};
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::{get, post}};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -32,7 +38,10 @@ pub fn control_router(switcher: ModelSwitcher) -> Router {
         .route("/control/pin", post(pin_model))
         .route("/control/unpin", post(unpin_model))
         .route("/control/switch", post(force_switch))
-        .route("/control/eviction", get(get_eviction_policies).post(set_eviction_policy))
+        .route(
+            "/control/eviction",
+            get(get_eviction_policies).post(set_eviction_policy),
+        )
         .route("/control/sleep", post(sleep_model))
         .route("/control/wake", post(wake_model))
         .with_state(switcher)
@@ -128,11 +137,7 @@ async fn get_status(State(switcher): State<ModelSwitcher>) -> impl IntoResponse 
         SwitcherState::Idle => "idle".to_string(),
         SwitcherState::Active { model } => format!("active:{}", model),
         SwitcherState::Switching { from, to } => {
-            format!(
-                "switching:{}->{}",
-                from.as_deref().unwrap_or("none"),
-                to
-            )
+            format!("switching:{}->{}", from.as_deref().unwrap_or("none"), to)
         }
     };
 
@@ -180,9 +185,7 @@ async fn set_mode(
             )
         }
         "manual" => {
-            switcher
-                .set_mode(SwitchMode::Manual { pinned: None })
-                .await;
+            switcher.set_mode(SwitchMode::Manual { pinned: None }).await;
             (
                 StatusCode::OK,
                 Json(MessageResponse {
@@ -415,10 +418,7 @@ fn format_process_state(state: ProcessState) -> String {
         ProcessState::Running { sleeping: None } => "running".to_string(),
         ProcessState::Running {
             sleeping: Some(eviction),
-        } => format!(
-            "sleeping:{:?}+{:?}",
-            eviction.weights, eviction.process
-        ),
+        } => format!("sleeping:{:?}+{:?}", eviction.weights, eviction.process),
         ProcessState::Failed { reason } => format!("failed:{}", reason),
         ProcessState::Checkpointed { .. } => "checkpointed".to_string(),
     }

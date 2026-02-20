@@ -70,7 +70,12 @@ use tracing::info;
 /// - The model switcher (for driving warmup before serving)
 pub async fn build_app(
     config: Config,
-) -> Result<(axum::Router, Option<axum::Router>, axum::Router, ModelSwitcher)> {
+) -> Result<(
+    axum::Router,
+    Option<axum::Router>,
+    axum::Router,
+    ModelSwitcher,
+)> {
     info!("Building llmux with {} models", config.models.len());
 
     // Create orchestrator with configured command

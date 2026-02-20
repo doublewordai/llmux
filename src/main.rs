@@ -116,13 +116,9 @@ async fn main() -> Result<()> {
     // Create checkpoint if --checkpoint is specified
     if let Some(model_name) = args.checkpoint {
         let eviction = args.eviction.as_deref().unwrap_or("discard+checkpoint");
-        let success = llmux::validate::run_checkpoint(
-            &config,
-            &model_name,
-            eviction,
-            !args.no_warmup,
-        )
-        .await?;
+        let success =
+            llmux::validate::run_checkpoint(&config, &model_name, eviction, !args.no_warmup)
+                .await?;
         std::process::exit(if success { 0 } else { 1 });
     }
 

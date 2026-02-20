@@ -2133,10 +2133,7 @@ async fn test_control_pin_and_unpin() {
             pinned: Some("model-a".to_string())
         }
     );
-    assert_eq!(
-        switcher.active_model().await,
-        Some("model-a".to_string())
-    );
+    assert_eq!(switcher.active_model().await, Some("model-a".to_string()));
 
     // Pin to unknown model returns 404
     let response = client
@@ -2431,9 +2428,7 @@ async fn test_control_pin_blocks_auto_switching() {
 #[tokio::test]
 #[serial]
 async fn test_warmup_leaves_all_models_sleeping() {
-    use llmux::{
-        FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, ProcessState,
-    };
+    use llmux::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, ProcessState};
     use std::sync::Arc;
 
     let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
@@ -2470,9 +2465,7 @@ async fn test_warmup_leaves_all_models_sleeping() {
     let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
 
     // Run warmup
-    llmux::run_warmup(&switcher)
-        .await
-        .expect("Warmup failed");
+    llmux::run_warmup(&switcher).await.expect("Warmup failed");
 
     // Both models should be running but sleeping
     let state_a = orchestrator.process_state("model-a").await;

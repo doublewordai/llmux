@@ -28,14 +28,20 @@ struct LevelResult {
 fn parse_policy(s: &str) -> Result<EvictionPolicy> {
     let parts: Vec<&str> = s.split('+').collect();
     if parts.len() != 2 {
-        bail!("Invalid policy '{}': expected format 'weights+process' (e.g. offload+keep_running)", s);
+        bail!(
+            "Invalid policy '{}': expected format 'weights+process' (e.g. offload+keep_running)",
+            s
+        );
     }
 
     let weights = match parts[0] {
         "retain" => WeightStrategy::Retain,
         "offload" => WeightStrategy::Offload,
         "discard" => WeightStrategy::Discard,
-        other => bail!("Unknown weight strategy '{}': expected retain, offload, or discard", other),
+        other => bail!(
+            "Unknown weight strategy '{}': expected retain, offload, or discard",
+            other
+        ),
     };
 
     let process = match parts[1] {
@@ -43,7 +49,10 @@ fn parse_policy(s: &str) -> Result<EvictionPolicy> {
         "cuda_suspend" => ProcessStrategy::CudaSuspend,
         "checkpoint" => ProcessStrategy::Checkpoint,
         "stop" => ProcessStrategy::Stop,
-        other => bail!("Unknown process strategy '{}': expected keep_running, cuda_suspend, checkpoint, or stop", other),
+        other => bail!(
+            "Unknown process strategy '{}': expected keep_running, cuda_suspend, checkpoint, or stop",
+            other
+        ),
     };
 
     Ok(EvictionPolicy { weights, process })
@@ -105,8 +114,14 @@ pub async fn run_validation(
             .map(|s| parse_policy(s))
             .collect::<Result<Vec<_>>>()?,
         None => vec![
-            EvictionPolicy { weights: WeightStrategy::Offload, process: ProcessStrategy::KeepRunning },
-            EvictionPolicy { weights: WeightStrategy::Discard, process: ProcessStrategy::KeepRunning },
+            EvictionPolicy {
+                weights: WeightStrategy::Offload,
+                process: ProcessStrategy::KeepRunning,
+            },
+            EvictionPolicy {
+                weights: WeightStrategy::Discard,
+                process: ProcessStrategy::KeepRunning,
+            },
         ],
     };
     let mut results = Vec::new();
@@ -144,7 +159,9 @@ pub async fn run_validation(
 
     // Cleanup: stop the model
     println!("\nStopping model...");
-    let _ = orchestrator.sleep_model(model_name, EvictionPolicy::STOP).await;
+    let _ = orchestrator
+        .sleep_model(model_name, EvictionPolicy::STOP)
+        .await;
 
     // Print results table
     print_results(&results);
@@ -375,7 +392,10 @@ pub async fn run_checkpoint(
     println!("GPU memory before checkpoint: {} MiB", gpu_before);
 
     // Checkpoint
-    println!("Checkpointing with {:?}+{:?}...", eviction.weights, eviction.process);
+    println!(
+        "Checkpointing with {:?}+{:?}...",
+        eviction.weights, eviction.process
+    );
     let ckpt_start = Instant::now();
     orchestrator
         .sleep_model(model_name, eviction)
@@ -400,10 +420,7 @@ pub async fn run_checkpoint(
     println!("  Time:      {:.1}s", ckpt_secs);
     println!("  Location:  {}", images_dir.display());
     println!("  Size:      {:.1} GB", image_size as f64 / 1_073_741_824.0);
-    println!(
-        "  GPU freed: {} MiB → {} MiB",
-        gpu_before, gpu_after
-    );
+    println!("  GPU freed: {} MiB → {} MiB", gpu_before, gpu_after);
     println!();
     println!("To restore this checkpoint with the daemon, add to your model config:");
     println!("  \"checkpoint_path\": \"{}\"", images_dir.display());
@@ -476,7 +493,11 @@ pub async fn run_restore(config: &Config, model_name: &str) -> Result<bool> {
         .context("Failed to set checkpointed state")?;
 
     // Restore
-    println!("Restoring '{}' from {}...", model_name, images_dir.display());
+    println!(
+        "Restoring '{}' from {}...",
+        model_name,
+        images_dir.display()
+    );
     let start = Instant::now();
     orchestrator
         .wake_model(model_name)
@@ -497,7 +518,10 @@ pub async fn run_restore(config: &Config, model_name: &str) -> Result<bool> {
     println!("  GPU:      {} MiB", gpu_after);
     println!("  Response: {:?}", response);
     println!();
-    println!("Model is running on port {}. Kill with: kill $(lsof -ti tcp:{})", port, port);
+    println!(
+        "Model is running on port {}. Kill with: kill $(lsof -ti tcp:{})",
+        port, port
+    );
 
     Ok(true)
 }
@@ -524,7 +548,14 @@ fn print_results(results: &[LevelResult]) {
     println!();
     println!(
         "{:<20} {:>10} {:>10} {:>12} {:>12} {:>12} {:>10} {:>6}",
-        "Policy", "Sleep (s)", "Wake (s)", "GPU Before", "GPU After", "GPU Wake", "Response", "Pass"
+        "Policy",
+        "Sleep (s)",
+        "Wake (s)",
+        "GPU Before",
+        "GPU After",
+        "GPU Wake",
+        "Response",
+        "Pass"
     );
     println!("{}", "-".repeat(100));
 

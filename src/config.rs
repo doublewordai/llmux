@@ -139,7 +139,6 @@ fn default_metrics_port() -> u16 {
     9090
 }
 
-
 impl Config {
     /// Load configuration from a JSON file
     pub async fn from_file(path: &Path) -> Result<Self> {
@@ -570,7 +569,13 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
         let model = &config.models["llama"];
-        assert_eq!(model.eviction.weights, crate::switcher::WeightStrategy::Discard);
-        assert_eq!(model.eviction.process, crate::switcher::ProcessStrategy::Checkpoint);
+        assert_eq!(
+            model.eviction.weights,
+            crate::switcher::WeightStrategy::Discard
+        );
+        assert_eq!(
+            model.eviction.process,
+            crate::switcher::ProcessStrategy::Checkpoint
+        );
     }
 }
