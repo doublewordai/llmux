@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use crate::orchestrator::Orchestrator;
-use crate::switcher::{EvictionPolicy, ProcessStrategy, WeightStrategy};
+use crate::types::{EvictionPolicy, ProcessStrategy, WeightStrategy};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -424,7 +424,7 @@ pub async fn run_checkpoint(
     println!();
     println!("To restore this checkpoint with the daemon, add to your model config:");
     println!("  \"checkpoint_path\": \"{}\"", images_dir.display());
-    if let Some(ref obj_cfg) = config
+    if let Some(obj_cfg) = config
         .checkpoint
         .as_ref()
         .and_then(|c| c.object_store.as_ref())
