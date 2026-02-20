@@ -41,6 +41,14 @@ pub struct Config {
     #[serde(default)]
     pub checkpoint: Option<CheckpointConfig>,
 
+    /// Maximum time (in seconds) to wait for a vLLM process to start up
+    /// and become healthy. Separates "how long a client waits"
+    /// (`request_timeout_secs`) from "how long a cold start is allowed to
+    /// take". Default: 1800 (30 minutes, for large MoE models with
+    /// DeepGEMM warmup).
+    #[serde(default = "default_startup_timeout")]
+    pub startup_timeout_secs: u64,
+
     /// Whether to warm up all models before accepting traffic.
     ///
     /// When enabled, the daemon sequentially starts each model, runs a warmup
@@ -101,6 +109,10 @@ pub struct ObjectStoreConfig {
     /// Region (default: "us-east-1")
     #[serde(default = "default_region")]
     pub region: String,
+}
+
+fn default_startup_timeout() -> u64 {
+    1800
 }
 
 fn default_vllm_command() -> String {

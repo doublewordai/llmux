@@ -80,10 +80,11 @@ pub async fn build_app(
     info!("Building llmux with {} models", config.models.len());
 
     // Create orchestrator with configured command
-    let orchestrator = Arc::new(Orchestrator::with_options(
+    let orchestrator = Arc::new(Orchestrator::with_startup_timeout(
         config.models.clone(),
         config.vllm_command.clone(),
         config.checkpoint.clone(),
+        std::time::Duration::from_secs(config.startup_timeout_secs),
     ));
 
     // Create policy

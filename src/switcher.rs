@@ -345,7 +345,11 @@ impl ModelSwitcher {
         match decision {
             PolicyDecision::SwitchNow => {
                 debug!(model = %target_model, "Policy: switch now");
-                self.do_switch(target_model).await;
+                let switcher = self.clone();
+                let target = target_model.to_string();
+                tokio::spawn(async move {
+                    switcher.do_switch(&target).await;
+                });
             }
             PolicyDecision::Defer(future) => {
                 debug!(model = %target_model, "Policy: defer");
@@ -664,16 +668,27 @@ impl ModelSwitcher {
         if let Some(model_state) = self.inner.model_states.get(model) {
             let mut queue = model_state.pending.lock().await;
             let count = queue.len();
+            let mut delivered = 0;
 
             for pending in queue.drain(..) {
                 let r = match &result {
                     Ok(()) => Ok(()),
                     Err(e) => Err(SwitchError::Internal(e.to_string())),
                 };
-                let _ = pending.ready_tx.send(r);
+                if pending.ready_tx.send(r).is_ok() {
+                    delivered += 1;
+                }
             }
 
-            debug!(model = %model, count, "Notified pending requests");
+            if count > 0 {
+                let expired = count - delivered;
+                if expired > 0 {
+                    warn!(model = %model, count, delivered, expired,
+                        "Notified pending requests ({expired} already timed out)");
+                } else {
+                    debug!(model = %model, count, "Notified pending requests");
+                }
+            }
         }
     }
 }

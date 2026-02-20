@@ -880,6 +880,7 @@ async fn test_end_to_end_single_model() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        startup_timeout_secs: 1800,
         warmup: false,
     };
 
@@ -990,6 +991,7 @@ async fn test_end_to_end_model_switching() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        startup_timeout_secs: 1800,
         warmup: false,
     };
 
@@ -1120,6 +1122,7 @@ async fn test_end_to_end_unknown_model_passthrough() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        startup_timeout_secs: 1800,
         warmup: false,
     };
 
@@ -1479,6 +1482,7 @@ async fn test_end_to_end_concurrent_requests() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        startup_timeout_secs: 1800,
         warmup: false,
     };
 
@@ -2311,6 +2315,7 @@ async fn test_control_pin_blocks_auto_switching() {
         vllm_command: mock_vllm_path.to_string(),
         checkpoint: None,
         admin_port: None,
+        startup_timeout_secs: 1800,
         warmup: false,
     };
 
@@ -2480,5 +2485,100 @@ async fn test_warmup_leaves_all_models_sleeping() {
         matches!(state_b, Some(ProcessState::Running { sleeping: Some(_) })),
         "model-b should be sleeping after warmup, got {:?}",
         state_b
+    );
+}
+
+// =============================================================================
+// Switch Cancellation / Orphan Prevention Tests
+// =============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_request_timeout_does_not_orphan_process() {
+    use llmux::{
+        FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, ProcessState, SwitcherState,
+    };
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "slow-model".to_string(),
+        ModelConfig {
+            model_path: "slow-model".to_string(),
+            port: port_a,
+            extra_args: vec!["--startup-delay-ms".to_string(), "5000".to_string()],
+            eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
+        },
+    );
+    configs.insert(
+        "fast-model".to_string(),
+        ModelConfig {
+            model_path: "fast-model".to_string(),
+            port: port_b,
+            extra_args: vec![],
+            eviction: llmux::EvictionPolicy::from(1),
+            checkpoint_path: None,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        configs,
+        mock_vllm_path.to_string(),
+    ));
+
+    // Short request timeout (2s) but slow model takes 5s to start.
+    // Zero cooldown so switches are fast.
+    let policy = Box::new(FifoPolicy::new(
+        llmux::EvictionPolicy::from(1),
+        Duration::from_secs(2),
+        true,
+        Duration::ZERO,
+    ));
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    // Step 1: Request slow-model — should time out after 2s
+    let result = switcher.ensure_model_ready("slow-model").await;
+    assert!(
+        matches!(result, Err(llmux::SwitchError::Timeout)),
+        "Expected timeout, got {:?}",
+        result
+    );
+
+    // Step 2: Wait for the background switch to finish starting slow-model.
+    // The spawned do_switch task should complete even though the request timed out.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // slow-model should be active (do_switch completed in the background)
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "slow-model".to_string()
+        },
+        "do_switch should have completed in the background"
+    );
+
+    // Step 3: Switch to fast-model — should sleep slow-model and wake fast-model
+    let result = switcher.ensure_model_ready("fast-model").await;
+    assert!(result.is_ok(), "Switch to fast-model failed: {:?}", result);
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "fast-model".to_string()
+        }
+    );
+
+    // slow-model should be sleeping (not orphaned as a second running process)
+    assert!(
+        matches!(
+            orchestrator.process_state("slow-model").await,
+            Some(ProcessState::Running { sleeping: Some(_) })
+        ),
+        "slow-model should be sleeping, not orphaned"
     );
 }

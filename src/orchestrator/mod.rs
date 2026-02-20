@@ -124,6 +124,21 @@ impl Orchestrator {
         vllm_command: String,
         checkpoint_config: Option<CheckpointConfig>,
     ) -> Self {
+        Self::with_startup_timeout(
+            configs,
+            vllm_command,
+            checkpoint_config,
+            Duration::from_secs(1800),
+        )
+    }
+
+    /// Create a new orchestrator with full options and a custom startup timeout.
+    pub fn with_startup_timeout(
+        configs: HashMap<String, ModelConfig>,
+        vllm_command: String,
+        checkpoint_config: Option<CheckpointConfig>,
+        startup_timeout: Duration,
+    ) -> Self {
         let processes = DashMap::new();
 
         for (name, config) in &configs {
@@ -161,7 +176,7 @@ impl Orchestrator {
             eviction_overrides: DashMap::new(),
             operation_lock: Mutex::new(()),
             health_timeout: Duration::from_secs(5),
-            startup_timeout: Duration::from_secs(1800), // 30 minutes for large MoE models with DeepGEMM warmup
+            startup_timeout,
             vllm_command,
             checkpoint_config,
         }
