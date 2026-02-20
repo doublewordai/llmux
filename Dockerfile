@@ -62,13 +62,16 @@ FROM vllm/vllm-openai:v0.15.1
 # 1. Fix sleep mode regression (vllm#32714): `with A and B:` -> `with A, B:`
 # 2. NCCL suspend/resume for cuda-checkpoint at TP>1
 # 3. Fix reload_weights for TP>1: preserve parameter subclass in replace_parameter()
+# 4. Fix MXFP4 MoE reload: use replace_parameter() instead of raw setattr() (doublewordai/vllm#2)
 COPY patches/fix-sleep-mode-v0.15.1.patch /tmp/
 COPY patches/nccl-suspend-resume-v0.15.1.patch /tmp/
 COPY patches/fix-reload-weights-tp-v0.15.1.patch /tmp/
+COPY patches/fix-mxfp4-reload-v0.15.1.patch /tmp/
 RUN cd /usr/local/lib/python3.12/dist-packages && \
     patch -p1 < /tmp/fix-sleep-mode-v0.15.1.patch && \
     patch -p1 < /tmp/nccl-suspend-resume-v0.15.1.patch && \
     patch -p1 < /tmp/fix-reload-weights-tp-v0.15.1.patch && \
+    patch -p1 < /tmp/fix-mxfp4-reload-v0.15.1.patch && \
     rm /tmp/*.patch
 
 # Install cuda-checkpoint from NVIDIA's repo (pre-built binary)

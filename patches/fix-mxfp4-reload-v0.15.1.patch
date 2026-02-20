@@ -1,0 +1,49 @@
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+index 789ed5dba..7513ed06f 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+@@ -6,6 +6,7 @@
+
+ import vllm._custom_ops as ops
+ from vllm.logger import init_logger
++from vllm.model_executor.utils import replace_parameter
+ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+     USE_FP32_REDUCE_DEFAULT,
+     get_marlin_input_dtype,
+@@ -386,9 +387,7 @@ def prepare_moe_fp4_layer_for_marlin(
+             tensor_list.append(marlin_qweight)
+
+         weight = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+-        weight = torch.nn.Parameter(weight, requires_grad=False)
+-
+-        setattr(layer, name, weight)
++        replace_parameter(layer, name, weight)
+
+     # WEIGHT SCALES
+     # Permute scales
+@@ -425,13 +424,11 @@ def prepare_moe_fp4_layer_for_marlin(
+             tensor_list.append(marlin_scales)
+
+         scales = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+-        scales = torch.nn.Parameter(scales, requires_grad=False)
+-        setattr(layer, name + "_weight_scale", scales)
++        replace_parameter(layer, name + "_weight_scale", scales)
+
+         if is_nvfp4:
+             global_scale = nvfp4_marlin_process_global_scale(global_scale)
+-            global_scale = torch.nn.Parameter(global_scale, requires_grad=False)
+-            setattr(layer, name + "_weight_scale_2", global_scale)
++            replace_parameter(layer, name + "_weight_scale_2", global_scale)
+
+     # BIAS
+     # Permute bias
+@@ -447,8 +444,7 @@ def prepare_moe_fp4_layer_for_marlin(
+             tensor_list.append(marlin_permute_bias(expert_bias))
+
+         bias = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+-        bias = torch.nn.Parameter(bias, requires_grad=False)
+-        setattr(layer, name, bias)
++        replace_parameter(layer, name, bias)
+
+
+ def rand_marlin_weight_nvfp4_like(weight, group_size, input_dtype=None):
