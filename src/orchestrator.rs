@@ -11,6 +11,7 @@ use crate::switcher::{EvictionPolicy, ProcessStrategy, WeightStrategy};
 use anyhow::Result;
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -578,18 +579,30 @@ impl Orchestrator {
             let stdout_path = log_dir.join("stdout.log");
             let stderr_path = log_dir.join("stderr.log");
 
-            let stdout_file = std::fs::File::create(&stdout_path).map_err(|e| {
-                OrchestratorError::SpawnFailed {
+            // Open log files with O_APPEND so that CRIU's should_check_size()
+            // skips file-size validation on restore. Without this, restoring a
+            // checkpoint after a container restart fails because the log files
+            // changed size during the intervening cold start.
+            let stdout_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .custom_flags(libc::O_APPEND)
+                .open(&stdout_path)
+                .map_err(|e| OrchestratorError::SpawnFailed {
                     model: model.to_string(),
                     reason: format!("Failed to create {}: {}", stdout_path.display(), e),
-                }
-            })?;
-            let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| {
-                OrchestratorError::SpawnFailed {
+                })?;
+            let stderr_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .custom_flags(libc::O_APPEND)
+                .open(&stderr_path)
+                .map_err(|e| OrchestratorError::SpawnFailed {
                     model: model.to_string(),
                     reason: format!("Failed to create {}: {}", stderr_path.display(), e),
-                }
-            })?;
+                })?;
 
             // CRIU requires stdin to point to a container-local /dev/null rather
             // than an inherited pipe or host fd. If stdin's mount ID belongs to
