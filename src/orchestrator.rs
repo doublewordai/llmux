@@ -100,15 +100,16 @@ fn strip_ansi(s: &str) -> String {
 /// Fallback (if cuda-checkpoint is unavailable): check for `/dev/nvidia`
 /// device mappings in `/proc/PID/maps`.
 fn find_cuda_pids(parent_pid: u32, cuda_checkpoint_path: &str) -> Vec<u32> {
-    let all_descendants = find_all_descendants(parent_pid);
-    if all_descendants.is_empty() {
-        return vec![];
-    }
+    // Include the parent itself — CRIU --tree dumps the root process plus
+    // all descendants, and the parent vLLM process often holds a CUDA
+    // context (it initialises CUDA before forking the EngineCore workers).
+    let mut all_pids = vec![parent_pid];
+    all_pids.extend(find_all_descendants(parent_pid));
 
-    // Primary: use cuda-checkpoint --get-state to probe each descendant.
+    // Primary: use cuda-checkpoint --get-state to probe each process.
     // A process with state "running" has an active CUDA context.
     let is_root = unsafe { libc::geteuid() } == 0;
-    let cuda_pids: Vec<u32> = all_descendants
+    let cuda_pids: Vec<u32> = all_pids
         .iter()
         .copied()
         .filter(|&pid| {
@@ -143,7 +144,7 @@ fn find_cuda_pids(parent_pid: u32, cuda_checkpoint_path: &str) -> Vec<u32> {
     }
 
     // Fallback: check /dev/nvidia device mappings in /proc/PID/maps
-    let gpu_pids: Vec<u32> = all_descendants
+    let gpu_pids: Vec<u32> = all_pids
         .iter()
         .copied()
         .filter(|&pid| has_nvidia_mappings(pid))
