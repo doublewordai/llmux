@@ -1,27 +1,11 @@
 //! Switch policies for model switching decisions.
 //!
-//! Three policies are available:
-//!
-//! - [`FifoPolicy`]: Switches immediately on the first request for a non-active model.
-//!   Simple and predictable, but causes excessive switching under mixed workloads.
-//!
-//! - [`CostAwarePolicy`]: Uses empirical switch timing (EMA), a coalescing window,
-//!   a serving window, and a cost threshold to reduce unnecessary switches. The
-//!   serving window ensures a model serves long enough to amortize its wake cost
-//!   before yielding. See `reports/switching-efficiency.md` Report 4 for benchmarks.
-//!
-//! - [`TimeSlicePolicy`]: Drain-first policy with a proactive background scheduler.
-//!   Never preempts a serving model — instead, the scheduler switches to the model
-//!   with the most demand only after the active model's queue fully drains. This
-//!   minimizes switches while a staleness bound caps maximum wait time.
+//! Currently only [`FifoPolicy`] is implemented: switches immediately on the
+//! first request for a non-active model.
 
-mod cost_aware;
 mod fifo;
-mod time_slice;
 
-pub use cost_aware::CostAwarePolicy;
 pub use fifo::FifoPolicy;
-pub use time_slice::TimeSlicePolicy;
 
 use crate::types::EvictionPolicy;
 use async_trait::async_trait;

@@ -49,10 +49,7 @@ pub mod validate;
 pub use config::{CheckpointConfig, Config, ModelConfig, ObjectStoreConfig, PolicyConfig};
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
 pub use orchestrator::{Orchestrator, OrchestratorError, ProcessState};
-pub use policy::{
-    CostAwarePolicy, FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy,
-    TimeSlicePolicy,
-};
+pub use policy::{FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy};
 pub use switcher::{InFlightGuard, ModelSwitcher};
 pub use types::{
     EvictionPolicy, ProcessStrategy, SwitchError, SwitchMode, SwitcherState, WeightStrategy,
