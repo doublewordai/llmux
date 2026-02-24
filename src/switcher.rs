@@ -189,14 +189,19 @@ impl ModelSwitcher {
 
         self.maybe_trigger_switch(model).await;
 
-        let timeout = self.inner.policy.request_timeout();
-        match tokio::time::timeout(timeout, ready_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(SwitchError::Internal("channel closed".to_string())),
-            Err(_) => {
-                warn!(model = %model, "Request timed out");
-                Err(SwitchError::Timeout)
-            }
+        match self.inner.policy.request_timeout() {
+            Some(timeout) => match tokio::time::timeout(timeout, ready_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(SwitchError::Internal("channel closed".to_string())),
+                Err(_) => {
+                    warn!(model = %model, "Request timed out");
+                    Err(SwitchError::Timeout)
+                }
+            },
+            None => match ready_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(SwitchError::Internal("channel closed".to_string())),
+            },
         }
     }
 

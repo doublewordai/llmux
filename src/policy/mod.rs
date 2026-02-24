@@ -111,8 +111,8 @@ pub trait SwitchPolicy: Send + Sync {
     /// Policies can use this to track empirical switch costs.
     fn on_switch_complete(&self, _from: &str, _to: &str, _duration: Duration) {}
 
-    /// Request timeout
-    fn request_timeout(&self) -> Duration;
+    /// Request timeout. None = unlimited (requests wait forever).
+    fn request_timeout(&self) -> Option<Duration>;
 
     /// Minimum time a model must stay active before it can be put to sleep.
     fn min_active_duration(&self) -> Duration;

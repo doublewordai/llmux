@@ -85,50 +85,38 @@ impl Config {
 /// Policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
-    /// Request timeout in seconds
-    /// TODO: default to unlimited (None) and let the user set it explicitly if they want a
-    /// timeout.
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout_secs: u64,
+    /// Request timeout in seconds. None = unlimited (requests wait forever).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 
     /// Whether to drain in-flight requests before switching
     #[serde(default = "default_drain_before_switch")]
     pub drain_before_switch: bool,
 
     /// Minimum seconds a model must stay active before it can be put to sleep.
-    /// Prevents rapid wake/sleep thrashing.
-    /// TODO: Default to 0 (no minimum) and let the user set it if they want a minimum active
-    /// duration.
-    #[serde(default = "default_min_active_secs")]
+    /// Prevents rapid wake/sleep thrashing. Default: 0 (no minimum).
+    #[serde(default)]
     pub min_active_secs: u64,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            request_timeout_secs: default_request_timeout(),
+            request_timeout_secs: None,
             drain_before_switch: default_drain_before_switch(),
-            min_active_secs: default_min_active_secs(),
+            min_active_secs: 0,
         }
     }
-}
-
-fn default_request_timeout() -> u64 {
-    300
 }
 
 fn default_drain_before_switch() -> bool {
     true
 }
 
-fn default_min_active_secs() -> u64 {
-    5
-}
-
 impl PolicyConfig {
     pub fn build_policy(&self) -> Box<dyn crate::policy::SwitchPolicy> {
         Box::new(crate::policy::FifoPolicy::new(
-            Duration::from_secs(self.request_timeout_secs),
+            self.request_timeout_secs.map(Duration::from_secs),
             self.drain_before_switch,
             Duration::from_secs(self.min_active_secs),
         ))
@@ -165,7 +153,7 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.models.len(), 2);
         assert_eq!(config.models["llama"].port, 8001);
-        assert_eq!(config.policy.request_timeout_secs, 30);
+        assert_eq!(config.policy.request_timeout_secs, Some(30));
     }
 
     #[test]
@@ -183,8 +171,8 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.port, 3000);
-        assert_eq!(config.policy.request_timeout_secs, 300);
+        assert_eq!(config.policy.request_timeout_secs, None);
         assert!(config.policy.drain_before_switch);
-        assert_eq!(config.policy.min_active_secs, 5);
+        assert_eq!(config.policy.min_active_secs, 0);
     }
 }

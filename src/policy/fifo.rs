@@ -7,17 +7,14 @@ use std::time::Duration;
 /// No background scheduler needed: every request spawns its own switch attempt
 /// via `maybe_trigger_switch`, and the switch lock serializes them.
 pub struct FifoPolicy {
-    // TODO: Is this the concern of the policy
-    request_timeout: Duration,
-    // TODO: is this the concern of the policy?
+    request_timeout: Option<Duration>,
     drain_before_switch: bool,
-    // TODO: is this the concern of the policy?
     min_active_duration: Duration,
 }
 
 impl FifoPolicy {
     pub fn new(
-        request_timeout: Duration,
+        request_timeout: Option<Duration>,
         drain_before_switch: bool,
         min_active_duration: Duration,
     ) -> Self {
@@ -31,7 +28,7 @@ impl FifoPolicy {
 
 impl Default for FifoPolicy {
     fn default() -> Self {
-        Self::new(Duration::from_secs(300), true, Duration::from_secs(5))
+        Self::new(None, true, Duration::ZERO)
     }
 }
 
@@ -47,7 +44,7 @@ impl SwitchPolicy for FifoPolicy {
         }
     }
 
-    fn request_timeout(&self) -> Duration {
+    fn request_timeout(&self) -> Option<Duration> {
         self.request_timeout
     }
 

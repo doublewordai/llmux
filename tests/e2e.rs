@@ -135,7 +135,7 @@ fn test_config(
     Config {
         models,
         policy: PolicyConfig {
-            request_timeout_secs: 30,
+            request_timeout_secs: Some(30),
             drain_before_switch: true,
             min_active_secs: 0,
         },
