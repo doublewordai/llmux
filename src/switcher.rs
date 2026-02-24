@@ -567,24 +567,33 @@ mod tests {
     use crate::policy::FifoPolicy;
     use std::path::PathBuf;
 
+    fn true_path() -> PathBuf {
+        ["/usr/bin/true", "/bin/true"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+            .expect("cannot find `true` binary")
+    }
+
     fn make_test_hooks() -> Arc<HookRunner> {
+        let t = true_path();
         let mut configs = HashMap::new();
         configs.insert(
             "model-a".to_string(),
             ModelConfig {
                 port: 8001,
-                wake: PathBuf::from("/bin/true"),
-                sleep: PathBuf::from("/bin/true"),
-                alive: PathBuf::from("/bin/true"),
+                wake: t.clone(),
+                sleep: t.clone(),
+                alive: t.clone(),
             },
         );
         configs.insert(
             "model-b".to_string(),
             ModelConfig {
                 port: 8002,
-                wake: PathBuf::from("/bin/true"),
-                sleep: PathBuf::from("/bin/true"),
-                alive: PathBuf::from("/bin/true"),
+                wake: t.clone(),
+                sleep: t.clone(),
+                alive: t.clone(),
             },
         );
         Arc::new(HookRunner::new(configs))
