@@ -33,6 +33,8 @@ pub struct HookRunner {
 }
 
 impl HookRunner {
+    // TODO: how do we propagate information (PID, for example) between wake and sleep (and back
+    // through to sleep). Filesystem?
     pub fn new(configs: HashMap<String, ModelConfig>) -> Self {
         Self { configs }
     }
