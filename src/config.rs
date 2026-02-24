@@ -22,10 +22,6 @@ pub struct Config {
     /// Proxy port
     #[serde(default = "default_port")]
     pub port: u16,
-
-    /// Admin/control API port (None to disable)
-    #[serde(default)]
-    pub admin_port: Option<u16>,
 }
 
 /// Configuration for a single model.
@@ -178,6 +174,5 @@ mod tests {
         assert_eq!(config.policy.request_timeout_secs, 300);
         assert!(config.policy.drain_before_switch);
         assert_eq!(config.policy.min_active_secs, 5);
-        assert!(config.admin_port.is_none());
     }
 }

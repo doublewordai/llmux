@@ -38,7 +38,6 @@
 //! ```
 
 mod config;
-pub mod control;
 mod hooks;
 mod middleware;
 pub mod policy;
@@ -63,9 +62,8 @@ use tracing::info;
 ///
 /// Returns:
 /// - The main Axum router (proxy + middleware)
-/// - The control API router (for the admin port)
 /// - The model switcher (for external use)
-pub async fn build_app(config: Config) -> Result<(Router, Router, ModelSwitcher)> {
+pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     info!("Building llmux with {} models", config.models.len());
 
     let hooks = Arc::new(HookRunner::new(config.models.clone()));
@@ -74,9 +72,6 @@ pub async fn build_app(config: Config) -> Result<(Router, Router, ModelSwitcher)
 
     // Spawn background scheduler if the policy uses one
     let _scheduler_handle = switcher.clone().spawn_scheduler();
-
-    // Build control API
-    let control = control::control_router(switcher.clone());
 
     // Build proxy
     let proxy_state = ProxyState::new();
@@ -87,5 +82,5 @@ pub async fn build_app(config: Config) -> Result<(Router, Router, ModelSwitcher)
         .with_state(proxy_state)
         .layer(ModelSwitcherLayer::new(switcher.clone()));
 
-    Ok((app, control, switcher))
+    Ok((app, switcher))
 }

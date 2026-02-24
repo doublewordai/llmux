@@ -140,7 +140,6 @@ fn test_config(
             min_active_secs: 0,
         },
         port: 0,
-        admin_port: None,
     }
 }
 
@@ -178,7 +177,7 @@ async fn test_single_model_request() {
     let (addr_b, _counter_b) = spawn_mock_backend(0).await;
 
     let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _, _switcher) = llmux::build_app(config).await.unwrap();
+    let (app, _switcher) = llmux::build_app(config).await.unwrap();
 
     let (status, body) = chat_request(&app, "model-a").await;
     assert_eq!(status, StatusCode::OK);
@@ -196,7 +195,7 @@ async fn test_model_switch() {
     let (addr_b, counter_b) = spawn_mock_backend(0).await;
 
     let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _, _switcher) = llmux::build_app(config).await.unwrap();
+    let (app, _switcher) = llmux::build_app(config).await.unwrap();
 
     // First request: model-a (cold start)
     let (status, body) = chat_request(&app, "model-a").await;
@@ -222,7 +221,7 @@ async fn test_same_model_no_switch() {
     let (addr_b, counter_b) = spawn_mock_backend(0).await;
 
     let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _, _switcher) = llmux::build_app(config).await.unwrap();
+    let (app, _switcher) = llmux::build_app(config).await.unwrap();
 
     for _ in 0..5 {
         let (status, body) = chat_request(&app, "model-a").await;
@@ -244,7 +243,7 @@ async fn test_unknown_model() {
     let (addr_b, _) = spawn_mock_backend(0).await;
 
     let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _, _) = llmux::build_app(config).await.unwrap();
+    let (app, _) = llmux::build_app(config).await.unwrap();
 
     let (status, body) = chat_request(&app, "nonexistent").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -261,7 +260,7 @@ async fn test_switch_timing() {
     let (addr_b, _) = spawn_mock_backend(0).await;
 
     let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _, _switcher) = llmux::build_app(config).await.unwrap();
+    let (app, _switcher) = llmux::build_app(config).await.unwrap();
 
     // First request: cold start wake for model-a (~100ms)
     let t0 = Instant::now();
@@ -292,7 +291,7 @@ async fn test_concurrent_same_model() {
     let (addr_b, _) = spawn_mock_backend(0).await;
 
     let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _, _) = llmux::build_app(config).await.unwrap();
+    let (app, _) = llmux::build_app(config).await.unwrap();
 
     // Send 10 concurrent requests for model-a
     let mut handles = Vec::new();
@@ -322,7 +321,7 @@ async fn test_concurrent_different_models() {
     let (addr_b, counter_b) = spawn_mock_backend(0).await;
 
     let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _, _) = llmux::build_app(config).await.unwrap();
+    let (app, _) = llmux::build_app(config).await.unwrap();
 
     // Send requests for both models concurrently
     let mut handles = Vec::new();
@@ -351,47 +350,6 @@ async fn test_concurrent_different_models() {
     assert_eq!(total, 6);
 }
 
-/// Control API: status endpoint reflects switcher state.
-#[tokio::test]
-async fn test_control_api_status() {
-    let hooks_a = MockHooks::new(10, 10);
-    let hooks_b = MockHooks::new(10, 10);
-
-    let (addr_a, _) = spawn_mock_backend(0).await;
-    let (addr_b, _) = spawn_mock_backend(0).await;
-
-    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, control, _) = llmux::build_app(config).await.unwrap();
-
-    // Initially idle
-    let resp = control
-        .clone()
-        .oneshot(Request::builder().uri("/control/status").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(
-        &resp.into_body().collect().await.unwrap().to_bytes(),
-    )
-    .unwrap();
-    assert_eq!(body["state"], "idle");
-
-    // Make a request to activate model-a
-    let _ = chat_request(&app, "model-a").await;
-
-    // Now should show active
-    let resp = control
-        .clone()
-        .oneshot(Request::builder().uri("/control/status").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let body: Value = serde_json::from_slice(
-        &resp.into_body().collect().await.unwrap().to_bytes(),
-    )
-    .unwrap();
-    assert_eq!(body["state"], "active:model-a");
-    assert_eq!(body["active_model"], "model-a");
-}
-
 /// model-override header takes precedence over body.
 #[tokio::test]
 async fn test_model_override_header() {
@@ -402,7 +360,7 @@ async fn test_model_override_header() {
     let (addr_b, counter_b) = spawn_mock_backend(0).await;
 
     let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _, _) = llmux::build_app(config).await.unwrap();
+    let (app, _) = llmux::build_app(config).await.unwrap();
 
     // Body says model-a, header says model-b
     let body = json!({
