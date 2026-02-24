@@ -3,6 +3,9 @@
 //! All model lifecycle operations (wake, sleep, liveness) are delegated to
 //! user-provided scripts. llmux does not know or care how models are started,
 //! stopped, or health-checked — that's entirely up to the scripts.
+//!
+//! Hooks are executed via `sh -c`, so they can be either a path to an
+//! executable or an inline shell script.
 
 use crate::config::ModelConfig;
 use std::collections::HashMap;
@@ -33,8 +36,6 @@ pub struct HookRunner {
 }
 
 impl HookRunner {
-    // TODO: how do we propagate information (PID, for example) between wake and sleep (and back
-    // through to sleep). Filesystem?
     pub fn new(configs: HashMap<String, ModelConfig>) -> Self {
         Self { configs }
     }
@@ -60,7 +61,7 @@ impl HookRunner {
             .configs
             .get(model)
             .ok_or_else(|| HookError::ModelNotFound(model.to_string()))?;
-        run_script(&config.wake.to_string_lossy(), model, "wake").await
+        run_hook(&config.wake, model, "wake").await
     }
 
     /// Run the sleep script for a model. Returns Ok(()) when the model is asleep.
@@ -69,7 +70,7 @@ impl HookRunner {
             .configs
             .get(model)
             .ok_or_else(|| HookError::ModelNotFound(model.to_string()))?;
-        run_script(&config.sleep.to_string_lossy(), model, "sleep").await
+        run_hook(&config.sleep, model, "sleep").await
     }
 
     /// Run the alive script for a model. Returns true if healthy, false if not.
@@ -81,7 +82,7 @@ impl HookRunner {
             .configs
             .get(model)
             .ok_or_else(|| HookError::ModelNotFound(model.to_string()))?;
-        match run_script(&config.alive.to_string_lossy(), model, "alive").await {
+        match run_hook(&config.alive, model, "alive").await {
             Ok(()) => Ok(true),
             Err(HookError::Failed { .. }) => Ok(false),
             Err(e) => Err(e),
@@ -89,10 +90,12 @@ impl HookRunner {
     }
 }
 
-async fn run_script(path: &str, model: &str, hook_name: &str) -> Result<(), HookError> {
-    debug!(model = %model, hook = %hook_name, path = %path, "Running hook");
+async fn run_hook(script: &str, model: &str, hook_name: &str) -> Result<(), HookError> {
+    debug!(model = %model, hook = %hook_name, "Running hook");
 
-    let output = Command::new(path)
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(script)
         .env("LLMUX_MODEL", model)
         .output()
         .await

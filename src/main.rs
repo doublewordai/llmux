@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 #[command(about = "Hook-driven LLM model multiplexer")]
 struct Args {
     /// Path to configuration file
-    #[arg(short, long, default_value = "config.json")]
+    #[arg(short, long, default_value = "config.yaml")]
     config: PathBuf,
 
     /// Port to listen on (overrides config)

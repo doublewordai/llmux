@@ -2,13 +2,13 @@
 //!
 //! All model lifecycle management is delegated to user-provided scripts.
 //! llmux only handles request routing, draining, and policy decisions.
-//! TODO: switch to yaml for better readability and support for multiline strings (for inline
-//! scripts).
+//!
+//! Supports both YAML and JSON config files (detected by extension).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 /// Top-level configuration
@@ -29,41 +29,43 @@ pub struct Config {
 /// Configuration for a single model.
 ///
 /// Each model is defined by a target port (where the inference server listens)
-/// and three lifecycle scripts: wake, sleep, alive.
+/// and three lifecycle hooks. Hooks can be either a path to an executable script
+/// or an inline shell script:
 ///
-/// ```json
-/// {
-///   "port": 8001,
-///   "wake": "./scripts/wake.sh",
-///   "sleep": "./scripts/sleep.sh",
-///   "alive": "./scripts/alive.sh"
-/// }
+/// ```yaml
+/// models:
+///   llama:
+///     port: 8001
+///     wake: ./scripts/wake-llama.sh
+///     sleep: |
+///       kill $(cat /tmp/llama.pid)
+///       rm /tmp/llama.pid
+///     alive: curl -sf http://localhost:8001/health
 /// ```
+///
+/// All hooks are executed via `sh -c` with LLMUX_MODEL set in the environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Port where the model's inference server listens
     pub port: u16,
 
     /// Script to bring the model to a running state (idempotent).
+    /// Can be a path to an executable or an inline shell script.
     /// Called with LLMUX_MODEL env var set to the model name.
     /// Must exit 0 when the model is ready to serve requests.
-    /// TODO: allow inline scripts here: switch config to yaml and use gha style multiline strings
-    /// for convenience.
-    pub wake: PathBuf,
+    pub wake: String,
 
     /// Script to put the model to sleep / free resources.
+    /// Can be a path to an executable or an inline shell script.
     /// Called with LLMUX_MODEL env var set to the model name.
     /// Must exit 0 when the model is fully stopped/sleeping.
-    /// TODO: allow inline scripts here: switch config to yaml and use gha style multiline strings
-    /// for convenience.
-    pub sleep: PathBuf,
+    pub sleep: String,
 
     /// Script to check if the model is alive and healthy.
+    /// Can be a path to an executable or an inline shell script.
     /// Called with LLMUX_MODEL env var set to the model name.
     /// Exit 0 = healthy, non-zero = unhealthy.
-    /// TODO: allow inline scripts here: switch config to yaml and use gha style multiline strings
-    /// for convenience.
-    pub alive: PathBuf,
+    pub alive: String,
 }
 
 fn default_port() -> u16 {
@@ -71,14 +73,23 @@ fn default_port() -> u16 {
 }
 
 impl Config {
-    /// Load configuration from a JSON file
+    /// Load configuration from a YAML or JSON file (detected by extension).
     pub async fn from_file(path: &Path) -> Result<Self> {
         let contents = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        serde_json::from_str(&contents)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        match ext {
+            "yaml" | "yml" => serde_yaml::from_str(&contents)
+                .with_context(|| format!("Failed to parse YAML config: {}", path.display())),
+            _ => serde_json::from_str(&contents)
+                .with_context(|| format!("Failed to parse JSON config: {}", path.display())),
+        }
     }
 }
 
@@ -128,7 +139,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_config() {
+    fn test_parse_json() {
         let json = r#"{
             "models": {
                 "llama": {
@@ -154,6 +165,31 @@ mod tests {
         assert_eq!(config.models.len(), 2);
         assert_eq!(config.models["llama"].port, 8001);
         assert_eq!(config.policy.request_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn test_parse_yaml() {
+        let yaml = r#"
+models:
+  llama:
+    port: 8001
+    wake: ./scripts/wake-llama.sh
+    sleep: |
+      kill $(cat /tmp/llama.pid)
+      rm /tmp/llama.pid
+    alive: curl -sf http://localhost:8001/health
+policy:
+  request_timeout_secs: 60
+port: 4000
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(config.models["llama"].port, 8001);
+        assert_eq!(config.models["llama"].wake, "./scripts/wake-llama.sh");
+        assert!(config.models["llama"].sleep.contains("kill"));
+        assert_eq!(config.policy.request_timeout_secs, Some(60));
+        assert_eq!(config.port, 4000);
     }
 
     #[test]

@@ -12,7 +12,6 @@ use llmux::{Config, ModelConfig, PolicyConfig};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,51 +20,19 @@ use tower::ServiceExt;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Create a temp directory with executable hook scripts.
-/// wake/sleep scripts sleep for `wake_ms`/`sleep_ms` then exit 0.
-/// alive script always exits 0.
+/// Inline hook scripts for testing. Hooks are executed via `sh -c`.
 struct MockHooks {
-    #[allow(dead_code)] // TempDir must be held to keep the directory alive
-    dir: tempfile::TempDir,
-    wake_path: PathBuf,
-    sleep_path: PathBuf,
-    alive_path: PathBuf,
+    wake: String,
+    sleep: String,
+    alive: String,
 }
 
 impl MockHooks {
     fn new(wake_ms: u64, sleep_ms: u64) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-
-        let wake_path = dir.path().join("wake.sh");
-        let sleep_path = dir.path().join("sleep.sh");
-        let alive_path = dir.path().join("alive.sh");
-
-        std::fs::write(
-            &wake_path,
-            format!("#!/bin/sh\nsleep {}\n", wake_ms as f64 / 1000.0),
-        )
-        .unwrap();
-        std::fs::write(
-            &sleep_path,
-            format!("#!/bin/sh\nsleep {}\n", sleep_ms as f64 / 1000.0),
-        )
-        .unwrap();
-        std::fs::write(&alive_path, "#!/bin/sh\nexit 0\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(&wake_path, perms.clone()).unwrap();
-            std::fs::set_permissions(&sleep_path, perms.clone()).unwrap();
-            std::fs::set_permissions(&alive_path, perms).unwrap();
-        }
-
         Self {
-            dir,
-            wake_path,
-            sleep_path,
-            alive_path,
+            wake: format!("sleep {}", wake_ms as f64 / 1000.0),
+            sleep: format!("sleep {}", sleep_ms as f64 / 1000.0),
+            alive: "true".to_string(),
         }
     }
 }
@@ -117,18 +84,18 @@ fn test_config(
         "model-a".to_string(),
         ModelConfig {
             port: model_a_port,
-            wake: hooks_a.wake_path.clone(),
-            sleep: hooks_a.sleep_path.clone(),
-            alive: hooks_a.alive_path.clone(),
+            wake: hooks_a.wake.clone(),
+            sleep: hooks_a.sleep.clone(),
+            alive: hooks_a.alive.clone(),
         },
     );
     models.insert(
         "model-b".to_string(),
         ModelConfig {
             port: model_b_port,
-            wake: hooks_b.wake_path.clone(),
-            sleep: hooks_b.sleep_path.clone(),
-            alive: hooks_b.alive_path.clone(),
+            wake: hooks_b.wake.clone(),
+            sleep: hooks_b.sleep.clone(),
+            alive: hooks_b.alive.clone(),
         },
     );
 
