@@ -2,6 +2,8 @@
 //!
 //! All model lifecycle management is delegated to user-provided scripts.
 //! llmux only handles request routing, draining, and policy decisions.
+//! TODO: switch to yaml for better readability and support for multiline strings (for inline
+//! scripts).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,16 +47,22 @@ pub struct ModelConfig {
     /// Script to bring the model to a running state (idempotent).
     /// Called with LLMUX_MODEL env var set to the model name.
     /// Must exit 0 when the model is ready to serve requests.
+    /// TODO: allow inline scripts here: switch config to yaml and use gha style multiline strings
+    /// for convenience.
     pub wake: PathBuf,
 
     /// Script to put the model to sleep / free resources.
     /// Called with LLMUX_MODEL env var set to the model name.
     /// Must exit 0 when the model is fully stopped/sleeping.
+    /// TODO: allow inline scripts here: switch config to yaml and use gha style multiline strings
+    /// for convenience.
     pub sleep: PathBuf,
 
     /// Script to check if the model is alive and healthy.
     /// Called with LLMUX_MODEL env var set to the model name.
     /// Exit 0 = healthy, non-zero = unhealthy.
+    /// TODO: allow inline scripts here: switch config to yaml and use gha style multiline strings
+    /// for convenience.
     pub alive: PathBuf,
 }
 
@@ -78,6 +86,8 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
     /// Request timeout in seconds
+    /// TODO: default to unlimited (None) and let the user set it explicitly if they want a
+    /// timeout.
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
 
@@ -87,6 +97,8 @@ pub struct PolicyConfig {
 
     /// Minimum seconds a model must stay active before it can be put to sleep.
     /// Prevents rapid wake/sleep thrashing.
+    /// TODO: Default to 0 (no minimum) and let the user set it if they want a minimum active
+    /// duration.
     #[serde(default = "default_min_active_secs")]
     pub min_active_secs: u64,
 }

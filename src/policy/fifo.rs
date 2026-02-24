@@ -7,8 +7,11 @@ use std::time::Duration;
 /// No background scheduler needed: every request spawns its own switch attempt
 /// via `maybe_trigger_switch`, and the switch lock serializes them.
 pub struct FifoPolicy {
+    // TODO: Is this the concern of the policy
     request_timeout: Duration,
+    // TODO: is this the concern of the policy?
     drain_before_switch: bool,
+    // TODO: is this the concern of the policy?
     min_active_duration: Duration,
 }
 

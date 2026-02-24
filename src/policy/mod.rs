@@ -32,6 +32,7 @@ pub struct PolicyContext {
     pub active_in_flight: usize,
     /// How long the active model has been active (since last wake completed)
     pub active_duration: Duration,
+    // TODO: How do we plugin cost estimation of switching?
 }
 
 /// Context provided to the background scheduler on each tick
