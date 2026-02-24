@@ -1,0 +1,63 @@
+models:
+  facebook/opt-125m:
+    port: 8001
+    wake: |
+      CONTAINER=llmux-opt-125m
+      # Already running? Nothing to do
+      if sudo podman inspect "$CONTAINER" --format '{{.State.Status}}' 2>/dev/null | grep -q running; then
+        exit 0
+      fi
+      # Try restore from checkpoint
+      if sudo podman container restore --tcp-established "$CONTAINER" 2>/dev/null; then
+        for i in $(seq 1 10); do
+          curl -sf http://localhost:8001/health && exit 0
+          sleep 1
+        done
+        exit 1
+      fi
+      # Cold start (first boot or restore failed)
+      sudo podman rm -f "$CONTAINER" 2>/dev/null
+      sudo podman run -d --name "$CONTAINER" \
+        --privileged --device nvidia.com/gpu=1 \
+        -p 8001:8000 \
+        -v ~/.cache/huggingface:/root/.cache/huggingface \
+        docker.io/vllm/vllm-openai:v0.8.3 \
+        --model facebook/opt-125m --max-model-len 512
+      for i in $(seq 1 120); do
+        curl -sf http://localhost:8001/health && exit 0
+        sleep 1
+      done
+      exit 1
+    sleep: sudo podman container checkpoint --tcp-established llmux-opt-125m
+    alive: curl -sf http://localhost:8001/health
+
+  Qwen/Qwen2.5-3B-Instruct:
+    port: 8002
+    wake: |
+      CONTAINER=llmux-qwen-3b
+      if sudo podman inspect "$CONTAINER" --format '{{.State.Status}}' 2>/dev/null | grep -q running; then
+        exit 0
+      fi
+      if sudo podman container restore --tcp-established "$CONTAINER" 2>/dev/null; then
+        for i in $(seq 1 10); do
+          curl -sf http://localhost:8002/health && exit 0
+          sleep 1
+        done
+        exit 1
+      fi
+      sudo podman rm -f "$CONTAINER" 2>/dev/null
+      sudo podman run -d --name "$CONTAINER" \
+        --privileged --device nvidia.com/gpu=2 \
+        -p 8002:8000 \
+        -v ~/.cache/huggingface:/root/.cache/huggingface \
+        docker.io/vllm/vllm-openai:v0.8.3 \
+        --model Qwen/Qwen2.5-3B-Instruct --max-model-len 512
+      for i in $(seq 1 120); do
+        curl -sf http://localhost:8002/health && exit 0
+        sleep 1
+      done
+      exit 1
+    sleep: sudo podman container checkpoint --tcp-established llmux-qwen-3b
+    alive: curl -sf http://localhost:8002/health
+
+port: 3000
