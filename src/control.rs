@@ -1,4 +1,4 @@
-//! Control API for manual model management.
+//! Control API for model management.
 //!
 //! Provides HTTP endpoints for inspecting and controlling the model switcher.
 //! Intended to run on a separate admin port.
@@ -7,17 +7,14 @@
 //!
 //! | Method | Path                  | Description                              |
 //! |--------|-----------------------|------------------------------------------|
-//! | GET    | `/control/status`     | Current state, mode, in-flight, queues   |
-//! | POST   | `/control/mode`       | Set switch mode (auto/manual)            |
-//! | POST   | `/control/pin`        | Pin a model (enters manual mode + switch)|
-//! | POST   | `/control/unpin`      | Unpin and return to auto mode            |
+//! | GET    | `/control/status`     | Current state, in-flight, queues         |
 //! | POST   | `/control/switch`     | Force switch to a model                  |
 //! | POST   | `/control/sleep`      | Run sleep hook for a model               |
 //! | POST   | `/control/wake`       | Run wake hook for a model                |
 //! | GET    | `/control/alive`      | Run alive hook for a model               |
 
 use crate::switcher::ModelSwitcher;
-use crate::types::{SwitchMode, SwitcherState};
+use crate::types::SwitcherState;
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -31,9 +28,6 @@ use std::collections::HashMap;
 pub fn control_router(switcher: ModelSwitcher) -> Router {
     Router::new()
         .route("/control/status", get(get_status))
-        .route("/control/mode", post(set_mode))
-        .route("/control/pin", post(pin_model))
-        .route("/control/unpin", post(unpin_model))
         .route("/control/switch", post(force_switch))
         .route("/control/sleep", post(sleep_model))
         .route("/control/wake", post(wake_model))
@@ -49,7 +43,6 @@ pub fn control_router(switcher: ModelSwitcher) -> Router {
 struct StatusResponse {
     state: String,
     active_model: Option<String>,
-    mode: SwitchMode,
     models: HashMap<String, ModelStatus>,
 }
 
@@ -57,11 +50,6 @@ struct StatusResponse {
 struct ModelStatus {
     in_flight: usize,
     queue_depth: usize,
-}
-
-#[derive(Deserialize)]
-struct SetModeRequest {
-    mode: String,
 }
 
 #[derive(Deserialize)]
@@ -96,7 +84,6 @@ struct AliveResponse {
 
 async fn get_status(State(switcher): State<ModelSwitcher>) -> impl IntoResponse {
     let state = switcher.state().await;
-    let mode = switcher.mode().await;
     let queue_depths = switcher.queue_depths().await;
 
     let active_model = match &state {
@@ -129,86 +116,7 @@ async fn get_status(State(switcher): State<ModelSwitcher>) -> impl IntoResponse 
     Json(StatusResponse {
         state: state_str,
         active_model,
-        mode,
         models,
-    })
-}
-
-async fn set_mode(
-    State(switcher): State<ModelSwitcher>,
-    Json(body): Json<SetModeRequest>,
-) -> impl IntoResponse {
-    match body.mode.as_str() {
-        "auto" => {
-            switcher.set_mode(SwitchMode::Auto).await;
-            (
-                StatusCode::OK,
-                Json(MessageResponse {
-                    message: "Switched to auto mode".to_string(),
-                }),
-            )
-        }
-        "manual" => {
-            switcher.set_mode(SwitchMode::Manual { pinned: None }).await;
-            (
-                StatusCode::OK,
-                Json(MessageResponse {
-                    message: "Switched to manual mode".to_string(),
-                }),
-            )
-        }
-        other => (
-            StatusCode::BAD_REQUEST,
-            Json(MessageResponse {
-                message: format!("Unknown mode: {}. Use 'auto' or 'manual'.", other),
-            }),
-        ),
-    }
-}
-
-async fn pin_model(
-    State(switcher): State<ModelSwitcher>,
-    Json(body): Json<ModelRequest>,
-) -> Result<Json<MessageResponse>, (StatusCode, Json<ErrorResponse>)> {
-    if !switcher.is_registered(&body.model) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Model not found: {}", body.model),
-            }),
-        ));
-    }
-
-    let prev_mode = switcher.mode().await;
-
-    switcher
-        .set_mode(SwitchMode::Manual {
-            pinned: Some(body.model.clone()),
-        })
-        .await;
-
-    let active = switcher.active_model().await;
-    if active.as_deref() != Some(&body.model)
-        && let Err(e) = switcher.force_switch(&body.model).await
-    {
-        switcher.set_mode(prev_mode).await;
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("Failed to switch to pinned model: {}", e),
-            }),
-        ));
-    }
-
-    Ok(Json(MessageResponse {
-        message: format!("Pinned to model: {}", body.model),
-    }))
-}
-
-async fn unpin_model(State(switcher): State<ModelSwitcher>) -> impl IntoResponse {
-    switcher.set_mode(SwitchMode::Auto).await;
-    Json(MessageResponse {
-        message: "Unpinned. Switched to auto mode.".to_string(),
     })
 }
 
@@ -223,15 +131,6 @@ async fn force_switch(
                 error: format!("Model not found: {}", body.model),
             }),
         ));
-    }
-
-    let mode = switcher.mode().await;
-    if let SwitchMode::Manual { .. } = mode {
-        switcher
-            .set_mode(SwitchMode::Manual {
-                pinned: Some(body.model.clone()),
-            })
-            .await;
     }
 
     if let Err(e) = switcher.force_switch(&body.model).await {
@@ -388,68 +287,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["state"], "idle");
-        assert_eq!(json["mode"]["mode"], "auto");
         assert!(json["models"].is_object());
-    }
-
-    #[tokio::test]
-    async fn test_set_mode_auto() {
-        let switcher = make_test_switcher();
-        let app = control_router(switcher);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/control/mode")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"mode":"auto"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_set_mode_invalid() {
-        let switcher = make_test_switcher();
-        let app = control_router(switcher);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/control/mode")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"mode":"invalid"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_pin_unknown_model() {
-        let switcher = make_test_switcher();
-        let app = control_router(switcher);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/control/pin")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"model":"nonexistent"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

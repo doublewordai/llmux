@@ -192,15 +192,6 @@ fn switch_error_response(error: SwitchError) -> Response<Body> {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Internal error: {}", e),
         ),
-        SwitchError::ManualModeRejected {
-            requested, active, ..
-        } => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "Manual mode active: model {} not available (active: {})",
-                requested, active
-            ),
-        ),
     };
 
     error_response(status, &message)

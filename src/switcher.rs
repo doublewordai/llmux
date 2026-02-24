@@ -6,7 +6,7 @@
 
 use crate::hooks::HookRunner;
 use crate::policy::{PolicyContext, PolicyDecision, ScheduleContext, SwitchContext, SwitchPolicy};
-use crate::types::{SwitchError, SwitchMode, SwitcherState};
+use crate::types::{SwitchError, SwitcherState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,8 +54,6 @@ struct SwitcherInner {
     activated_at: RwLock<Option<Instant>>,
     /// When the last switch failure occurred (for backoff)
     last_switch_failure: RwLock<Option<Instant>>,
-    /// Current switch mode (auto or manual)
-    mode: RwLock<SwitchMode>,
 }
 
 /// The model switcher coordinates wake/sleep transitions.
@@ -88,7 +86,6 @@ impl ModelSwitcher {
                 switch_lock: Mutex::new(()),
                 activated_at: RwLock::new(None),
                 last_switch_failure: RwLock::new(None),
-                mode: RwLock::new(SwitchMode::Auto),
             }),
         }
     }
@@ -102,15 +99,6 @@ impl ModelSwitcher {
             SwitcherState::Active { model } => Some(model.clone()),
             _ => None,
         }
-    }
-
-    pub async fn mode(&self) -> SwitchMode {
-        self.inner.mode.read().await.clone()
-    }
-
-    pub async fn set_mode(&self, mode: SwitchMode) {
-        info!(mode = ?mode, "Switch mode changed");
-        *self.inner.mode.write().await = mode;
     }
 
     pub fn registered_models(&self) -> Vec<String> {
@@ -182,27 +170,6 @@ impl ModelSwitcher {
             {
                 trace!(model = %model, "Model already active");
                 return Ok(());
-            }
-        }
-
-        // Manual mode: reject requests for non-active models
-        {
-            let mode = self.inner.mode.read().await;
-            if let SwitchMode::Manual { ref pinned } = *mode {
-                let active = self.active_model().await;
-                let allowed = pinned.as_deref().or(active.as_deref());
-                if allowed != Some(model) {
-                    let active_name = allowed.unwrap_or("none").to_string();
-                    warn!(
-                        requested = %model,
-                        active = %active_name,
-                        "Manual mode: rejecting request for non-active model"
-                    );
-                    return Err(SwitchError::ManualModeRejected {
-                        requested: model.to_string(),
-                        active: active_name,
-                    });
-                }
             }
         }
 
@@ -278,9 +245,6 @@ impl ModelSwitcher {
 
             loop {
                 tick.tick().await;
-                if matches!(*self.inner.mode.read().await, SwitchMode::Manual { .. }) {
-                    continue;
-                }
                 let ctx = self.build_schedule_context().await;
                 if let Some(target) = self.inner.policy.schedule_tick(&ctx) {
                     debug!(target = %target, "Scheduler: triggering switch");
@@ -295,15 +259,6 @@ impl ModelSwitcher {
     // -----------------------------------------------------------------------
 
     async fn maybe_trigger_switch(&self, target_model: &str) {
-        // In manual mode, never auto-switch
-        {
-            let mode = self.inner.mode.read().await;
-            if matches!(*mode, SwitchMode::Manual { .. }) {
-                trace!(model = %target_model, "Manual mode: skipping auto-switch");
-                return;
-            }
-        }
-
         let model_state = match self.inner.model_states.get(target_model) {
             Some(s) => s,
             None => return,
@@ -370,11 +325,6 @@ impl ModelSwitcher {
                 let target = target_model.to_string();
                 tokio::spawn(async move {
                     future.await;
-                    let mode = switcher.mode().await;
-                    if matches!(mode, SwitchMode::Manual { .. }) {
-                        debug!(model = %target, "Manual mode: aborting deferred auto-switch");
-                        return;
-                    }
                     switcher.do_switch(&target).await;
                 });
             }
@@ -695,15 +645,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_default_mode_is_auto() {
-        let hooks = make_test_hooks();
-        let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(hooks, policy);
-
-        assert_eq!(switcher.mode().await, SwitchMode::Auto);
-    }
-
-    #[tokio::test]
     async fn test_model_port() {
         let hooks = make_test_hooks();
         let policy = Box::new(FifoPolicy::default());
@@ -712,35 +653,6 @@ mod tests {
         assert_eq!(switcher.model_port("model-a"), Some(8001));
         assert_eq!(switcher.model_port("model-b"), Some(8002));
         assert_eq!(switcher.model_port("model-c"), None);
-    }
-
-    #[tokio::test]
-    async fn test_manual_mode_rejects_non_active_model() {
-        let hooks = make_test_hooks();
-        let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(hooks, policy);
-
-        {
-            let mut state = switcher.inner.state.write().await;
-            *state = SwitcherState::Active {
-                model: "model-a".to_string(),
-            };
-        }
-
-        switcher
-            .set_mode(SwitchMode::Manual {
-                pinned: Some("model-a".to_string()),
-            })
-            .await;
-
-        let result = switcher.ensure_model_ready("model-a").await;
-        assert!(result.is_ok());
-
-        let result = switcher.ensure_model_ready("model-b").await;
-        assert!(matches!(
-            result,
-            Err(SwitchError::ManualModeRejected { .. })
-        ));
     }
 
     #[tokio::test]
@@ -770,29 +682,4 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_switch_mode_serde() {
-        let auto = SwitchMode::Auto;
-        let json = serde_json::to_string(&auto).unwrap();
-        assert_eq!(json, r#"{"mode":"auto"}"#);
-
-        let manual = SwitchMode::Manual {
-            pinned: Some("llama".to_string()),
-        };
-        let json = serde_json::to_string(&manual).unwrap();
-        assert!(json.contains(r#""mode":"manual""#));
-        assert!(json.contains(r#""pinned":"llama""#));
-
-        let parsed: SwitchMode = serde_json::from_str(r#"{"mode":"auto"}"#).unwrap();
-        assert_eq!(parsed, SwitchMode::Auto);
-
-        let parsed: SwitchMode =
-            serde_json::from_str(r#"{"mode":"manual","pinned":"test"}"#).unwrap();
-        assert_eq!(
-            parsed,
-            SwitchMode::Manual {
-                pinned: Some("test".to_string())
-            }
-        );
-    }
 }

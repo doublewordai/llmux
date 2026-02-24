@@ -17,22 +17,6 @@ pub enum SwitchError {
 
     #[error("internal error: {0}")]
     Internal(String),
-
-    #[error("manual mode: model {requested} not available (active: {active})")]
-    ManualModeRejected { requested: String, active: String },
-}
-
-/// Switch mode controls whether model switching is automatic or manual.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum SwitchMode {
-    /// Policy-driven automatic switching (default behavior)
-    Auto,
-    /// Manual mode: no auto-switching. Only the pinned model (if set) serves requests.
-    Manual {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pinned: Option<String>,
-    },
 }
 
 /// State of the model switcher

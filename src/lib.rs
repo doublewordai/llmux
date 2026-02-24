@@ -52,7 +52,7 @@ pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
 pub use policy::{FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy};
 pub use proxy::{ProxyState, proxy_handler};
 pub use switcher::{InFlightGuard, ModelSwitcher};
-pub use types::{SwitchError, SwitchMode, SwitcherState};
+pub use types::{SwitchError, SwitcherState};
 
 use anyhow::Result;
 use axum::Router;
