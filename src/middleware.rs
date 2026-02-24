@@ -80,7 +80,7 @@ where
                 }
             };
 
-            let model = extract_model(&parts.headers, &body_bytes);
+            let model = extract_model(&body_bytes);
 
             let Some(model) = model else {
                 // No model specified — pass through (health checks, etc.)
@@ -139,16 +139,8 @@ where
     }
 }
 
-/// Extract model name from request headers or JSON body.
-fn extract_model(headers: &axum::http::HeaderMap, body: &Bytes) -> Option<String> {
-    // Check model-override header first
-    if let Some(model) = headers.get("model-override")
-        && let Ok(model_str) = model.to_str()
-    {
-        return Some(model_str.to_string());
-    }
-
-    // Parse JSON body for "model" field
+/// Extract model name from the JSON request body.
+fn extract_model(body: &Bytes) -> Option<String> {
     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body)
         && let Some(model) = json.get("model").and_then(|v| v.as_str())
     {
@@ -230,42 +222,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_model_from_header() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("model-override", "llama".parse().unwrap());
-
-        let body = Bytes::from("{}");
-        let model = extract_model(&headers, &body);
-
-        assert_eq!(model, Some("llama".to_string()));
-    }
-
-    #[test]
     fn test_extract_model_from_body() {
-        let headers = axum::http::HeaderMap::new();
         let body = Bytes::from(r#"{"model": "mistral", "messages": []}"#);
-
-        let model = extract_model(&headers, &body);
-        assert_eq!(model, Some("mistral".to_string()));
-    }
-
-    #[test]
-    fn test_extract_model_header_precedence() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("model-override", "from-header".parse().unwrap());
-
-        let body = Bytes::from(r#"{"model": "from-body"}"#);
-        let model = extract_model(&headers, &body);
-
-        assert_eq!(model, Some("from-header".to_string()));
+        assert_eq!(extract_model(&body), Some("mistral".to_string()));
     }
 
     #[test]
     fn test_extract_model_none() {
-        let headers = axum::http::HeaderMap::new();
         let body = Bytes::from(r#"{"messages": []}"#);
-
-        let model = extract_model(&headers, &body);
-        assert_eq!(model, None);
+        assert_eq!(extract_model(&body), None);
     }
 }

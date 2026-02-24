@@ -350,36 +350,3 @@ async fn test_concurrent_different_models() {
     assert_eq!(total, 6);
 }
 
-/// model-override header takes precedence over body.
-#[tokio::test]
-async fn test_model_override_header() {
-    let hooks_a = MockHooks::new(0, 0);
-    let hooks_b = MockHooks::new(0, 0);
-
-    let (addr_a, counter_a) = spawn_mock_backend(0).await;
-    let (addr_b, counter_b) = spawn_mock_backend(0).await;
-
-    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
-    let (app, _) = llmux::build_app(config).await.unwrap();
-
-    // Body says model-a, header says model-b
-    let body = json!({
-        "model": "model-a",
-        "messages": [{"role": "user", "content": "hi"}]
-    });
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("Content-Type", "application/json")
-        .header("model-override", "model-b")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap();
-
-    let response = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // Header wins: model-b's backend got the request
-    assert_eq!(counter_a.load(Ordering::SeqCst), 0);
-    assert_eq!(counter_b.load(Ordering::SeqCst), 1);
-}
