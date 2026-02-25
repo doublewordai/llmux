@@ -44,3 +44,16 @@ YAML or JSON (detected by extension). Each model has a `port` and three hooks (`
 
 - `.github/workflows/ci.yaml` — fmt + clippy + test
 - `.github/workflows/release-plz.yaml` — crates.io publishing on push to main
+
+## Releasing
+
+Uses [release-plz](https://github.com/release-plz/release-plz). On every push to main, the `release` job publishes any unpublished version to crates.io and creates a GitHub release.
+
+To release a new version:
+
+1. Bump `version` in `Cargo.toml`
+2. Run `cargo check` to update `Cargo.lock`
+3. Commit **both** `Cargo.toml` and `Cargo.lock`
+4. Push to main — release-plz handles the rest
+
+Important: always commit `Cargo.lock` with version bumps. `cargo publish` fails on a dirty lockfile.
