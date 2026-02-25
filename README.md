@@ -156,25 +156,6 @@ use CRIU to checkpoint and restore vLLM containers, achieving ~3x faster
 model switches vs. cold start. See the [example README](examples/podman-criu/README.md)
 for setup instructions and timings.
 
-## Architecture
-
-The codebase is ~1,700 lines of Rust:
-
-| Module | What it does |
-|--------|-------------|
-| `main.rs` | CLI (clap), config loading, server startup |
-| `config.rs` | YAML/JSON config parsing |
-| `hooks.rs` | Executes wake/sleep/alive scripts via `sh -c` |
-| `switcher.rs` | State machine: Idle → Switching → Active. Drain, sleep, wake. |
-| `middleware.rs` | Tower layer: extract model, ensure ready, acquire in-flight guard |
-| `proxy.rs` | Reverse proxy to `localhost:<port>` |
-| `policy/` | Pluggable switch policy trait (currently FIFO) |
-
-The switch policy is a trait (`SwitchPolicy`) with rich context — queue depths,
-in-flight counts, timing — so future policies can make cost-aware or
-batching decisions. See [`docs/scheduling-problem.md`](docs/scheduling-problem.md)
-for the design space.
-
 ## License
 
 MIT
