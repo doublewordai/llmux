@@ -20,10 +20,16 @@ pub struct ProxyState {
     client: Client<HttpConnector, Body>,
 }
 
-impl ProxyState {
-    pub fn new() -> Self {
+impl Default for ProxyState {
+    fn default() -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
         Self { client }
+    }
+}
+
+impl ProxyState {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -31,10 +37,7 @@ impl ProxyState {
 ///
 /// Reads the [`ProxyTarget`] extension (set by the model switcher middleware)
 /// to determine which localhost port to forward to.
-pub async fn proxy_handler(
-    State(state): State<ProxyState>,
-    req: Request<Body>,
-) -> Response<Body> {
+pub async fn proxy_handler(State(state): State<ProxyState>, req: Request<Body>) -> Response<Body> {
     let target = req.extensions().get::<ProxyTarget>().copied();
 
     match target {
@@ -42,10 +45,7 @@ pub async fn proxy_handler(
             Ok(resp) => resp,
             Err(e) => {
                 error!(error = %e, "Proxy error");
-                error_response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("Backend error: {}", e),
-                )
+                error_response(StatusCode::BAD_GATEWAY, &format!("Backend error: {}", e))
             }
         },
         None => error_response(StatusCode::NOT_FOUND, "No model specified in request"),

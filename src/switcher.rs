@@ -685,5 +685,4 @@ mod tests {
         let result = switcher.force_switch("model-a").await;
         assert!(result.is_ok());
     }
-
 }

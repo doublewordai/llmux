@@ -12,8 +12,8 @@ use llmux::{Config, ModelConfig, PolicyConfig};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
@@ -46,7 +46,11 @@ async fn spawn_mock_backend(port: u16) -> (SocketAddr, Arc<AtomicUsize>) {
         "/v1/chat/completions",
         post(move |Json(body): Json<Value>| {
             let c = counter_clone.fetch_add(1, Ordering::SeqCst);
-            let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let model = body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             async move {
                 Json(json!({
                     "model": model,
@@ -127,7 +131,8 @@ async fn chat_request(app: &Router, model: &str) -> (StatusCode, Value) {
     let response = app.clone().oneshot(req).await.unwrap();
     let status = response.status();
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let json: Value = serde_json::from_slice(&body_bytes).unwrap_or(json!({"raw": String::from_utf8_lossy(&body_bytes).to_string()}));
+    let json: Value = serde_json::from_slice(&body_bytes)
+        .unwrap_or(json!({"raw": String::from_utf8_lossy(&body_bytes).to_string()}));
 
     (status, json)
 }
@@ -214,7 +219,12 @@ async fn test_unknown_model() {
 
     let (status, body) = chat_request(&app, "nonexistent").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body["error"]["message"].as_str().unwrap().contains("not found"));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not found")
+    );
 }
 
 /// Switch cost is real wall-clock time from the hook scripts.
@@ -234,7 +244,11 @@ async fn test_switch_timing() {
     let (status, _) = chat_request(&app, "model-a").await;
     let cold_start = t0.elapsed();
     assert_eq!(status, StatusCode::OK);
-    assert!(cold_start >= Duration::from_millis(80), "cold start took {:?}", cold_start);
+    assert!(
+        cold_start >= Duration::from_millis(80),
+        "cold start took {:?}",
+        cold_start
+    );
 
     // Second request: switch a→b (sleep a ~50ms + wake b ~100ms = ~150ms)
     let t1 = Instant::now();
@@ -264,9 +278,9 @@ async fn test_concurrent_same_model() {
     let mut handles = Vec::new();
     for _ in 0..10 {
         let app = app.clone();
-        handles.push(tokio::spawn(async move {
-            chat_request(&app, "model-a").await
-        }));
+        handles.push(tokio::spawn(
+            async move { chat_request(&app, "model-a").await },
+        ));
     }
 
     for handle in handles {
@@ -295,9 +309,7 @@ async fn test_concurrent_different_models() {
     for i in 0..6 {
         let app = app.clone();
         let model = if i % 2 == 0 { "model-a" } else { "model-b" };
-        handles.push(tokio::spawn(async move {
-            chat_request(&app, model).await
-        }));
+        handles.push(tokio::spawn(async move { chat_request(&app, model).await }));
     }
 
     let mut statuses = Vec::new();
@@ -316,4 +328,3 @@ async fn test_concurrent_different_models() {
     let total = counter_a.load(Ordering::SeqCst) + counter_b.load(Ordering::SeqCst);
     assert_eq!(total, 6);
 }
-

@@ -79,10 +79,7 @@ impl Config {
             .await
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         match ext {
             "yaml" | "yml" => serde_yaml::from_str(&contents)
