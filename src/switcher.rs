@@ -4,6 +4,7 @@
 //! counting, drains requests before switching, and delegates all lifecycle
 //! operations to the [`HookRunner`].
 
+use crate::cost::SwitchCostTracker;
 use crate::hooks::HookRunner;
 use crate::policy::{PolicyContext, PolicyDecision, ScheduleContext, SwitchContext, SwitchPolicy};
 use crate::types::{SwitchError, SwitcherState};
@@ -54,6 +55,8 @@ struct SwitcherInner {
     activated_at: RwLock<Option<Instant>>,
     /// When the last switch failure occurred (for backoff)
     last_switch_failure: RwLock<Option<Instant>>,
+    /// Empirical switch cost tracking (EMA of observed durations)
+    cost_tracker: SwitchCostTracker,
 }
 
 /// The model switcher coordinates wake/sleep transitions.
@@ -86,6 +89,7 @@ impl ModelSwitcher {
                 switch_lock: Mutex::new(()),
                 activated_at: RwLock::new(None),
                 last_switch_failure: RwLock::new(None),
+                cost_tracker: SwitchCostTracker::new(0.3),
             }),
         }
     }
@@ -123,6 +127,12 @@ impl ModelSwitcher {
             .get(model)
             .map(|s| s.in_flight.load(Ordering::SeqCst))
             .unwrap_or(0)
+    }
+
+    /// Estimated cost of switching between two models, based on observed durations.
+    /// `from` is `None` for cold starts from Idle.
+    pub fn estimated_switch_cost(&self, from: Option<&str>, to: &str) -> Option<Duration> {
+        self.inner.cost_tracker.estimate(from, to)
     }
 
     /// Force a switch to the given model, bypassing policy.
@@ -293,6 +303,11 @@ impl ModelSwitcher {
                 .map(|t| t.elapsed())
                 .unwrap_or(Duration::ZERO);
 
+            let estimated_switch_cost = self
+                .inner
+                .cost_tracker
+                .estimate(active_model.as_deref(), target_model);
+
             PolicyContext {
                 target_model: target_model.to_string(),
                 active_model,
@@ -300,6 +315,7 @@ impl ModelSwitcher {
                 oldest_waiting,
                 active_in_flight,
                 active_duration,
+                estimated_switch_cost,
             }
         };
 
@@ -466,6 +482,10 @@ impl ModelSwitcher {
                 *self.inner.activated_at.write().await = Some(Instant::now());
                 *self.inner.last_switch_failure.write().await = None;
 
+                self.inner
+                    .cost_tracker
+                    .record(from_model.as_deref(), target_model, total_dur);
+
                 let from_str = from_model.as_deref().unwrap_or("");
                 self.inner
                     .policy
@@ -513,11 +533,17 @@ impl ModelSwitcher {
 
         let queue_depths = self.queue_depths().await;
 
+        let switch_costs = self
+            .inner
+            .cost_tracker
+            .estimates_from(active_model.as_deref());
+
         ScheduleContext {
             active_model,
             active_duration,
             queue_depths,
             active_in_flight,
+            switch_costs,
         }
     }
 

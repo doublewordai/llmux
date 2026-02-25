@@ -38,6 +38,7 @@
 //! ```
 
 mod config;
+mod cost;
 mod hooks;
 mod middleware;
 pub mod policy;
@@ -46,6 +47,7 @@ mod switcher;
 pub(crate) mod types;
 
 pub use config::{Config, ModelConfig, PolicyConfig};
+pub use cost::SwitchCostTracker;
 pub use hooks::HookRunner;
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
 pub use policy::{FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy};
