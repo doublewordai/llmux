@@ -1,8 +1,10 @@
-//! Axum middleware layer for model switching
+//! Axum middleware layer for model switching.
 //!
-//! This layer intercepts requests, extracts the model name, ensures the model
-//! is ready, and then passes the request through to the inner service (onwards).
+//! Intercepts requests, extracts the model name, ensures the model is ready
+//! (triggering a switch if needed), acquires an in-flight guard, and wraps
+//! the response body so the guard is held until streaming completes.
 
+use crate::proxy::ProxyTarget;
 use crate::switcher::{InFlightGuard, ModelSwitcher};
 use crate::types::SwitchError;
 use axum::body::Body;
@@ -11,14 +13,12 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use http_body::Frame;
 use http_body_util::BodyExt;
-use metrics::{counter, histogram};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
 use tower::{Layer, Service};
 use tracing::{debug, error, trace, warn};
 
-/// Layer that adds model switching to a service
+/// Layer that adds model switching to a service.
 #[derive(Clone)]
 pub struct ModelSwitcherLayer {
     switcher: ModelSwitcher,
@@ -41,7 +41,7 @@ impl<S> Layer<S> for ModelSwitcherLayer {
     }
 }
 
-/// Service that wraps requests with model switching
+/// Service that wraps requests with model switching.
 #[derive(Clone)]
 pub struct ModelSwitcherService<S> {
     switcher: ModelSwitcher,
@@ -66,10 +66,9 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Extract the body to read the model
             let (parts, body) = req.into_parts();
 
-            // Collect body bytes
+            // Collect body bytes so we can inspect the model field
             let body_bytes = match body.collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(e) => {
@@ -81,11 +80,10 @@ where
                 }
             };
 
-            // Extract model name from body or header
-            let model = extract_model(&parts.headers, &body_bytes);
+            let model = extract_model(&body_bytes);
 
             let Some(model) = model else {
-                // No model specified - pass through (might be a non-model endpoint)
+                // No model specified — pass through (health checks, etc.)
                 trace!("No model in request, passing through");
                 let req = Request::from_parts(parts, Body::from(body_bytes));
                 return inner.call(req).await;
@@ -93,20 +91,18 @@ where
 
             debug!(model = %model, "Extracted model from request");
 
-            // Check if model is registered
             if !switcher.is_registered(&model) {
-                warn!(model = %model, "Model not registered with switcher, passing through");
-                // Model not in our switcher - pass through to onwards
-                // (might be handled by a different backend)
-                let req = Request::from_parts(parts, Body::from(body_bytes));
-                return inner.call(req).await;
+                warn!(model = %model, "Model not registered");
+                return Ok(error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Model not found: {}", model),
+                ));
             }
 
             // Ensure model is ready and acquire in-flight guard.
             // If the model starts draining between the ready check and the
-            // guard acquisition, loop back through ensure_model_ready so the
-            // request waits for the next switch instead of getting a 503.
-            let queue_start = Instant::now();
+            // guard acquisition, loop back so the request waits for the next
+            // switch instead of getting a 503.
             let guard = loop {
                 if let Err(e) = switcher.ensure_model_ready(&model).await {
                     error!(model = %model, error = %e, "Failed to ensure model ready");
@@ -121,21 +117,17 @@ where
                     }
                 }
             };
-            let queue_wait = queue_start.elapsed();
 
-            // Record request metrics
-            let waited = queue_wait > Duration::from_millis(1);
-            histogram!("llmux_request_queue_wait_seconds", "model" => model.clone())
-                .record(queue_wait.as_secs_f64());
-            counter!("llmux_requests_total", "model" => model.clone(), "waited" => if waited { "true" } else { "false" })
-                .increment(1);
+            // Set proxy target so the proxy handler knows where to forward
+            let port = switcher.model_port(&model).unwrap();
+            let mut parts = parts;
+            parts.extensions.insert(ProxyTarget { port });
 
-            // Reconstruct request with body
             let req = Request::from_parts(parts, Body::from(body_bytes));
 
             // Forward to inner service, then wrap the response body so the
             // in-flight guard is held until the full response (including
-            // streamed body) is consumed — not just until headers arrive.
+            // streamed body) is consumed.
             let response = inner.call(req).await?;
             let (resp_parts, body) = response.into_parts();
             let guarded = GuardedBody {
@@ -147,16 +139,8 @@ where
     }
 }
 
-/// Extract model name from request headers or JSON body
-fn extract_model(headers: &axum::http::HeaderMap, body: &Bytes) -> Option<String> {
-    // Check model-override header first
-    if let Some(model) = headers.get("model-override")
-        && let Ok(model_str) = model.to_str()
-    {
-        return Some(model_str.to_string());
-    }
-
-    // Parse JSON body for "model" field
+/// Extract model name from the JSON request body.
+fn extract_model(body: &Bytes) -> Option<String> {
     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body)
         && let Some(model) = json.get("model").and_then(|v| v.as_str())
     {
@@ -166,7 +150,6 @@ fn extract_model(headers: &axum::http::HeaderMap, body: &Bytes) -> Option<String
     None
 }
 
-/// Create an error response
 fn error_response(status: StatusCode, message: &str) -> Response<Body> {
     let body = serde_json::json!({
         "error": {
@@ -182,7 +165,6 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
         .unwrap()
 }
 
-/// Create error response from SwitchError
 fn switch_error_response(error: SwitchError) -> Response<Body> {
     let (status, message) = match &error {
         SwitchError::ModelNotFound(m) => (StatusCode::NOT_FOUND, format!("Model not found: {}", m)),
@@ -194,22 +176,13 @@ fn switch_error_response(error: SwitchError) -> Response<Body> {
             StatusCode::GATEWAY_TIMEOUT,
             "Request timed out waiting for model".to_string(),
         ),
-        SwitchError::Orchestrator(e) => (
+        SwitchError::HookFailed { model, detail } => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Orchestrator error: {}", e),
+            format!("Hook failed for {}: {}", model, detail),
         ),
         SwitchError::Internal(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Internal error: {}", e),
-        ),
-        SwitchError::ManualModeRejected {
-            requested, active, ..
-        } => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "Manual mode active: model {} not available (active: {})",
-                requested, active
-            ),
         ),
     };
 
@@ -217,9 +190,8 @@ fn switch_error_response(error: SwitchError) -> Response<Body> {
 }
 
 /// Response body wrapper that holds an [`InFlightGuard`] until the body is
-/// fully consumed. For streaming responses, this ensures the in-flight count
-/// stays accurate until vLLM finishes generating — not just until the response
-/// headers arrive.
+/// fully consumed. For streaming responses (SSE), this ensures the in-flight
+/// count stays accurate until the backend finishes generating.
 struct GuardedBody {
     inner: Body,
     _guard: Option<InFlightGuard>,
@@ -250,43 +222,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_model_from_header() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("model-override", "llama".parse().unwrap());
-
-        let body = Bytes::from("{}");
-        let model = extract_model(&headers, &body);
-
-        assert_eq!(model, Some("llama".to_string()));
-    }
-
-    #[test]
     fn test_extract_model_from_body() {
-        let headers = axum::http::HeaderMap::new();
         let body = Bytes::from(r#"{"model": "mistral", "messages": []}"#);
-
-        let model = extract_model(&headers, &body);
-        assert_eq!(model, Some("mistral".to_string()));
-    }
-
-    #[test]
-    fn test_extract_model_header_precedence() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("model-override", "from-header".parse().unwrap());
-
-        let body = Bytes::from(r#"{"model": "from-body"}"#);
-        let model = extract_model(&headers, &body);
-
-        // Header takes precedence
-        assert_eq!(model, Some("from-header".to_string()));
+        assert_eq!(extract_model(&body), Some("mistral".to_string()));
     }
 
     #[test]
     fn test_extract_model_none() {
-        let headers = axum::http::HeaderMap::new();
         let body = Bytes::from(r#"{"messages": []}"#);
-
-        let model = extract_model(&headers, &body);
-        assert_eq!(model, None);
+        assert_eq!(extract_model(&body), None);
     }
 }

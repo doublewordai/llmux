@@ -1,25 +1,24 @@
 use super::{PolicyContext, PolicyDecision, SwitchContext, SwitchPolicy};
-use crate::types::EvictionPolicy;
 use async_trait::async_trait;
 use std::time::Duration;
 
-/// FIFO policy - switch immediately on first request
+/// FIFO policy — switch immediately on first request for a non-active model.
+///
+/// No background scheduler needed: every request spawns its own switch attempt
+/// via `maybe_trigger_switch`, and the switch lock serializes them.
 pub struct FifoPolicy {
-    eviction: EvictionPolicy,
-    request_timeout: Duration,
+    request_timeout: Option<Duration>,
     drain_before_switch: bool,
     min_active_duration: Duration,
 }
 
 impl FifoPolicy {
     pub fn new(
-        eviction: EvictionPolicy,
-        request_timeout: Duration,
+        request_timeout: Option<Duration>,
         drain_before_switch: bool,
         min_active_duration: Duration,
     ) -> Self {
         Self {
-            eviction,
             request_timeout,
             drain_before_switch,
             min_active_duration,
@@ -29,12 +28,7 @@ impl FifoPolicy {
 
 impl Default for FifoPolicy {
     fn default() -> Self {
-        Self::new(
-            EvictionPolicy::from(1),
-            Duration::from_secs(300),
-            true,
-            Duration::from_secs(5),
-        )
+        Self::new(None, true, Duration::ZERO)
     }
 }
 
@@ -50,11 +44,7 @@ impl SwitchPolicy for FifoPolicy {
         }
     }
 
-    fn eviction_policy(&self) -> EvictionPolicy {
-        self.eviction
-    }
-
-    fn request_timeout(&self) -> Duration {
+    fn request_timeout(&self) -> Option<Duration> {
         self.request_timeout
     }
 

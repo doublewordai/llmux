@@ -1,12 +1,14 @@
-//! Configuration for llmux
+//! Configuration for llmux v2.
+//!
+//! All model lifecycle management is delegated to user-provided scripts.
+//! llmux only handles request routing, draining, and policy decisions.
+//!
+//! Supports both YAML and JSON config files (detected by extension).
 
-use crate::policy::{FifoPolicy, SwitchPolicy};
-use crate::types::EvictionPolicy;
 use anyhow::{Context, Result};
-use onwards::target::Targets;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 /// Top-level configuration
@@ -22,379 +24,107 @@ pub struct Config {
     /// Proxy port
     #[serde(default = "default_port")]
     pub port: u16,
-
-    /// Metrics port (0 to disable)
-    #[serde(default = "default_metrics_port")]
-    pub metrics_port: u16,
-
-    /// Admin/control API port (None to disable)
-    #[serde(default)]
-    pub admin_port: Option<u16>,
-
-    /// Command to use for spawning vLLM processes (default: "vllm")
-    /// Can be overridden for testing with mock-vllm
-    #[serde(default = "default_vllm_command")]
-    pub vllm_command: String,
-
-    /// CRIU/CUDA checkpoint configuration.
-    /// Required when any model uses CudaSuspend or Checkpoint process strategy.
-    #[serde(default)]
-    pub checkpoint: Option<CheckpointConfig>,
-
-    /// Maximum time (in seconds) to wait for a vLLM process to start up
-    /// and become healthy. Separates "how long a client waits"
-    /// (`request_timeout_secs`) from "how long a cold start is allowed to
-    /// take". Default: 1800 (30 minutes, for large MoE models with
-    /// DeepGEMM warmup).
-    #[serde(default = "default_startup_timeout")]
-    pub startup_timeout_secs: u64,
-
-    /// Whether to warm up all models before accepting traffic.
-    ///
-    /// When enabled, the daemon sequentially starts each model, runs a warmup
-    /// inference, then sleeps it using the model's configured eviction policy.
-    /// After warmup, every model is in its warm sleeping state, so the first
-    /// real request triggers a fast wake rather than a cold start.
-    #[serde(default)]
-    pub warmup: bool,
 }
 
-/// Configuration for CUDA/CRIU-based checkpointing.
+/// Configuration for a single model.
 ///
-/// Required when any model uses `ProcessStrategy::CudaSuspend` or
-/// `ProcessStrategy::Checkpoint`. Provides paths to `cuda-checkpoint` and
-/// `criu` binaries, and the CUDA plugin directory.
+/// Each model is defined by a target port (where the inference server listens)
+/// and three lifecycle hooks. Hooks can be either a path to an executable script
+/// or an inline shell script:
+///
+/// ```yaml
+/// models:
+///   llama:
+///     port: 8001
+///     wake: ./scripts/wake-llama.sh
+///     sleep: |
+///       kill $(cat /tmp/llama.pid)
+///       rm /tmp/llama.pid
+///     alive: curl -sf http://localhost:8001/health
+/// ```
+///
+/// All hooks are executed via `sh -c` with LLMUX_MODEL set in the environment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointConfig {
-    /// Path to the criu binary (default: "criu" on PATH)
-    #[serde(default = "default_criu_path")]
-    pub criu_path: String,
+pub struct ModelConfig {
+    /// Port where the model's inference server listens
+    pub port: u16,
 
-    /// Directory containing the CUDA checkpoint plugin (libcuda_plugin.so)
-    #[serde(default = "default_cuda_plugin_dir")]
-    pub cuda_plugin_dir: String,
+    /// Script to bring the model to a running state (idempotent).
+    /// Can be a path to an executable or an inline shell script.
+    /// Called with LLMUX_MODEL env var set to the model name.
+    /// Must exit 0 when the model is ready to serve requests.
+    pub wake: String,
 
-    /// Base directory for checkpoint images (per-model subdirectories are created)
-    #[serde(default = "default_images_dir")]
-    pub images_dir: PathBuf,
+    /// Script to put the model to sleep / free resources.
+    /// Can be a path to an executable or an inline shell script.
+    /// Called with LLMUX_MODEL env var set to the model name.
+    /// Must exit 0 when the model is fully stopped/sleeping.
+    pub sleep: String,
 
-    /// Path to cuda-checkpoint binary (default: "cuda-checkpoint" on PATH)
-    #[serde(default = "default_cuda_checkpoint_path")]
-    pub cuda_checkpoint_path: String,
-
-    /// Keep checkpoint images on disk after restore (default: true).
-    /// When true, images are preserved so the same checkpoint can be
-    /// restored multiple times without re-checkpointing.
-    #[serde(default = "default_keep_images")]
-    pub keep_images: bool,
-
-    /// Optional S3-compatible object store for checkpoint persistence.
-    /// When configured, checkpoints are uploaded after creation and
-    /// downloaded on demand before restore.
-    #[serde(default)]
-    pub object_store: Option<ObjectStoreConfig>,
-}
-
-/// S3-compatible object store configuration for checkpoint persistence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjectStoreConfig {
-    /// S3-compatible endpoint URL (e.g. "http://localhost:9200")
-    pub endpoint: String,
-    /// Bucket name
-    pub bucket: String,
-    /// Access key (AWS_ACCESS_KEY_ID equivalent)
-    pub access_key: String,
-    /// Secret key (AWS_SECRET_ACCESS_KEY equivalent)
-    pub secret_key: String,
-    /// Region (default: "us-east-1")
-    #[serde(default = "default_region")]
-    pub region: String,
-}
-
-fn default_startup_timeout() -> u64 {
-    1800
-}
-
-fn default_vllm_command() -> String {
-    "vllm".to_string()
-}
-
-fn default_criu_path() -> String {
-    "criu".to_string()
-}
-
-fn default_cuda_plugin_dir() -> String {
-    "/usr/lib/criu/".to_string()
-}
-
-fn default_images_dir() -> PathBuf {
-    PathBuf::from("/tmp/llmux-checkpoints")
-}
-
-fn default_cuda_checkpoint_path() -> String {
-    "cuda-checkpoint".to_string()
-}
-
-fn default_keep_images() -> bool {
-    true
-}
-
-fn default_region() -> String {
-    "us-east-1".to_string()
+    /// Script to check if the model is alive and healthy.
+    /// Can be a path to an executable or an inline shell script.
+    /// Called with LLMUX_MODEL env var set to the model name.
+    /// Exit 0 = healthy, non-zero = unhealthy.
+    pub alive: String,
 }
 
 fn default_port() -> u16 {
     3000
 }
 
-fn default_metrics_port() -> u16 {
-    9090
-}
-
 impl Config {
-    /// Load configuration from a JSON file
+    /// Load configuration from a YAML or JSON file (detected by extension).
     pub async fn from_file(path: &Path) -> Result<Self> {
         let contents = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        serde_json::from_str(&contents)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))
-    }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    /// Validate configuration, warning about common misconfigurations.
-    ///
-    /// Checks that models using CudaSuspend or Checkpoint process strategies
-    /// with tensor parallelism have the required vLLM flags.
-    pub fn validate(&self) {
-        use crate::types::ProcessStrategy;
-        use tracing::warn;
-
-        for (name, model) in &self.models {
-            if !model.eviction.needs_cuda_checkpoint() {
-                continue;
-            }
-
-            // Parse --tensor-parallel-size from extra_args
-            let tp = model.tensor_parallel_size();
-            if tp <= 1 {
-                continue;
-            }
-
-            let strategy_name = match model.eviction.process {
-                ProcessStrategy::CudaSuspend => "CudaSuspend",
-                ProcessStrategy::Checkpoint => "Checkpoint",
-                _ => continue,
-            };
-
-            if !model.extra_args.contains(&"--enforce-eager".to_string()) {
-                warn!(
-                    model = %name,
-                    "Model uses {} at TP={} but is missing --enforce-eager. \
-                     CUDA graphs hold stale NCCL handles and will crash on resume.",
-                    strategy_name, tp
-                );
-            }
-
-            if !model
-                .extra_args
-                .contains(&"--disable-custom-all-reduce".to_string())
-            {
-                warn!(
-                    model = %name,
-                    "Model uses {} at TP={} but is missing --disable-custom-all-reduce. \
-                     CustomAllReduce IPC buffers cannot survive cuda-checkpoint.",
-                    strategy_name, tp
-                );
-            }
+        match ext {
+            "yaml" | "yml" => serde_yaml::from_str(&contents)
+                .with_context(|| format!("Failed to parse YAML config: {}", path.display())),
+            _ => serde_json::from_str(&contents)
+                .with_context(|| format!("Failed to parse JSON config: {}", path.display())),
         }
-
-        // Validate checkpoint_path entries
-        let has_object_store = self
-            .checkpoint
-            .as_ref()
-            .and_then(|c| c.object_store.as_ref())
-            .is_some();
-
-        for (name, model) in &self.models {
-            if let Some(ref checkpoint_path) = model.checkpoint_path {
-                if !checkpoint_path.exists() && !has_object_store {
-                    tracing::error!(
-                        model = %name,
-                        path = %checkpoint_path.display(),
-                        "checkpoint_path does not exist. Remove it from config or \
-                         create the checkpoint with --checkpoint first."
-                    );
-                    std::process::exit(1);
-                } else if !checkpoint_path.exists() {
-                    tracing::info!(
-                        model = %name,
-                        path = %checkpoint_path.display(),
-                        "checkpoint_path does not exist locally; will download from object store on first request"
-                    );
-                }
-                if self.checkpoint.is_none() {
-                    tracing::error!(
-                        model = %name,
-                        "checkpoint_path is set but no top-level 'checkpoint' config section. \
-                         Add a 'checkpoint' section with criu_path, cuda_plugin_dir, etc."
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-
-    /// Build onwards Targets from model configs
-    pub fn build_onwards_targets(&self) -> Result<Targets> {
-        use dashmap::DashMap;
-        use onwards::load_balancer::ProviderPool;
-        use onwards::target::Target;
-        use std::sync::Arc;
-
-        let targets_map: DashMap<String, ProviderPool> = DashMap::new();
-
-        for (name, model_config) in &self.models {
-            let url = format!("http://localhost:{}", model_config.port)
-                .parse()
-                .with_context(|| format!("Invalid URL for model {}", name))?;
-
-            let target = Target {
-                url,
-                keys: None,
-                onwards_key: None,
-                onwards_model: Some(model_config.model_path.clone()),
-                limiter: None,
-                concurrency_limiter: None,
-                upstream_auth_header_name: None,
-                upstream_auth_header_prefix: None,
-                response_headers: None,
-                sanitize_response: false,
-            };
-
-            let pool = target.into_pool();
-            targets_map.insert(name.clone(), pool);
-        }
-
-        Ok(Targets {
-            targets: Arc::new(targets_map),
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-        })
-    }
-}
-
-/// Configuration for a single model.
-///
-/// ```json
-/// {
-///   "model_path": "...",
-///   "port": 8001,
-///   "eviction": { "weights": "discard", "process": "checkpoint" }
-/// }
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    /// Path to the model (HuggingFace model ID or local path)
-    pub model_path: String,
-
-    /// Port for this model's vLLM instance
-    pub port: u16,
-
-    /// Additional vLLM CLI arguments (e.g. `["--gpu-memory-utilization", "0.8"]`)
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-
-    /// Eviction policy: controls what happens to weights and to the process
-    /// when this model is put to sleep.
-    #[serde(default)]
-    pub eviction: EvictionPolicy,
-
-    /// Path to existing CRIU checkpoint images. When set, the daemon restores
-    /// from checkpoint on first request instead of cold-starting vLLM.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkpoint_path: Option<PathBuf>,
-}
-
-impl ModelConfig {
-    /// Parse tensor parallel size from extra_args (default: 1)
-    pub fn tensor_parallel_size(&self) -> usize {
-        self.extra_args
-            .windows(2)
-            .find(|w| w[0] == "--tensor-parallel-size")
-            .and_then(|w| w[1].parse().ok())
-            .unwrap_or(1)
-    }
-
-    /// Build vLLM command line arguments.
-    ///
-    /// Always includes `--enable-sleep-mode` for consistency across all
-    /// eviction strategies. The dev mode endpoints (sleep/wake/collective_rpc)
-    /// are available regardless.
-    pub fn vllm_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "serve".to_string(),
-            self.model_path.clone(),
-            "--port".to_string(),
-            self.port.to_string(),
-            "--enable-sleep-mode".to_string(),
-        ];
-
-        args.extend(self.extra_args.clone());
-        args
     }
 }
 
 /// Policy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
-    /// Request timeout in seconds
-    #[serde(default = "default_request_timeout")]
-    pub request_timeout_secs: u64,
+    /// Request timeout in seconds. None = unlimited (requests wait forever).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 
     /// Whether to drain in-flight requests before switching
     #[serde(default = "default_drain_before_switch")]
     pub drain_before_switch: bool,
 
-    /// Default eviction policy for models that don't specify one
-    #[serde(default)]
-    pub eviction: EvictionPolicy,
-
     /// Minimum seconds a model must stay active before it can be put to sleep.
-    /// Prevents rapid wake/sleep thrashing that can cause GPU page faults.
-    #[serde(default = "default_min_active_secs")]
+    /// Prevents rapid wake/sleep thrashing. Default: 0 (no minimum).
+    #[serde(default)]
     pub min_active_secs: u64,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            request_timeout_secs: default_request_timeout(),
+            request_timeout_secs: None,
             drain_before_switch: default_drain_before_switch(),
-            eviction: EvictionPolicy::default(),
-            min_active_secs: default_min_active_secs(),
+            min_active_secs: 0,
         }
     }
-}
-
-fn default_request_timeout() -> u64 {
-    300
 }
 
 fn default_drain_before_switch() -> bool {
     true
 }
 
-fn default_min_active_secs() -> u64 {
-    5
-}
-
 impl PolicyConfig {
-    /// Build a SwitchPolicy from this config.
-    pub fn build_policy(&self, _model_names: &[String]) -> Box<dyn SwitchPolicy> {
-        Box::new(FifoPolicy::new(
-            self.eviction,
-            Duration::from_secs(self.request_timeout_secs),
+    pub fn build_policy(&self) -> Box<dyn crate::policy::SwitchPolicy> {
+        Box::new(crate::policy::FifoPolicy::new(
+            self.request_timeout_secs.map(Duration::from_secs),
             self.drain_before_switch,
             Duration::from_secs(self.min_active_secs),
         ))
@@ -406,17 +136,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_config() {
+    fn test_parse_json() {
         let json = r#"{
             "models": {
                 "llama": {
-                    "model_path": "meta-llama/Llama-2-7b",
-                    "port": 8001
+                    "port": 8001,
+                    "wake": "./scripts/wake-llama.sh",
+                    "sleep": "./scripts/sleep-llama.sh",
+                    "alive": "./scripts/alive-llama.sh"
                 },
                 "mistral": {
-                    "model_path": "mistralai/Mistral-7B-v0.1",
                     "port": 8002,
-                    "extra_args": ["--gpu-memory-utilization", "0.8"]
+                    "wake": "./scripts/wake-mistral.sh",
+                    "sleep": "./scripts/sleep-mistral.sh",
+                    "alive": "./scripts/alive-mistral.sh"
                 }
             },
             "policy": {
@@ -428,86 +161,51 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.models.len(), 2);
         assert_eq!(config.models["llama"].port, 8001);
-        assert_eq!(config.models["mistral"].extra_args.len(), 2);
-        assert_eq!(config.policy.request_timeout_secs, 30);
+        assert_eq!(config.policy.request_timeout_secs, Some(30));
     }
 
     #[test]
-    fn test_vllm_args() {
-        let config = ModelConfig {
-            model_path: "meta-llama/Llama-2-7b".to_string(),
-            port: 8001,
-            extra_args: vec![
-                "--tensor-parallel-size".to_string(),
-                "2".to_string(),
-                "--max-model-len".to_string(),
-                "4096".to_string(),
-            ],
-            eviction: EvictionPolicy::from(1),
-            checkpoint_path: None,
-        };
+    fn test_parse_yaml() {
+        let yaml = r#"
+models:
+  llama:
+    port: 8001
+    wake: ./scripts/wake-llama.sh
+    sleep: |
+      kill $(cat /tmp/llama.pid)
+      rm /tmp/llama.pid
+    alive: curl -sf http://localhost:8001/health
+policy:
+  request_timeout_secs: 60
+port: 4000
+"#;
 
-        let args = config.vllm_args();
-        assert!(args.contains(&"--enable-sleep-mode".to_string()));
-        assert!(args.contains(&"--tensor-parallel-size".to_string()));
-        assert!(args.contains(&"2".to_string()));
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(config.models["llama"].port, 8001);
+        assert_eq!(config.models["llama"].wake, "./scripts/wake-llama.sh");
+        assert!(config.models["llama"].sleep.contains("kill"));
+        assert_eq!(config.policy.request_timeout_secs, Some(60));
+        assert_eq!(config.port, 4000);
     }
 
     #[test]
-    fn test_warmup_defaults_to_false() {
+    fn test_defaults() {
         let json = r#"{
             "models": {
                 "llama": {
-                    "model_path": "meta-llama/Llama-2-7b",
-                    "port": 8001
-                }
-            },
-            "port": 3000
-        }"#;
-
-        let config: Config = serde_json::from_str(json).unwrap();
-        assert!(!config.warmup);
-    }
-
-    #[test]
-    fn test_warmup_parses_when_set() {
-        let json = r#"{
-            "models": {
-                "llama": {
-                    "model_path": "meta-llama/Llama-2-7b",
-                    "port": 8001
-                }
-            },
-            "port": 3000,
-            "warmup": true
-        }"#;
-
-        let config: Config = serde_json::from_str(json).unwrap();
-        assert!(config.warmup);
-    }
-
-    #[test]
-    fn test_eviction_policy_deserialize() {
-        let json = r#"{
-            "models": {
-                "llama": {
-                    "model_path": "meta-llama/Llama-2-7b",
                     "port": 8001,
-                    "eviction": { "weights": "discard", "process": "checkpoint" }
+                    "wake": "./wake.sh",
+                    "sleep": "./sleep.sh",
+                    "alive": "./alive.sh"
                 }
-            },
-            "port": 3000
+            }
         }"#;
 
         let config: Config = serde_json::from_str(json).unwrap();
-        let model = &config.models["llama"];
-        assert_eq!(
-            model.eviction.weights,
-            crate::types::WeightStrategy::Discard
-        );
-        assert_eq!(
-            model.eviction.process,
-            crate::types::ProcessStrategy::Checkpoint
-        );
+        assert_eq!(config.port, 3000);
+        assert_eq!(config.policy.request_timeout_secs, None);
+        assert!(config.policy.drain_before_switch);
+        assert_eq!(config.policy.min_active_secs, 0);
     }
 }

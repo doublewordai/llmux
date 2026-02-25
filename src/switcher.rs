@@ -1,11 +1,12 @@
-//! Model Switcher - coordinates wake/sleep between models
+//! Model Switcher — coordinates wake/sleep transitions between models.
 //!
-//! The switcher tracks which model is active and coordinates transitions.
+//! The switcher tracks which model is active, manages in-flight request
+//! counting, drains requests before switching, and delegates all lifecycle
+//! operations to the [`HookRunner`].
 
-use crate::orchestrator::Orchestrator;
+use crate::hooks::HookRunner;
 use crate::policy::{PolicyContext, PolicyDecision, ScheduleContext, SwitchContext, SwitchPolicy};
-use crate::types::{EvictionPolicy, SwitchError, SwitchMode, SwitcherState};
-use metrics::{counter, gauge, histogram};
+use crate::types::{SwitchError, SwitcherState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,9 +14,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
-/// A pending request waiting for a model
+/// A pending request waiting for a model to become active
 struct PendingRequest {
-    #[allow(dead_code)] // Used for debugging/logging
+    #[allow(dead_code)]
     model: String,
     queued_at: Instant,
     ready_tx: oneshot::Sender<Result<(), SwitchError>>,
@@ -43,9 +44,8 @@ impl Default for ModelState {
     }
 }
 
-/// Inner state for the switcher
 struct SwitcherInner {
-    orchestrator: Arc<Orchestrator>,
+    hooks: Arc<HookRunner>,
     policy: Box<dyn SwitchPolicy>,
     state: RwLock<SwitcherState>,
     model_states: HashMap<String, Arc<ModelState>>,
@@ -54,11 +54,9 @@ struct SwitcherInner {
     activated_at: RwLock<Option<Instant>>,
     /// When the last switch failure occurred (for backoff)
     last_switch_failure: RwLock<Option<Instant>>,
-    /// Current switch mode (auto or manual)
-    mode: RwLock<SwitchMode>,
 }
 
-/// The model switcher coordinates wake/sleep transitions
+/// The model switcher coordinates wake/sleep transitions.
 pub struct ModelSwitcher {
     inner: Arc<SwitcherInner>,
 }
@@ -72,9 +70,8 @@ impl Clone for ModelSwitcher {
 }
 
 impl ModelSwitcher {
-    /// Create a new model switcher
-    pub fn new(orchestrator: Arc<Orchestrator>, policy: Box<dyn SwitchPolicy>) -> Self {
-        let model_states: HashMap<String, Arc<ModelState>> = orchestrator
+    pub fn new(hooks: Arc<HookRunner>, policy: Box<dyn SwitchPolicy>) -> Self {
+        let model_states: HashMap<String, Arc<ModelState>> = hooks
             .registered_models()
             .into_iter()
             .map(|model| (model, Arc::new(ModelState::default())))
@@ -82,24 +79,21 @@ impl ModelSwitcher {
 
         Self {
             inner: Arc::new(SwitcherInner {
-                orchestrator,
+                hooks,
                 policy,
                 state: RwLock::new(SwitcherState::Idle),
                 model_states,
                 switch_lock: Mutex::new(()),
                 activated_at: RwLock::new(None),
                 last_switch_failure: RwLock::new(None),
-                mode: RwLock::new(SwitchMode::Auto),
             }),
         }
     }
 
-    /// Get the current state
     pub async fn state(&self) -> SwitcherState {
         self.inner.state.read().await.clone()
     }
 
-    /// Get the currently active model
     pub async fn active_model(&self) -> Option<String> {
         match &*self.inner.state.read().await {
             SwitcherState::Active { model } => Some(model.clone()),
@@ -107,36 +101,31 @@ impl ModelSwitcher {
         }
     }
 
-    /// Get the current switch mode
-    pub async fn mode(&self) -> SwitchMode {
-        self.inner.mode.read().await.clone()
-    }
-
-    /// Set the switch mode
-    pub async fn set_mode(&self, mode: SwitchMode) {
-        info!(mode = ?mode, "Switch mode changed");
-        *self.inner.mode.write().await = mode;
-    }
-
-    /// Get the list of registered model names
     pub fn registered_models(&self) -> Vec<String> {
         self.inner.model_states.keys().cloned().collect()
     }
 
-    /// Get access to the orchestrator (for process state queries)
-    pub fn orchestrator(&self) -> &Arc<Orchestrator> {
-        &self.inner.orchestrator
+    pub fn hooks(&self) -> &Arc<HookRunner> {
+        &self.inner.hooks
     }
 
-    /// Get the policy's default eviction policy
-    pub fn policy_eviction(&self) -> EvictionPolicy {
-        self.inner.policy.eviction_policy()
+    pub fn is_registered(&self, model: &str) -> bool {
+        self.inner.model_states.contains_key(model)
+    }
+
+    pub fn model_port(&self, model: &str) -> Option<u16> {
+        self.inner.hooks.model_port(model)
+    }
+
+    pub fn in_flight_count(&self, model: &str) -> usize {
+        self.inner
+            .model_states
+            .get(model)
+            .map(|s| s.in_flight.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     /// Force a switch to the given model, bypassing policy.
-    ///
-    /// Reuses the full `do_switch` machinery (drain, sleep, wake) so all
-    /// safety guarantees still apply. Returns after the switch completes.
     pub async fn force_switch(&self, model: &str) -> Result<(), SwitchError> {
         if !self.is_registered(model) {
             return Err(SwitchError::ModelNotFound(model.to_string()));
@@ -154,7 +143,6 @@ impl ModelSwitcher {
 
         self.do_switch(model).await;
 
-        // Check if switch succeeded
         let state = self.inner.state.read().await;
         match &*state {
             SwitcherState::Active { model: active } if active == model => Ok(()),
@@ -162,27 +150,11 @@ impl ModelSwitcher {
         }
     }
 
-    /// Check if a model is registered
-    pub fn is_registered(&self, model: &str) -> bool {
-        self.inner.model_states.contains_key(model)
-    }
-
-    /// Get in-flight count for a model
-    pub fn in_flight_count(&self, model: &str) -> usize {
-        self.inner
-            .model_states
-            .get(model)
-            .map(|s| s.in_flight.load(Ordering::SeqCst))
-            .unwrap_or(0)
-    }
-
-    /// Ensure a model is ready for requests
+    /// Ensure a model is ready for requests.
     ///
-    /// This will:
-    /// 1. Return immediately if the model is already active
-    /// 2. In manual mode: reject if model doesn't match pinned/active model
-    /// 3. Queue the request and trigger a switch if needed
-    /// 4. Wait for the switch to complete (up to timeout)
+    /// Returns immediately if the model is already active. Otherwise queues
+    /// the request and triggers a switch if needed, waiting up to the policy
+    /// timeout for the switch to complete.
     pub async fn ensure_model_ready(&self, model: &str) -> Result<(), SwitchError> {
         let model_state = self
             .inner
@@ -201,27 +173,6 @@ impl ModelSwitcher {
             }
         }
 
-        // Manual mode: reject requests for non-active models
-        {
-            let mode = self.inner.mode.read().await;
-            if let SwitchMode::Manual { ref pinned } = *mode {
-                let active = self.active_model().await;
-                let allowed = pinned.as_deref().or(active.as_deref());
-                if allowed != Some(model) {
-                    let active_name = allowed.unwrap_or("none").to_string();
-                    warn!(
-                        requested = %model,
-                        active = %active_name,
-                        "Manual mode: rejecting request for non-active model"
-                    );
-                    return Err(SwitchError::ManualModeRejected {
-                        requested: model.to_string(),
-                        active: active_name,
-                    });
-                }
-            }
-        }
-
         // Queue the request
         let (ready_tx, ready_rx) = oneshot::channel();
         let pending = PendingRequest {
@@ -236,65 +187,88 @@ impl ModelSwitcher {
             debug!(model = %model, queue_depth = queue.len(), "Request queued");
         }
 
-        // Maybe trigger switch
         self.maybe_trigger_switch(model).await;
 
-        // Wait for ready
-        let timeout = self.inner.policy.request_timeout();
-        match tokio::time::timeout(timeout, ready_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(SwitchError::Internal("channel closed".to_string())),
-            Err(_) => {
-                warn!(model = %model, "Request timed out");
-                Err(SwitchError::Timeout)
-            }
+        match self.inner.policy.request_timeout() {
+            Some(timeout) => match tokio::time::timeout(timeout, ready_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(SwitchError::Internal("channel closed".to_string())),
+                Err(_) => {
+                    warn!(model = %model, "Request timed out");
+                    Err(SwitchError::Timeout)
+                }
+            },
+            None => match ready_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(SwitchError::Internal("channel closed".to_string())),
+            },
         }
     }
 
     /// Acquire an in-flight guard.
     ///
-    /// Returns `None` if the model is not registered **or** if the model is
-    /// currently draining (about to be put to sleep). Uses increment-then-check
-    /// to close the TOCTOU window between `notify_pending` and the drain in
-    /// `do_switch`.
+    /// Returns `None` if the model is not registered or if it is currently
+    /// draining. Uses increment-then-check to close the TOCTOU window.
     pub fn acquire_in_flight(&self, model: &str) -> Option<InFlightGuard> {
         let model_state = self.inner.model_states.get(model)?;
 
-        // Increment first so the drain sees our count if it checks concurrently.
-        let new_count = model_state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let _new_count = model_state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // If draining started, back out — the model is about to sleep.
         if model_state.draining.load(Ordering::SeqCst) {
             model_state.in_flight.fetch_sub(1, Ordering::SeqCst);
             model_state.in_flight_changed.notify_waiters();
             return None;
         }
 
-        gauge!("llmux_in_flight", "model" => model.to_owned()).set(new_count as f64);
-
         Some(InFlightGuard {
             model_state: Arc::clone(model_state),
-            model_name: model.to_owned(),
         })
     }
 
-    /// Check policy and maybe trigger switch
-    async fn maybe_trigger_switch(&self, target_model: &str) {
-        // In manual mode, never auto-switch
-        {
-            let mode = self.inner.mode.read().await;
-            if matches!(*mode, SwitchMode::Manual { .. }) {
-                trace!(model = %target_model, "Manual mode: skipping auto-switch");
-                return;
-            }
+    /// Get queue depths for every registered model.
+    pub async fn queue_depths(&self) -> HashMap<String, usize> {
+        let mut depths = HashMap::new();
+        for (model, state) in &self.inner.model_states {
+            let queue = state.pending.lock().await;
+            depths.insert(model.clone(), queue.len());
         }
+        depths
+    }
 
+    /// Spawn a background scheduler task if the policy requests one.
+    pub fn spawn_scheduler(self) -> Option<tokio::task::JoinHandle<()>> {
+        let interval = self.inner.policy.scheduler_interval()?;
+
+        info!(
+            interval_ms = interval.as_millis(),
+            "Spawning background scheduler"
+        );
+
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tick.tick().await;
+                let ctx = self.build_schedule_context().await;
+                if let Some(target) = self.inner.policy.schedule_tick(&ctx) {
+                    debug!(target = %target, "Scheduler: triggering switch");
+                    self.do_switch(&target).await;
+                }
+            }
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Private
+    // -----------------------------------------------------------------------
+
+    async fn maybe_trigger_switch(&self, target_model: &str) {
         let model_state = match self.inner.model_states.get(target_model) {
             Some(s) => s,
             None => return,
         };
 
-        // Build policy context
         let ctx = {
             let state = self.inner.state.read().await;
             let queue = model_state.pending.lock().await;
@@ -329,7 +303,7 @@ impl ModelSwitcher {
             }
         };
 
-        // Already switching?
+        // Already switching to this model?
         {
             let state = self.inner.state.read().await;
             if let SwitcherState::Switching { to, .. } = &*state
@@ -339,7 +313,6 @@ impl ModelSwitcher {
             }
         }
 
-        // Ask policy
         let decision = self.inner.policy.on_pending_request(&ctx).await;
 
         match decision {
@@ -357,28 +330,20 @@ impl ModelSwitcher {
                 let target = target_model.to_string();
                 tokio::spawn(async move {
                     future.await;
-                    // Re-check mode: operator may have switched to manual while
-                    // this deferred decision was waiting.
-                    let mode = switcher.mode().await;
-                    if matches!(mode, SwitchMode::Manual { .. }) {
-                        debug!(model = %target, "Manual mode: aborting deferred auto-switch");
-                        return;
-                    }
                     switcher.do_switch(&target).await;
                 });
             }
             PolicyDecision::Skip => {
-                trace!(model = %target_model, "Policy: skip (switch already arranged)");
+                trace!(model = %target_model, "Policy: skip");
             }
         }
     }
 
-    /// Perform the actual switch
     async fn do_switch(&self, target_model: &str) {
         let _guard = self.inner.switch_lock.lock().await;
         let switch_start = Instant::now();
 
-        // Backoff: if the last switch failed recently, wait before retrying
+        // Backoff after recent failure
         {
             let last_failure = self.inner.last_switch_failure.read().await;
             if let Some(failed_at) = *last_failure {
@@ -416,7 +381,7 @@ impl ModelSwitcher {
             }
         };
 
-        // Update state
+        // Update state to Switching
         {
             let mut state = self.inner.state.write().await;
             *state = SwitcherState::Switching {
@@ -425,14 +390,9 @@ impl ModelSwitcher {
             };
         }
 
-        let from_str = from_model.as_deref().unwrap_or("");
         info!(from = ?from_model, to = %target_model, "Starting model switch");
 
         // Phase 1: Cooldown — ensure the old model has been active long enough
-        // before sleeping. Requests can still flow to the old model during this
-        // wait, which minimises the window where requests are rejected by the
-        // draining flag below.
-        let cooldown_start = Instant::now();
         if from_model.is_some() {
             let min_active = self.inner.policy.min_active_duration();
             let activated_at = *self.inner.activated_at.read().await;
@@ -440,33 +400,19 @@ impl ModelSwitcher {
                 let elapsed = activated.elapsed();
                 if elapsed < min_active {
                     let remaining = min_active - elapsed;
-                    info!(
-                        remaining = ?remaining,
-                        "Waiting for cooldown before sleeping old model"
-                    );
+                    info!(remaining = ?remaining, "Waiting for cooldown");
                     tokio::time::sleep(remaining).await;
                 }
             }
         }
-        let cooldown_dur = cooldown_start.elapsed();
 
-        // Phase 2: Drain — set draining flag and wait for in-flight to complete.
-        let drain_start = Instant::now();
-
-        // Set draining flag *before* drain so that `acquire_in_flight` rejects
-        // new guards. This closes the TOCTOU race where `notify_pending` sends Ok
-        // but the middleware task hasn't acquired its guard yet — when the drain
-        // sees in_flight == 0 it would complete instantly, then those tasks would
-        // acquire guards and send requests to a sleeping model.
+        // Phase 2: Drain — set draining flag and wait for in-flight to complete
         if let Some(ref from) = from_model
             && let Some(from_state) = self.inner.model_states.get(from)
         {
             from_state.draining.store(true, Ordering::SeqCst);
         }
 
-        // Drain in-flight requests (policy decides whether to wait).
-        // Pass the model's own `in_flight_changed` Notify so the drain wakes
-        // when InFlightGuard::drop fires.
         if let Some(ref from) = from_model
             && let Some(from_state) = self.inner.model_states.get(from)
         {
@@ -482,131 +428,75 @@ impl ModelSwitcher {
 
             self.inner.policy.prepare_switch(&mut switch_ctx).await;
         }
-        let drain_dur = drain_start.elapsed();
 
-        // Phase 3: Sleep old model — use per-model eviction policy from config,
-        // falling back to the global policy default.
-        let sleep_start = Instant::now();
+        // Phase 3: Sleep old model via hook
         if let Some(ref from) = from_model {
-            let eviction = self
-                .inner
-                .orchestrator
-                .eviction_policy_for(from)
-                .unwrap_or_else(|| self.inner.policy.eviction_policy());
-            debug!(model = %from, eviction = ?eviction, "Sleeping model");
-            self.inner.orchestrator.force_sleep(from, eviction).await;
+            debug!(model = %from, "Running sleep hook");
+            if let Err(e) = self.inner.hooks.run_sleep(from).await {
+                error!(model = %from, error = %e, "Sleep hook failed");
+                // Continue anyway — wake script is idempotent and will
+                // handle whatever state the old model is in.
+            }
         }
 
-        // Clear draining flag now that sleep is complete
+        // Clear draining flag
         if let Some(ref from) = from_model
             && let Some(from_state) = self.inner.model_states.get(from)
         {
             from_state.draining.store(false, Ordering::SeqCst);
         }
-        let sleep_dur = sleep_start.elapsed();
 
-        // Phase 4: Wake new model
-        let wake_start = Instant::now();
-        debug!(model = %target_model, "Waking model");
-        match self.inner.orchestrator.wake_model(target_model).await {
+        // Phase 4: Wake new model via hook
+        debug!(model = %target_model, "Running wake hook");
+        match self.inner.hooks.run_wake(target_model).await {
             Ok(()) => {
-                // Wait for ready
-                let mut ready = false;
-                for attempt in 0..10 {
-                    if self.inner.orchestrator.is_ready(target_model).await {
-                        ready = true;
-                        break;
-                    }
-                    debug!(model = %target_model, attempt, "Waiting for model");
-                    tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+                let total_dur = switch_start.elapsed();
+                info!(
+                    model = %target_model,
+                    duration = ?total_dur,
+                    "Model is now active"
+                );
+
+                {
+                    let mut state = self.inner.state.write().await;
+                    *state = SwitcherState::Active {
+                        model: target_model.to_string(),
+                    };
                 }
+                *self.inner.activated_at.write().await = Some(Instant::now());
+                *self.inner.last_switch_failure.write().await = None;
 
-                let wake_dur = wake_start.elapsed();
+                let from_str = from_model.as_deref().unwrap_or("");
+                self.inner
+                    .policy
+                    .on_switch_complete(from_str, target_model, total_dur);
 
-                if ready {
-                    info!(model = %target_model, "Model is now active");
-                    {
-                        let mut state = self.inner.state.write().await;
-                        *state = SwitcherState::Active {
-                            model: target_model.to_string(),
-                        };
-                    }
-                    *self.inner.activated_at.write().await = Some(Instant::now());
-                    *self.inner.last_switch_failure.write().await = None;
-
-                    // Record switch metrics
-                    let total_dur = switch_start.elapsed();
-                    histogram!("llmux_switch_phase_seconds", "phase" => "cooldown", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(cooldown_dur.as_secs_f64());
-                    histogram!("llmux_switch_phase_seconds", "phase" => "drain", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(drain_dur.as_secs_f64());
-                    histogram!("llmux_switch_phase_seconds", "phase" => "sleep", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(sleep_dur.as_secs_f64());
-                    histogram!("llmux_switch_phase_seconds", "phase" => "wake", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(wake_dur.as_secs_f64());
-                    histogram!("llmux_switch_total_seconds", "from" => from_str.to_owned(), "to" => target_model.to_owned()).record(total_dur.as_secs_f64());
-                    counter!("llmux_switches_total", "from" => from_str.to_owned(), "to" => target_model.to_owned()).increment(1);
-
-                    // Notify policy of empirical switch timing
-                    self.inner
-                        .policy
-                        .on_switch_complete(from_str, target_model, total_dur);
-
-                    // Update active model gauge
-                    if let Some(ref from) = from_model {
-                        gauge!("llmux_active_model_info", "model" => from.clone()).set(0.0);
-                    }
-                    gauge!("llmux_active_model_info", "model" => target_model.to_owned()).set(1.0);
-
-                    self.notify_pending(target_model, Ok(())).await;
-                } else {
-                    error!(model = %target_model, "Model failed to become ready");
-                    // Clean up: force-sleep the partially-woken model to free GPU memory
-                    self.inner
-                        .orchestrator
-                        .force_sleep(target_model, EvictionPolicy::STOP)
-                        .await;
-                    *self.inner.last_switch_failure.write().await = Some(Instant::now());
-                    {
-                        let mut state = self.inner.state.write().await;
-                        *state = SwitcherState::Idle;
-                    }
-                    counter!("llmux_switch_failures_total", "to" => target_model.to_owned())
-                        .increment(1);
-                    self.notify_pending(
-                        target_model,
-                        Err(SwitchError::NotReady(target_model.to_string())),
-                    )
-                    .await;
-                }
+                self.notify_pending(target_model, Ok(())).await;
             }
             Err(e) => {
-                error!(model = %target_model, error = %e, "Failed to wake model");
-                // Clean up: force-sleep in case the model partially woke
-                self.inner
-                    .orchestrator
-                    .force_sleep(target_model, EvictionPolicy::STOP)
-                    .await;
+                error!(model = %target_model, error = %e, "Wake hook failed");
+
+                // Try to clean up the partially-woken model
+                let _ = self.inner.hooks.run_sleep(target_model).await;
+
                 *self.inner.last_switch_failure.write().await = Some(Instant::now());
                 {
                     let mut state = self.inner.state.write().await;
                     *state = SwitcherState::Idle;
                 }
-                counter!("llmux_switch_failures_total", "to" => target_model.to_owned())
-                    .increment(1);
-                self.notify_pending(target_model, Err(SwitchError::Orchestrator(e)))
-                    .await;
+
+                self.notify_pending(
+                    target_model,
+                    Err(SwitchError::HookFailed {
+                        model: target_model.to_string(),
+                        detail: e.to_string(),
+                    }),
+                )
+                .await;
             }
         }
     }
 
-    /// Get the queue depth for every registered model.
-    pub async fn queue_depths(&self) -> HashMap<String, usize> {
-        let mut depths = HashMap::new();
-        for (model, state) in &self.inner.model_states {
-            let queue = state.pending.lock().await;
-            depths.insert(model.clone(), queue.len());
-        }
-        depths
-    }
-
-    /// Build a ScheduleContext from current switcher state.
     async fn build_schedule_context(&self) -> ScheduleContext {
         let (active_model, active_in_flight) = match &*self.inner.state.read().await {
             SwitcherState::Active { model } => (Some(model.clone()), self.in_flight_count(model)),
@@ -631,39 +521,6 @@ impl ModelSwitcher {
         }
     }
 
-    /// Spawn a background scheduler task if the policy requests one.
-    ///
-    /// Returns `Some(JoinHandle)` if the scheduler was spawned, `None`
-    /// if the policy does not use a scheduler (i.e. `scheduler_interval`
-    /// returns `None`).
-    pub fn spawn_scheduler(self) -> Option<tokio::task::JoinHandle<()>> {
-        let interval = self.inner.policy.scheduler_interval()?;
-
-        info!(
-            interval_ms = interval.as_millis(),
-            "Spawning background scheduler"
-        );
-
-        Some(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tick.tick().await;
-                // Skip scheduler ticks in manual mode
-                if matches!(*self.inner.mode.read().await, SwitchMode::Manual { .. }) {
-                    continue;
-                }
-                let ctx = self.build_schedule_context().await;
-                if let Some(target) = self.inner.policy.schedule_tick(&ctx) {
-                    debug!(target = %target, "Scheduler: triggering switch");
-                    self.do_switch(&target).await;
-                }
-            }
-        }))
-    }
-
-    /// Notify pending requests
     async fn notify_pending(&self, model: &str, result: Result<(), SwitchError>) {
         if let Some(model_state) = self.inner.model_states.get(model) {
             let mut queue = model_state.pending.lock().await;
@@ -693,16 +550,15 @@ impl ModelSwitcher {
     }
 }
 
-/// Guard that tracks in-flight requests
+/// Guard that tracks in-flight requests. When dropped, decrements the count
+/// and notifies the drain waiter.
 pub struct InFlightGuard {
     model_state: Arc<ModelState>,
-    model_name: String,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         let prev = self.model_state.in_flight.fetch_sub(1, Ordering::SeqCst);
-        gauge!("llmux_in_flight", "model" => self.model_name.clone()).set((prev - 1) as f64);
         if prev == 1 {
             self.model_state.in_flight_changed.notify_waiters();
         }
@@ -714,38 +570,35 @@ mod tests {
     use super::*;
     use crate::config::ModelConfig;
     use crate::policy::FifoPolicy;
-    use std::collections::HashMap;
 
-    fn make_test_orchestrator() -> Arc<Orchestrator> {
+    fn make_test_hooks() -> Arc<HookRunner> {
         let mut configs = HashMap::new();
         configs.insert(
             "model-a".to_string(),
             ModelConfig {
-                model_path: "test".to_string(),
                 port: 8001,
-                extra_args: vec![],
-                eviction: EvictionPolicy::from(1),
-                checkpoint_path: None,
+                wake: "true".to_string(),
+                sleep: "true".to_string(),
+                alive: "true".to_string(),
             },
         );
         configs.insert(
             "model-b".to_string(),
             ModelConfig {
-                model_path: "test".to_string(),
                 port: 8002,
-                extra_args: vec![],
-                eviction: EvictionPolicy::from(1),
-                checkpoint_path: None,
+                wake: "true".to_string(),
+                sleep: "true".to_string(),
+                alive: "true".to_string(),
             },
         );
-        Arc::new(Orchestrator::new(configs))
+        Arc::new(HookRunner::new(configs))
     }
 
     #[test]
     fn test_switcher_creation() {
-        let orchestrator = make_test_orchestrator();
+        let hooks = make_test_hooks();
         let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
+        let switcher = ModelSwitcher::new(hooks, policy);
 
         assert!(switcher.is_registered("model-a"));
         assert!(switcher.is_registered("model-b"));
@@ -754,9 +607,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_in_flight_tracking() {
-        let orchestrator = make_test_orchestrator();
+        let hooks = make_test_hooks();
         let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
+        let switcher = ModelSwitcher::new(hooks, policy);
 
         assert_eq!(switcher.in_flight_count("model-a"), 0);
 
@@ -770,11 +623,10 @@ mod tests {
 
     #[test]
     fn test_acquire_in_flight_rejected_while_draining() {
-        let orchestrator = make_test_orchestrator();
+        let hooks = make_test_hooks();
         let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
+        let switcher = ModelSwitcher::new(hooks, policy);
 
-        // Acquire should succeed when not draining
         let guard = switcher.acquire_in_flight("model-a");
         assert!(guard.is_some());
         assert_eq!(switcher.in_flight_count("model-a"), 1);
@@ -784,16 +636,12 @@ mod tests {
         let model_state = switcher.inner.model_states.get("model-a").unwrap();
         model_state.draining.store(true, Ordering::SeqCst);
 
-        // Acquire should now return None
         let guard = switcher.acquire_in_flight("model-a");
         assert!(guard.is_none());
-        // In-flight count should remain 0 (increment was backed out)
         assert_eq!(switcher.in_flight_count("model-a"), 0);
 
-        // Clear draining flag
         model_state.draining.store(false, Ordering::SeqCst);
 
-        // Acquire should succeed again
         let guard = switcher.acquire_in_flight("model-a");
         assert!(guard.is_some());
         assert_eq!(switcher.in_flight_count("model-a"), 1);
@@ -801,101 +649,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_default_mode_is_auto() {
-        let orchestrator = make_test_orchestrator();
+    async fn test_model_port() {
+        let hooks = make_test_hooks();
         let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
+        let switcher = ModelSwitcher::new(hooks, policy);
 
-        assert_eq!(switcher.mode().await, SwitchMode::Auto);
-    }
-
-    #[tokio::test]
-    async fn test_set_mode_manual() {
-        let orchestrator = make_test_orchestrator();
-        let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
-
-        switcher
-            .set_mode(SwitchMode::Manual {
-                pinned: Some("model-a".to_string()),
-            })
-            .await;
-
-        assert_eq!(
-            switcher.mode().await,
-            SwitchMode::Manual {
-                pinned: Some("model-a".to_string())
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn test_manual_mode_rejects_non_active_model() {
-        let orchestrator = make_test_orchestrator();
-        let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
-
-        // Set active state to model-a (simulate it being active)
-        {
-            let mut state = switcher.inner.state.write().await;
-            *state = SwitcherState::Active {
-                model: "model-a".to_string(),
-            };
-        }
-
-        // Enter manual mode with model-a pinned
-        switcher
-            .set_mode(SwitchMode::Manual {
-                pinned: Some("model-a".to_string()),
-            })
-            .await;
-
-        // Request for model-a should succeed (fast path: already active)
-        let result = switcher.ensure_model_ready("model-a").await;
-        assert!(result.is_ok());
-
-        // Request for model-b should be rejected
-        let result = switcher.ensure_model_ready("model-b").await;
-        assert!(matches!(
-            result,
-            Err(SwitchError::ManualModeRejected { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_manual_mode_no_pin_uses_active() {
-        let orchestrator = make_test_orchestrator();
-        let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
-
-        // Set active state to model-a
-        {
-            let mut state = switcher.inner.state.write().await;
-            *state = SwitcherState::Active {
-                model: "model-a".to_string(),
-            };
-        }
-
-        // Enter manual mode without pinning a specific model
-        switcher.set_mode(SwitchMode::Manual { pinned: None }).await;
-
-        // Request for active model should succeed
-        let result = switcher.ensure_model_ready("model-a").await;
-        assert!(result.is_ok());
-
-        // Request for other model should be rejected
-        let result = switcher.ensure_model_ready("model-b").await;
-        assert!(matches!(
-            result,
-            Err(SwitchError::ManualModeRejected { .. })
-        ));
+        assert_eq!(switcher.model_port("model-a"), Some(8001));
+        assert_eq!(switcher.model_port("model-b"), Some(8002));
+        assert_eq!(switcher.model_port("model-c"), None);
     }
 
     #[tokio::test]
     async fn test_force_switch_unknown_model() {
-        let orchestrator = make_test_orchestrator();
+        let hooks = make_test_hooks();
         let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
+        let switcher = ModelSwitcher::new(hooks, policy);
 
         let result = switcher.force_switch("nonexistent").await;
         assert!(matches!(result, Err(SwitchError::ModelNotFound(_))));
@@ -903,11 +671,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_force_switch_already_active() {
-        let orchestrator = make_test_orchestrator();
+        let hooks = make_test_hooks();
         let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
+        let switcher = ModelSwitcher::new(hooks, policy);
 
-        // Set active state to model-a
         {
             let mut state = switcher.inner.state.write().await;
             *state = SwitcherState::Active {
@@ -915,51 +682,7 @@ mod tests {
             };
         }
 
-        // Force switch to already-active model should be a no-op
         let result = switcher.force_switch("model-a").await;
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_registered_models() {
-        let orchestrator = make_test_orchestrator();
-        let policy = Box::new(FifoPolicy::default());
-        let switcher = ModelSwitcher::new(orchestrator, policy);
-
-        let mut models = switcher.registered_models();
-        models.sort();
-        assert_eq!(models, vec!["model-a", "model-b"]);
-    }
-
-    #[tokio::test]
-    async fn test_switch_mode_serde() {
-        let auto = SwitchMode::Auto;
-        let json = serde_json::to_string(&auto).unwrap();
-        assert_eq!(json, r#"{"mode":"auto"}"#);
-
-        let manual = SwitchMode::Manual {
-            pinned: Some("llama".to_string()),
-        };
-        let json = serde_json::to_string(&manual).unwrap();
-        assert!(json.contains(r#""mode":"manual""#));
-        assert!(json.contains(r#""pinned":"llama""#));
-
-        let manual_no_pin = SwitchMode::Manual { pinned: None };
-        let json = serde_json::to_string(&manual_no_pin).unwrap();
-        assert!(json.contains(r#""mode":"manual""#));
-        assert!(!json.contains("pinned"));
-
-        // Deserialize
-        let parsed: SwitchMode = serde_json::from_str(r#"{"mode":"auto"}"#).unwrap();
-        assert_eq!(parsed, SwitchMode::Auto);
-
-        let parsed: SwitchMode =
-            serde_json::from_str(r#"{"mode":"manual","pinned":"test"}"#).unwrap();
-        assert_eq!(
-            parsed,
-            SwitchMode::Manual {
-                pinned: Some("test".to_string())
-            }
-        );
     }
 }

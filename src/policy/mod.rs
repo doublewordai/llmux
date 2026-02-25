@@ -1,13 +1,14 @@
 //! Switch policies for model switching decisions.
 //!
-//! Currently only [`FifoPolicy`] is implemented: switches immediately on the
-//! first request for a non-active model.
+//! The policy trait is intentionally rich — it receives detailed context about
+//! queue depths, in-flight counts, and timing so that future policies can make
+//! sophisticated decisions. The initial [`FifoPolicy`] uses only a fraction
+//! of this data.
 
 mod fifo;
 
 pub use fifo::FifoPolicy;
 
-use crate::types::EvictionPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::future::Future;
@@ -31,6 +32,7 @@ pub struct PolicyContext {
     pub active_in_flight: usize,
     /// How long the active model has been active (since last wake completed)
     pub active_duration: Duration,
+    // TODO: How do we plugin cost estimation of switching?
 }
 
 /// Context provided to the background scheduler on each tick
@@ -46,7 +48,7 @@ pub struct ScheduleContext {
     pub active_in_flight: usize,
 }
 
-/// Context for preparing a switch
+/// Context for preparing a switch (drain phase)
 pub struct SwitchContext {
     pub from_model: Option<String>,
     pub to_model: String,
@@ -85,13 +87,18 @@ impl SwitchContext {
 pub enum PolicyDecision {
     /// Switch immediately
     SwitchNow,
-    /// Defer - wait for the future to complete, then switch
+    /// Defer — wait for the future to complete, then switch
     Defer(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
-    /// Skip - a switch is already being arranged; do nothing
+    /// Skip — a switch is already being arranged; do nothing
     Skip,
 }
 
-/// Policy trait for controlling model switching behavior
+/// Policy trait for controlling model switching behavior.
+///
+/// Policies receive rich context about the current state of the system and
+/// return decisions about when and how to switch models. The trait is
+/// intentionally broad to support future policies (batching, priority-based,
+/// cost-aware, etc.) without API changes.
 #[async_trait]
 pub trait SwitchPolicy: Send + Sync {
     /// Called when a request arrives for an inactive model
@@ -104,14 +111,10 @@ pub trait SwitchPolicy: Send + Sync {
     /// Policies can use this to track empirical switch costs.
     fn on_switch_complete(&self, _from: &str, _to: &str, _duration: Duration) {}
 
-    /// Default eviction policy for models that don't specify one
-    fn eviction_policy(&self) -> EvictionPolicy;
-
-    /// Request timeout
-    fn request_timeout(&self) -> Duration;
+    /// Request timeout. None = unlimited (requests wait forever).
+    fn request_timeout(&self) -> Option<Duration>;
 
     /// Minimum time a model must stay active before it can be put to sleep.
-    /// Prevents rapid wake/sleep thrashing that can cause GPU page faults.
     fn min_active_duration(&self) -> Duration;
 
     /// If `Some(interval)`, the switcher will spawn a background scheduler

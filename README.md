@@ -3,562 +3,177 @@
 [![Crates.io](https://img.shields.io/crates/v/llmux)](https://crates.io/crates/llmux)
 [![GitHub](https://img.shields.io/badge/GitHub-doublewordai%2Fllmux-blue)](https://github.com/doublewordai/llmux)
 
-LLM multiplexer for vLLM. Host multiple models on a single GPU, switching
-between them on demand using vLLM's sleep/wake API.
+LLM multiplexer. Routes OpenAI-compatible requests to model backends and
+switches between them on demand using user-provided scripts.
 
-When a request arrives for a model that isn't currently loaded, llmux puts the
-active model to sleep (freeing GPU memory) and wakes the requested model. The
-OpenAI-compatible API stays up throughout - clients just change the `model`
-field.
+When a request arrives for a model that isn't currently loaded, llmux drains
+in-flight requests, runs your **sleep** script on the active model, then runs
+your **wake** script on the requested model. The API stays up throughout —
+clients just change the `model` field.
+
+llmux doesn't manage model processes directly. You provide three shell scripts
+per model (**wake**, **sleep**, **alive**) and llmux calls them at the right
+time. This means it works with any backend — vLLM, SGLang, llama.cpp, Ollama,
+or anything else that speaks HTTP.
+
+## Install
+
+```sh
+cargo install llmux
+```
+
+## Quick start
+
+Create a `config.yaml`:
+
+```yaml
+models:
+  llama:
+    port: 8001
+    wake: ./scripts/wake-llama.sh
+    sleep: ./scripts/sleep-llama.sh
+    alive: curl -sf http://localhost:8001/health
+
+  mistral:
+    port: 8002
+    wake: ./scripts/wake-mistral.sh
+    sleep: ./scripts/sleep-mistral.sh
+    alive: curl -sf http://localhost:8002/health
+
+port: 3000
+```
+
+Run it:
+
+```sh
+llmux -c config.yaml
+```
+
+Send requests:
+
+```sh
+curl http://localhost:3000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "llama", "messages": [{"role": "user", "content": "Hi"}]}'
+```
+
+When a request comes in for `mistral`, llmux will drain active requests,
+run `sleep-llama.sh`, then `wake-mistral.sh`, and proxy the request through.
 
 ## How it works
 
 ```
-                    Client requests
-                         |
-                    +---------+
-                    |  llmux  |   port 3000 (OpenAI-compatible)
-                    +---------+
-                    /         \
-            [vLLM:8001]    [vLLM:8002]
-             (active)       (sleeping)
+Client requests
+     |
++---------+
+|  llmux  |   port 3000 (OpenAI-compatible proxy)
++---------+
+ /         \
+[8001]    [8002]
+ llama     mistral
+(active)   (sleeping)
 ```
 
-llmux spawns vLLM processes lazily on first request and manages their
-lifecycle. Only one model is active at a time - the rest are evicted using
-a configurable two-axis policy.
-
-### Eviction policy
-
-When a model is evicted, llmux applies two strategies in sequence:
-
-1. **Weight strategy** — what vLLM does with model weights (via the sleep API)
-2. **Process strategy** — what happens to the OS process afterward
-
-#### Weight strategy
-
-Applied first, via vLLM's sleep endpoint. Controls what happens to weights and KV cache:
-
-| Strategy | Description |
-|----------|-------------|
-| `retain` | Nothing happens. Weights and KV cache stay on GPU. |
-| `offload` | Weights copied to pinned CPU RAM. KV cache and CUDA graphs discarded. Frees most GPU memory but uses significant host RAM. |
-| `discard` | Weights dropped entirely (reloaded from disk on wake). KV cache and CUDA graphs discarded. Frees most GPU memory with no CPU RAM cost. |
-
-Both `offload` and `discard` leave a small CUDA context (~500 MiB) on the GPU.
-
-#### Process strategy
-
-Applied second, to the process left behind by the weight strategy:
-
-| Strategy | Description |
-|----------|-------------|
-| `keep_running` | Process stays as-is. Fast, but whatever's still on GPU stays there. |
-| `cuda_suspend` | Snapshots remaining VRAM to host RAM via `cuda-checkpoint`, freeing 100% of GPU memory. Process stays alive. |
-| `checkpoint` | CRIU dumps the entire process (including host RAM) to disk, then kills it. Frees 100% of GPU and CPU memory. |
-| `stop` | Kills the process. Everything is lost. |
-
-#### How they interact
-
-The weight strategy determines what's on GPU vs. CPU before the process strategy runs.
-This affects speed, memory usage, and what survives a wake cycle:
-
-| | `keep_running` | `cuda_suspend` | `checkpoint` | `stop` |
-|---|---|---|---|---|
-| **`retain`** | No-op (model stays loaded) | Full VRAM snapshot to CPU — weights, KV cache, CUDA graphs all preserved | Full process checkpoint to disk — large image (includes VRAM) | Everything lost |
-| **`offload`** | Weights on CPU, KV lost, ~500 MiB CUDA context remains on GPU | Remaining CUDA context → CPU, weights already on CPU | Large CRIU image (weights in host RAM get written to disk) | Everything lost |
-| **`discard`** | Weights gone, KV lost, ~500 MiB CUDA context remains on GPU | Remaining CUDA context → CPU, weights gone | Small CRIU image (no weights — reloaded from HF cache on wake) | Everything lost |
-
-Common choices:
-
-- **`offload` + `keep_running`** — Fast wake (weights already in RAM), but holds CPU memory and ~500 MiB GPU
-- **`discard` + `keep_running`** — No CPU RAM cost, but slow wake (reload from disk) and ~500 MiB GPU
-- **`retain` + `cuda_suspend`** — Frees 100% GPU, full state preserved, but holds all VRAM in CPU RAM
-- **`discard` + `checkpoint`** — Frees 100% GPU *and* CPU, small CRIU image; wake reloads weights from disk but restores KV cache, CUDA graphs, and warmed allocator from checkpoint
-- **`offload` + `checkpoint`** — Like above but CRIU image is large (includes weights); wake is faster (no disk reload) but checkpoint is slower and uses more disk
-
-If eviction fails, llmux automatically escalates to `stop` to guarantee GPU
-memory is freed.
-
-#### CUDA suspend
-
-Uses `cuda-checkpoint --toggle` to suspend CUDA state and copy VRAM to host
-RAM. The process stays alive — no serialization, no CRIU. Wake is just another
-toggle to copy state back to GPU.
-
-Like `offload`, this holds state in CPU RAM. Unlike `offload`, it frees 100% of
-GPU memory (`offload` keeps ~500 MiB for CUDA context) and preserves full state.
-
-For TP>1, llmux coordinates NCCL teardown before checkpoint and rebuild after
-restore. This requires patched vLLM with `suspend_nccl`/`resume_nccl` support
-(included in the Docker image).
-
-**Requirements:**
-- `cuda-checkpoint` utility (included in Docker image)
-- Root access (or passwordless `sudo` for `cuda-checkpoint`)
-- For TP>1: `--enforce-eager` and `--disable-custom-all-reduce` in `extra_args`
-
-#### CRIU checkpoint
-
-CRIU checkpointing uses `cuda-checkpoint` and `criu` to snapshot the entire
-vLLM process tree to disk, then kill it. On restore, CRIU brings the process
-back with all state intact — including GPU VRAM contents, KV cache, CUDA
-graphs, and the warmed memory allocator. First inference after restore is ~30ms
-(no warmup needed).
-
-**Requirements:**
-- CRIU 4.x with the CUDA plugin (`libcuda_plugin.so`) (included in Docker image)
-- `cuda-checkpoint` utility (included in Docker image)
-- Root access (or passwordless `sudo` for `criu` and `cuda-checkpoint`)
-- vLLM process must not use `io_uring` or `libuv` (set automatically)
-- For TP>1: `--enforce-eager` and `--disable-custom-all-reduce` in `extra_args`
-
-**Trade-offs vs offload:**
-- Slower sleep/wake than `offload`, but no CPU RAM cost and full state preservation
-- Slower wake than `offload` but faster first-inference (no warmup)
-
-## Quickstart
-
-Create a `config.json`:
-
-```json
-{
-  "models": {
-    "qwen-14b": {
-      "model_path": "Qwen/Qwen3-14B",
-      "port": 8001,
-      "eviction": { "weights": "offload", "process": "keep_running" }
-    },
-    "gemma-12b": {
-      "model_path": "google/gemma-3-12b-it",
-      "port": 8002,
-      "eviction": { "weights": "discard", "process": "keep_running" }
-    }
-  },
-  "port": 3000
-}
-```
-
-### With Docker (recommended)
-
-The Docker image bundles vLLM v0.15.1 with patches for NCCL suspend/resume
-and sleep mode fixes:
-
-```bash
-docker run --gpus all --init \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -v ./config.json:/etc/llmux/config.json:ro \
-  -p 3000:3000 \
-  ghcr.io/doublewordai/llmux:latest
-```
-
-For `cuda_suspend` or `checkpoint` process strategies, additional flags are required:
-
-```bash
-docker run --gpus all \
-  --privileged \
-  --pid=host \
-  --ipc=host \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -v ./config.json:/etc/llmux/config.json:ro \
-  -v /tmp/llmux-checkpoints:/tmp/llmux-checkpoints \
-  -p 3000:3000 \
-  ghcr.io/doublewordai/llmux:latest
-```
-
-The extra flags are needed because:
-- `--privileged` — CRIU requires broad namespace and ptrace access
-- `--pid=host` — cuda-checkpoint needs to ptrace vLLM worker PIDs
-- `--ipc=host` — NCCL uses shared memory for inter-GPU communication
-- `-v /tmp/llmux-checkpoints:...` — CRIU checkpoints can be tens of GB; mount a host volume to avoid filling the container filesystem
-
-**Important:** Do NOT use `--init` with CRIU (`checkpoint` process strategy). Docker's init process (tini)
-redirects stdin to the host's `/dev/null`, whose mount ID is invisible inside the container.
-CRIU dump fails with "Can't lookup mount=N for fd=0 path=/dev/null".
-
-### From source
-
-Requires vLLM installed and available as `vllm` on PATH:
-
-```bash
-cargo install llmux
-llmux --config config.json
-```
-
-For `cuda_suspend` or `checkpoint` process strategies, you also need `cuda-checkpoint`
-and `criu` (with CUDA plugin) installed and either run as root or configure passwordless sudo.
-
-### Send requests
-
-```bash
-# First request starts vLLM for qwen-14b
-curl http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "qwen-14b", "messages": [{"role": "user", "content": "Hello"}]}'
-
-# Switching: sleeps qwen-14b, starts gemma-12b
-curl http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "gemma-12b", "messages": [{"role": "user", "content": "Hello"}]}'
-```
+1. **Middleware** extracts the `model` field from the request JSON body
+2. **Switcher** checks if that model is active. If not, triggers a switch:
+   - Drains in-flight requests for the current model
+   - Runs the **sleep** hook on the current model
+   - Runs the **wake** hook on the target model
+3. **Proxy** forwards the request to `localhost:<model_port>`
+4. In-flight tracking uses RAII guards that hold through streaming responses
 
 ## Configuration
 
-### Model options
+### Models
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `model_path` | *required* | HuggingFace model ID or local path |
-| `port` | *required* | Port for this model's vLLM instance |
-| `eviction` | `retain` + `stop` | Eviction policy (see below) |
-| `extra_args` | `[]` | Additional vLLM CLI arguments |
-| `checkpoint_path` | *none* | Path to CRIU checkpoint images for lazy restore on first request |
-
-The `eviction` field takes an object with `weights` and `process` keys:
-
-```json
-{
-  "eviction": { "weights": "offload", "process": "keep_running" }
-}
-```
-
-All vLLM-specific flags (e.g. `--gpu-memory-utilization`, `--tensor-parallel-size`,
-`--dtype`) should be passed via `extra_args`:
-
-```json
-{
-  "model_path": "Qwen/Qwen3-14B",
-  "port": 8001,
-  "extra_args": ["--gpu-memory-utilization", "0.9", "--tensor-parallel-size", "2"]
-}
-```
-
-#### Tensor parallelism with cuda_suspend/checkpoint
-
-When using `cuda_suspend` or `checkpoint` with TP>1, you **must** include `--enforce-eager`
-and `--disable-custom-all-reduce` in `extra_args`:
-
-```json
-{
-  "model_path": "NousResearch/Meta-Llama-3.1-8B-Instruct",
-  "port": 8001,
-  "eviction": { "weights": "retain", "process": "cuda_suspend" },
-  "extra_args": [
-    "--tensor-parallel-size", "2",
-    "--enforce-eager",
-    "--disable-custom-all-reduce",
-    "--gpu-memory-utilization", "0.85"
-  ]
-}
-```
-
-- `--enforce-eager` — CUDA graphs hold stale NCCL handles and crash on resume
-- `--disable-custom-all-reduce` — CustomAllReduce IPC buffers cannot survive cuda-checkpoint
-
-llmux validates the config at startup and warns if these flags are missing.
-
-### Top-level options
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `port` | `3000` | Proxy listen port |
-| `metrics_port` | `9090` | Prometheus metrics port (0 to disable) |
-| `vllm_command` | `"vllm"` | vLLM binary path |
-
-### Checkpoint config
-
-To use `cuda_suspend` or `checkpoint` process strategies, add a `checkpoint` section:
-
-```json
-{
-  "models": {
-    "qwen-14b": {
-      "model_path": "Qwen/Qwen3-14B",
-      "port": 8001,
-      "eviction": { "weights": "retain", "process": "cuda_suspend" }
-    }
-  },
-  "checkpoint": {
-    "cuda_checkpoint_path": "cuda-checkpoint"
-  }
-}
-```
-
-For CRIU checkpointing, the full config is:
-
-```json
-{
-  "checkpoint": {
-    "criu_path": "criu",
-    "cuda_plugin_dir": "/usr/lib/criu/",
-    "images_dir": "/tmp/llmux-checkpoints",
-    "cuda_checkpoint_path": "cuda-checkpoint"
-  }
-}
-```
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `criu_path` | `"criu"` | Path to the criu binary |
-| `cuda_plugin_dir` | `"/usr/lib/criu/"` | Directory containing `libcuda_plugin.so` |
-| `images_dir` | `"/tmp/llmux-checkpoints"` | Base directory for checkpoint images |
-| `cuda_checkpoint_path` | `"cuda-checkpoint"` | Path to the cuda-checkpoint utility |
-
-### vLLM logging
-
-vLLM process output (stdout/stderr) is always captured and forwarded to the
-`vllm` tracing target at `debug` level. Use `RUST_LOG` to control visibility:
-
-```bash
-# Default: only llmux info logs, vLLM output hidden
-llmux --config config.json
-
-# Show vLLM output
-RUST_LOG=info,vllm=debug llmux --config config.json
-
-# --verbose includes vLLM output automatically
-llmux --config config.json --verbose
-```
-
-ANSI color codes are stripped from vLLM output. The `NO_COLOR=1` environment
-variable is also set on spawned vLLM processes.
-
-### Policy options
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `policy_type` | `"fifo"` | Switching policy |
-| `request_timeout_secs` | `60` | Request timeout |
-| `drain_before_switch` | `true` | Wait for in-flight requests before sleeping |
-| `eviction` | `retain` + `stop` | Default eviction policy |
-
-## Validation
-
-llmux includes a built-in validation tool that tests sleep/wake cycles
-against a running model, verifying GPU memory is freed and responses are
-deterministic after wake:
-
-```bash
-llmux --config config.json --validate qwen-14b \
-  --policies offload+keep_running,discard+keep_running,retain+cuda_suspend \
-  --verbose
-```
-
-Output:
-
-```
-Eviction          Sleep (s)   Wake (s)   GPU Before    GPU After     GPU Wake   Response   Pass
-------------------------------------------------------------------------------------------------
-Offload+KeepRun        35.9        1.2      45899 MiB       1341 MiB      44033 MiB      match     OK
-Discard+KeepRun         0.3        8.2      44033 MiB       1341 MiB      44033 MiB      match     OK
-
-Result: ALL PASSED
-```
-
-## Checkpoint management
-
-Pre-create CRIU checkpoints for fast model switching:
-
-```bash
-# Create checkpoint (start model, warm up, CRIU dump to disk)
-llmux --config config.json --checkpoint qwen-14b
-
-# Use a different weight strategy (affects CRIU image size)
-llmux --config config.json --checkpoint qwen-14b --eviction retain+checkpoint
-
-# Skip warmup inference before checkpointing
-llmux --config config.json --checkpoint qwen-14b --no-warmup
-
-# Restore detached (CRIU restore, health check, exit — process keeps running)
-llmux --config config.json --restore-detached qwen-14b
-```
-
-The default eviction for `--checkpoint` is `discard+checkpoint`, which produces
-small CRIU images (weights are reloaded from the HF cache on restore). Use
-`retain+checkpoint` or `offload+checkpoint` for larger images that restore
-faster (weights already in the snapshot).
-
-After `--restore-detached`, the vLLM process continues running on its configured
-port. This is useful for testing checkpoints or running a single model without
-the daemon.
-
-### Lazy restore via config
-
-Instead of restoring manually, set `checkpoint_path` in your model config so
-the daemon restores from checkpoint on first request:
-
-```json
-{
-  "models": {
-    "qwen-14b": {
-      "model_path": "Qwen/Qwen3-14B",
-      "port": 8001,
-      "eviction": { "weights": "discard", "process": "checkpoint" },
-      "checkpoint_path": "/tmp/llmux-checkpoints/qwen-14b/images"
-    }
-  }
-}
-```
-
-When the daemon starts, models with `checkpoint_path` are initialized in
-checkpointed state. The first request triggers a CRIU restore instead of a
-cold start — typically 3-5x faster.
-
-`keep_images` must be `true` (the default) in the `checkpoint` config when
-using `checkpoint_path`, since the images must persist across daemon restarts.
-
-## Docker Compose
-
-### Basic setup
+Each model needs a `port` and three hooks:
 
 ```yaml
-services:
-  llmux:
-    image: ghcr.io/doublewordai/llmux:latest
-    init: true
-    command: ["--config", "/etc/llmux/config.json"]
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-      - ./config.json:/etc/llmux/config.json:ro
-    ports:
-      - "3000:3000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
+models:
+  my-model:
+    port: 8001
+    wake: |
+      # Bring the model to a ready state (must be idempotent).
+      # Exit 0 when the model is ready to serve requests.
+      docker start my-model-container
+      for i in $(seq 1 60); do
+        curl -sf http://localhost:8001/health && exit 0
+        sleep 1
+      done
+      exit 1
+    sleep: |
+      # Free resources. Exit 0 when done.
+      docker stop my-model-container
+    alive: |
+      # Health check. Exit 0 = healthy, non-zero = unhealthy.
+      curl -sf http://localhost:8001/health
 ```
 
-### With cuda-checkpoint/CRIU
+Hooks are executed via `sh -c` with `LLMUX_MODEL` set in the environment.
+They can be inline scripts (YAML `|` syntax) or paths to executables.
+
+### Policy
 
 ```yaml
-services:
-  llmux:
-    image: ghcr.io/doublewordai/llmux:latest
-    init: true
-    command: ["--config", "/etc/llmux/config.json"]
-    pid: host
-    ipc: host
-    cap_add:
-      - SYS_PTRACE
-      - CHECKPOINT_RESTORE
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-      - ./config.json:/etc/llmux/config.json:ro
-    ports:
-      - "3000:3000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
+policy:
+  # Max time a request waits for a switch. Omit for unlimited.
+  request_timeout_secs: 300
+
+  # Wait for in-flight requests to finish before switching. Default: true.
+  drain_before_switch: true
+
+  # Minimum seconds a model stays active before it can be switched out.
+  # Prevents rapid thrashing. Default: 0.
+  min_active_secs: 5
 ```
 
-### With onwards (API key auth)
-
-For production, put [onwards](https://github.com/doublewordai/onwards) in
-front for API key authentication:
+### Full config reference
 
 ```yaml
-services:
-  llmux:
-    image: ghcr.io/doublewordai/llmux:latest
-    init: true
-    command: ["--config", "/etc/llmux/config.json"]
-    pid: host
-    ipc: host
-    cap_add:
-      - SYS_PTRACE
-      - CHECKPOINT_RESTORE
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-      - ./config.json:/etc/llmux/config.json:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
+models:
+  <model-name>:
+    port: <u16>         # Where the backend listens
+    wake: <string>      # Script to start/restore the model
+    sleep: <string>     # Script to stop/checkpoint the model
+    alive: <string>     # Health check script
 
-  onwards:
-    image: ghcr.io/doublewordai/onwards:latest
-    command: ["--targets", "/etc/onwards/targets.json"]
-    volumes:
-      - ./targets.json:/etc/onwards/targets.json:ro
-    ports:
-      - "3000:3000"
+policy:
+  request_timeout_secs: <u64 | null>   # null = unlimited
+  drain_before_switch: <bool>          # default: true
+  min_active_secs: <u64>               # default: 0
+
+port: <u16>  # Proxy listen port (default: 3000)
 ```
 
-Where `targets.json` maps model names to llmux with API keys:
+Both YAML and JSON configs are supported (detected by file extension).
 
-```json
-{
-  "targets": {
-    "qwen-14b": {
-      "url": "http://llmux:3000/v1",
-      "keys": ["sk-your-api-key"],
-      "onwards_model": "qwen-14b"
-    },
-    "gemma-12b": {
-      "url": "http://llmux:3000/v1",
-      "keys": ["sk-your-api-key"],
-      "onwards_model": "gemma-12b"
-    }
-  }
-}
-```
+## Examples
 
-## Tensor parallelism
+### Podman + CRIU (GPU checkpoint/restore)
 
-All eviction strategies work with TP>1:
+The [`examples/podman-criu/`](examples/podman-criu/) directory shows how to
+use CRIU to checkpoint and restore vLLM containers, achieving ~3x faster
+model switches vs. cold start. See the [example README](examples/podman-criu/README.md)
+for setup instructions and timings.
 
-| Strategy | TP>1 | Notes |
-|----------|------|-------|
-| `offload` | Yes | vLLM manages NCCL teardown/rebuild internally |
-| `discard` | Yes | Same — vLLM handles it |
-| `cuda_suspend` | Yes | llmux tears down NCCL before cuda-checkpoint, rebuilds after restore |
-| `checkpoint` | Yes | Same — NCCL teardown before checkpoint, rebuild after restore |
-| `stop` | Yes | Kill + cold restart always works |
+## Architecture
 
-For `cuda_suspend` and `checkpoint`, llmux uses vLLM's `/collective_rpc` endpoint to call
-`suspend_nccl` (before cuda-checkpoint) and `resume_nccl` (after restore)
-on all TP workers. This tears down NCCL IPC handles that cuda-checkpoint
-cannot checkpoint, then rebuilds them after CUDA state is restored.
+The codebase is ~1,700 lines of Rust:
 
-This requires patched vLLM with `suspend_nccl`/`resume_nccl` support. The
-Docker image includes these patches. For bare-metal installs, apply
-`patches/nccl-suspend-resume-v0.15.1.patch` to your vLLM installation.
+| Module | What it does |
+|--------|-------------|
+| `main.rs` | CLI (clap), config loading, server startup |
+| `config.rs` | YAML/JSON config parsing |
+| `hooks.rs` | Executes wake/sleep/alive scripts via `sh -c` |
+| `switcher.rs` | State machine: Idle → Switching → Active. Drain, sleep, wake. |
+| `middleware.rs` | Tower layer: extract model, ensure ready, acquire in-flight guard |
+| `proxy.rs` | Reverse proxy to `localhost:<port>` |
+| `policy/` | Pluggable switch policy trait (currently FIFO) |
 
-## Known issues
-
-The `--validate` flag exists specifically to catch these kinds of problems
-before they hit production.
-
-### vLLM v0.14+ sleep regression
-
-Sleep mode (`offload`/`discard`) has a regression where weights are not discarded from GPU
-memory ([vllm#32714](https://github.com/vllm-project/vllm/issues/32714)).
-The Docker image includes a patch (`fix-sleep-mode-v0.15.1.patch`) that fixes
-this. For bare-metal installs, apply the patch or use `cuda_suspend`/`stop` instead.
-
-### vLLM v0.13.0
-
-- **`openai/gpt-oss-20b` `discard` reload fails.** The MXFP4 weight loader crashes on
-  wake with `default_weight_loader() got an unexpected keyword argument
-  'weight_name'`. `offload` works fine (19.6s sleep, 0.6s wake). Use `offload` for this
-  model.
-- `offload` and `discard` both work correctly for `Qwen/Qwen3-14B` and
-  `google/gemma-3-12b-it`.
-
-### NVIDIA driver requirements
-
-The Docker image uses vLLM v0.15.1 which requires CUDA 12.9 and
-nvidia-driver-580 or later. Check your driver version with `nvidia-smi`.
-
-## Compatibility
-
-- **`offload`/`discard`:** Works with vLLM v0.13.x out of the box. Works with v0.15.1 with the sleep fix patch (included in Docker image).
-- **`cuda_suspend`/`checkpoint`:** Works with vLLM v0.13.x+ with NCCL patches (included in Docker image). Requires `cuda-checkpoint` and CRIU (included in Docker image).
-- **TP>1 with `cuda_suspend`/`checkpoint`:** Requires vLLM NCCL suspend/resume patches (included in Docker image) plus `--enforce-eager` and `--disable-custom-all-reduce` flags.
+The switch policy is a trait (`SwitchPolicy`) with rich context — queue depths,
+in-flight counts, timing — so future policies can make cost-aware or
+batching decisions. See [`docs/scheduling-problem.md`](docs/scheduling-problem.md)
+for the design space.
 
 ## License
 

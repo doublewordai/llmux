@@ -1,170 +1,86 @@
-//! # llmux
+//! # llmux v2
 //!
-//! Zero-reload model switching for vLLM - manages multiple models on shared GPU.
+//! Hook-driven LLM model multiplexer with pluggable switch policy.
 //!
-//! This crate provides:
-//! - **Orchestrator**: Lazily starts vLLM processes on first request
-//! - **Switcher**: Coordinates wake/sleep between models
-//! - **Middleware**: Axum layer that integrates with onwards proxy
+//! All model lifecycle management (start, stop, health check) is delegated to
+//! user-provided scripts. llmux handles request routing, in-flight tracking,
+//! draining, and policy-driven switching.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                     llmux                          │
-//! │  ┌─────────────────────────────────────────────────────┐   │
-//! │  │ Orchestrator                                         │   │
-//! │  │ - Spawns vLLM processes lazily                       │   │
-//! │  │ - Tracks: NotStarted | Starting | Running | Sleeping │   │
-//! │  └─────────────────────────────────────────────────────┘   │
-//! │                          │                                  │
-//! │  ┌─────────────────────────────────────────────────────┐   │
-//! │  │ Middleware Layer                                     │   │
-//! │  │ - Extracts model from request                        │   │
-//! │  │ - Ensures model ready before forwarding              │   │
-//! │  └─────────────────────────────────────────────────────┘   │
-//! │                          │                                  │
-//! │  ┌─────────────────────────────────────────────────────┐   │
-//! │  │ Onwards Proxy                                        │   │
-//! │  │ - Routes to vLLM by model name                       │   │
-//! │  └─────────────────────────────────────────────────────┘   │
-//! │                          │                                  │
-//! │      ┌───────────────────┼───────────────────┐             │
-//! │      ▼                   ▼                   ▼             │
-//! │  [vLLM:8001]        [vLLM:8002]         [vLLM:8003]        │
-//! │   (llama)           (mistral)           (qwen)            │
-//! └─────────────────────────────────────────────────────────────┘
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                        llmux                            │
+//! │  ┌───────────────────────────────────────────────────┐  │
+//! │  │ Middleware (Tower Layer)                           │  │
+//! │  │ - Extracts model from request                     │  │
+//! │  │ - Ensures model ready (triggers switch if needed) │  │
+//! │  │ - Acquires in-flight guard                        │  │
+//! │  │ - Wraps response in GuardedBody for streaming     │  │
+//! │  └───────────────────────────────────────────────────┘  │
+//! │                          │                              │
+//! │  ┌───────────────────────────────────────────────────┐  │
+//! │  │ Switcher                                          │  │
+//! │  │ - Drain → sleep hook → wake hook                  │  │
+//! │  │ - Policy decides when to switch                   │  │
+//! │  └───────────────────────────────────────────────────┘  │
+//! │                          │                              │
+//! │  ┌───────────────────────────────────────────────────┐  │
+//! │  │ Reverse Proxy                                     │  │
+//! │  │ - Forwards to localhost:model_port                │  │
+//! │  └───────────────────────────────────────────────────┘  │
+//! │                          │                              │
+//! │      ┌───────────────────┼───────────────────┐         │
+//! │      ▼                   ▼                   ▼         │
+//! │  [backend:8001]     [backend:8002]      [backend:8003] │
+//! │   wake.sh / sleep.sh / alive.sh                        │
+//! └─────────────────────────────────────────────────────────┘
 //! ```
 
 mod config;
-pub mod control;
+mod hooks;
 mod middleware;
-pub mod object_store;
-mod orchestrator;
-mod policy;
+pub mod policy;
+mod proxy;
 mod switcher;
 pub(crate) mod types;
-pub mod validate;
 
-pub use config::{CheckpointConfig, Config, ModelConfig, ObjectStoreConfig, PolicyConfig};
+pub use config::{Config, ModelConfig, PolicyConfig};
+pub use hooks::HookRunner;
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
-pub use orchestrator::{Orchestrator, OrchestratorError, ProcessState};
 pub use policy::{FifoPolicy, PolicyContext, PolicyDecision, ScheduleContext, SwitchPolicy};
+pub use proxy::{ProxyState, proxy_handler};
 pub use switcher::{InFlightGuard, ModelSwitcher};
-pub use types::{
-    EvictionPolicy, ProcessStrategy, SwitchError, SwitchMode, SwitcherState, WeightStrategy,
-};
+pub use types::{SwitchError, SwitcherState};
 
 use anyhow::Result;
+use axum::Router;
 use std::sync::Arc;
 use tracing::info;
 
-/// Build the complete llmux stack
+/// Build the complete llmux stack.
 ///
 /// Returns:
 /// - The main Axum router (proxy + middleware)
-/// - An optional metrics router (when `config.metrics_port > 0`)
-/// - The control API router (for the admin port)
-/// - The model switcher (for driving warmup before serving)
-pub async fn build_app(
-    config: Config,
-) -> Result<(
-    axum::Router,
-    Option<axum::Router>,
-    axum::Router,
-    ModelSwitcher,
-)> {
+/// - The model switcher (for external use)
+pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     info!("Building llmux with {} models", config.models.len());
 
-    // Create orchestrator with configured command
-    let orchestrator = Arc::new(Orchestrator::with_startup_timeout(
-        config.models.clone(),
-        config.vllm_command.clone(),
-        config.checkpoint.clone(),
-        std::time::Duration::from_secs(config.startup_timeout_secs),
-    ));
-
-    // Create policy
-    let model_names: Vec<String> = config.models.keys().cloned().collect();
-    let policy = config.policy.build_policy(&model_names);
-
-    // Create switcher
-    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+    let hooks = Arc::new(HookRunner::new(config.models.clone()));
+    let policy = config.policy.build_policy();
+    let switcher = ModelSwitcher::new(hooks, policy);
 
     // Spawn background scheduler if the policy uses one
     let _scheduler_handle = switcher.clone().spawn_scheduler();
 
-    // Build control API router (served on separate admin port)
-    let control = control::control_router(switcher.clone());
+    // Build proxy
+    let proxy_state = ProxyState::new();
 
-    // Build onwards targets from model configs
-    let targets = config.build_onwards_targets()?;
+    // Main app: proxy with model switcher middleware
+    let app = Router::new()
+        .fallback(proxy_handler)
+        .with_state(proxy_state)
+        .layer(ModelSwitcherLayer::new(switcher.clone()));
 
-    // Create onwards app state
-    let onwards_state = onwards::AppState::new(targets);
-    let onwards_router = onwards::build_router(onwards_state);
-
-    // Wrap with model switcher middleware
-    let mut app = onwards_router.layer(ModelSwitcherLayer::new(switcher.clone()));
-
-    // Install metrics layer and build metrics router if enabled
-    let metrics_router = if config.metrics_port > 0 {
-        let (prometheus_layer, handle) = onwards::build_metrics_layer_and_handle("llmux");
-        app = app.layer(prometheus_layer);
-        Some(onwards::build_metrics_router(handle))
-    } else {
-        None
-    };
-
-    Ok((app, metrics_router, control, switcher))
-}
-
-/// Run the warmup phase: start each model, run one inference, then sleep it.
-///
-/// Iterates all models sequentially. Each model is cold-started, warmed with
-/// a single inference request (to compile CUDA graphs and warm the allocator),
-/// then put to sleep using its configured eviction policy. After warmup,
-/// every model is in its warm sleeping state so the first real request
-/// triggers a fast wake rather than a cold start.
-pub async fn run_warmup(switcher: &ModelSwitcher) -> Result<()> {
-    let orchestrator = switcher.orchestrator();
-    let models = orchestrator.registered_models();
-
-    info!(count = models.len(), "Starting warmup phase");
-
-    for model in &models {
-        let eviction = orchestrator
-            .eviction_policy_for(model)
-            .expect("model registered but no eviction policy");
-
-        let port = switcher
-            .orchestrator()
-            .model_port(model)
-            .expect("model registered but no port");
-
-        let model_path = switcher
-            .orchestrator()
-            .model_path(model)
-            .expect("model registered but no model_path");
-
-        info!(model = %model, "Warmup: starting");
-        orchestrator
-            .ensure_running(model)
-            .await
-            .map_err(|e| anyhow::anyhow!("warmup: failed to start {}: {}", model, e))?;
-
-        info!(model = %model, "Warmup: running inference");
-        validate::run_warmup_inference(port, &model_path).await?;
-
-        info!(model = %model, ?eviction, "Warmup: sleeping");
-        orchestrator
-            .sleep_model(model, eviction)
-            .await
-            .map_err(|e| anyhow::anyhow!("warmup: failed to sleep {}: {}", model, e))?;
-
-        info!(model = %model, "Warmup: complete");
-    }
-
-    info!("Warmup phase complete — all models warmed and sleeping");
-    Ok(())
+    Ok((app, switcher))
 }
