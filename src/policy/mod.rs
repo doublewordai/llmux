@@ -32,7 +32,10 @@ pub struct PolicyContext {
     pub active_in_flight: usize,
     /// How long the active model has been active (since last wake completed)
     pub active_duration: Duration,
-    // TODO: How do we plugin cost estimation of switching?
+    /// Estimated cost of switching from the active model to the target,
+    /// based on EMA of observed switch durations. `None` if this pair
+    /// hasn't been observed yet.
+    pub estimated_switch_cost: Option<Duration>,
 }
 
 /// Context provided to the background scheduler on each tick
@@ -46,6 +49,9 @@ pub struct ScheduleContext {
     pub queue_depths: HashMap<String, usize>,
     /// Number of in-flight requests for the active model
     pub active_in_flight: usize,
+    /// Estimated switch costs from the active model to each other model.
+    /// Missing entries mean no observation for that pair yet.
+    pub switch_costs: HashMap<String, Duration>,
 }
 
 /// Context for preparing a switch (drain phase)

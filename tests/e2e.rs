@@ -328,3 +328,65 @@ async fn test_concurrent_different_models() {
     let total = counter_a.load(Ordering::SeqCst) + counter_b.load(Ordering::SeqCst);
     assert_eq!(total, 6);
 }
+
+/// Switch cost tracker records empirical costs after switches.
+#[tokio::test]
+async fn test_switch_cost_tracking() {
+    let hooks_a = MockHooks::new(50, 20); // 50ms wake, 20ms sleep
+    let hooks_b = MockHooks::new(80, 20); // 80ms wake, 20ms sleep
+
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+
+    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    let (app, switcher) = llmux::build_app(config).await.unwrap();
+
+    // No costs recorded yet
+    assert!(switcher.estimated_switch_cost(None, "model-a").is_none());
+    assert!(switcher.estimated_switch_cost(None, "model-b").is_none());
+
+    // Cold start model-a
+    let (status, _) = chat_request(&app, "model-a").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Cold start cost for model-a should be recorded
+    let cold_a = switcher.estimated_switch_cost(None, "model-a");
+    assert!(cold_a.is_some(), "cold start cost for model-a not recorded");
+    assert!(
+        cold_a.unwrap() >= Duration::from_millis(30),
+        "cold start cost {:?} too low",
+        cold_a
+    );
+
+    // Switch a → b
+    let (status, _) = chat_request(&app, "model-b").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // a→b cost should be recorded (sleep a + wake b ≈ 20+80 = 100ms)
+    let a_to_b = switcher.estimated_switch_cost(Some("model-a"), "model-b");
+    assert!(a_to_b.is_some(), "a→b switch cost not recorded");
+    assert!(
+        a_to_b.unwrap() >= Duration::from_millis(70),
+        "a→b cost {:?} too low",
+        a_to_b
+    );
+
+    // b→a not yet observed
+    assert!(switcher.estimated_switch_cost(Some("model-b"), "model-a").is_none());
+
+    // Switch b → a
+    let (status, _) = chat_request(&app, "model-a").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Now b→a should be recorded (sleep b + wake a ≈ 20+50 = 70ms)
+    let b_to_a = switcher.estimated_switch_cost(Some("model-b"), "model-a");
+    assert!(b_to_a.is_some(), "b→a switch cost not recorded");
+
+    // Directional: a→b should cost more than b→a (80ms wake vs 50ms wake)
+    assert!(
+        a_to_b.unwrap() > b_to_a.unwrap(),
+        "expected a→b ({:?}) > b→a ({:?}) due to asymmetric wake times",
+        a_to_b,
+        b_to_a
+    );
+}
