@@ -107,15 +107,27 @@ where
             // guard acquisition, loop back so the request waits for the next
             // switch instead of getting a 503.
             let guard = loop {
-                if let Err(e) = switcher.ensure_model_ready(&model).await {
-                    error!(model = %model, error = %e, "Failed to ensure model ready");
-                    let resp = switch_error_response(e);
-                    record_request_metrics(&model, resp.status().as_u16(), request_start);
-                    return Ok(resp);
-                }
+                let settle = match switcher.ensure_model_ready(&model).await {
+                    Ok(settle) => settle,
+                    Err(e) => {
+                        error!(model = %model, error = %e, "Failed to ensure model ready");
+                        let resp = switch_error_response(e);
+                        record_request_metrics(&model, resp.status().as_u16(), request_start);
+                        return Ok(resp);
+                    }
+                };
 
                 match switcher.acquire_in_flight(&model) {
-                    Some(guard) => break guard,
+                    Some(guard) => {
+                        // Signal that we've acquired the guard. This unblocks
+                        // notify_pending (which holds the switch lock) so the
+                        // next switch can proceed — but only after we're
+                        // safely in-flight and won't be starved by draining.
+                        if let Some(signal) = settle {
+                            signal.settle().await;
+                        }
+                        break guard;
+                    }
                     None => {
                         debug!(model = %model, "Model draining, re-entering ensure_model_ready");
                         continue;

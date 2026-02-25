@@ -1,6 +1,6 @@
 [package]
 name = "llmux"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2024"
 rust-version = "1.88.0"
 license = "MIT"

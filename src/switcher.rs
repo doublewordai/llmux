@@ -12,15 +12,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, RwLock, oneshot};
+use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
+
+/// Signal sent through the oneshot channel when a model becomes active.
+///
+/// The receiver must call [`ReadySignal::settle`] after acquiring its
+/// in-flight guard. `notify_pending` blocks on these settle signals so
+/// that the switch lock is held until all notified requests are actively
+/// being processed — preventing the next switch from draining the model
+/// before any request has started.
+pub(crate) struct ReadySignal {
+    settle_tx: mpsc::Sender<()>,
+}
+
+impl ReadySignal {
+    pub(crate) async fn settle(self) {
+        let _ = self.settle_tx.send(()).await;
+    }
+}
 
 /// A pending request waiting for a model to become active
 struct PendingRequest {
     #[allow(dead_code)]
     model: String,
     queued_at: Instant,
-    ready_tx: oneshot::Sender<Result<(), SwitchError>>,
+    ready_tx: oneshot::Sender<Result<ReadySignal, SwitchError>>,
 }
 
 /// Per-model state tracking
@@ -162,10 +179,16 @@ impl ModelSwitcher {
 
     /// Ensure a model is ready for requests.
     ///
-    /// Returns immediately if the model is already active. Otherwise queues
-    /// the request and triggers a switch if needed, waiting up to the policy
-    /// timeout for the switch to complete.
-    pub async fn ensure_model_ready(&self, model: &str) -> Result<(), SwitchError> {
+    /// Returns `Ok(None)` immediately if the model is already active (fast
+    /// path). Otherwise queues the request, triggers a switch if needed, and
+    /// waits up to the policy timeout. Returns `Ok(Some(signal))` — the
+    /// caller **must** call [`ReadySignal::settle`] after acquiring its
+    /// in-flight guard so that `notify_pending` knows the request is actively
+    /// being processed.
+    pub(crate) async fn ensure_model_ready(
+        &self,
+        model: &str,
+    ) -> Result<Option<ReadySignal>, SwitchError> {
         let model_state = self
             .inner
             .model_states
@@ -179,7 +202,7 @@ impl ModelSwitcher {
                 && active == model
             {
                 trace!(model = %model, "Model already active");
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -204,7 +227,7 @@ impl ModelSwitcher {
 
         match self.inner.policy.request_timeout() {
             Some(timeout) => match tokio::time::timeout(timeout, ready_rx).await {
-                Ok(Ok(result)) => result,
+                Ok(Ok(result)) => result.map(Some),
                 Ok(Err(_)) => Err(SwitchError::Internal("channel closed".to_string())),
                 Err(_) => {
                     warn!(
@@ -217,7 +240,7 @@ impl ModelSwitcher {
                 }
             },
             None => match ready_rx.await {
-                Ok(result) => result,
+                Ok(result) => result.map(Some),
                 Err(_) => Err(SwitchError::Internal("channel closed".to_string())),
             },
         }
@@ -644,31 +667,93 @@ impl ModelSwitcher {
         }
     }
 
+    /// Notify pending requests and — on success — wait for them to settle.
+    ///
+    /// When the result is `Ok`, each notified request receives a
+    /// [`ReadySignal`]. The request must call `settle()` after acquiring
+    /// its in-flight guard. This method blocks until all delivered signals
+    /// have settled (or their receivers are dropped), ensuring the switch
+    /// lock is held while requests transition from "notified" to "in-flight."
+    ///
+    /// When the result is `Err`, requests are notified of the failure and
+    /// no settle wait is needed.
     async fn notify_pending(&self, model: &str, result: Result<(), SwitchError>) {
-        if let Some(model_state) = self.inner.model_states.get(model) {
-            let mut queue = model_state.pending.lock().await;
-            let count = queue.len();
-            let mut delivered = 0;
+        let Some(model_state) = self.inner.model_states.get(model) else {
+            return;
+        };
 
-            for pending in queue.drain(..) {
-                let r = match &result {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(SwitchError::Internal(e.to_string())),
-                };
-                if pending.ready_tx.send(r).is_ok() {
-                    delivered += 1;
-                }
+        let mut queue = model_state.pending.lock().await;
+        let count = queue.len();
+        if count == 0 {
+            return;
+        }
+
+        let mut delivered = 0;
+
+        // For successful activations, create a settle channel so we can
+        // wait for notified requests to acquire their in-flight guards.
+        let settle_tx = if result.is_ok() {
+            // +1 capacity: one per request, non-blocking sends
+            Some(mpsc::channel::<()>(count))
+        } else {
+            None
+        };
+
+        for pending in queue.drain(..) {
+            let r = match (&result, &settle_tx) {
+                (Ok(()), Some((tx, _))) => Ok(ReadySignal {
+                    settle_tx: tx.clone(),
+                }),
+                (Err(e), _) => Err(SwitchError::Internal(e.to_string())),
+                _ => unreachable!(),
+            };
+            if pending.ready_tx.send(r).is_ok() {
+                delivered += 1;
             }
+        }
 
-            metrics::gauge!("llmux_request_queue_depth", "model" => model.to_string()).set(0.0);
+        metrics::gauge!("llmux_request_queue_depth", "model" => model.to_string()).set(0.0);
+        drop(queue); // release pending lock before the settle wait
 
-            if count > 0 {
-                let expired = count - delivered;
-                if expired > 0 {
-                    warn!(model = %model, count, delivered, expired,
-                        "Notified pending requests ({expired} already timed out)");
-                } else {
-                    debug!(model = %model, count, "Notified pending requests");
+        if count > 0 {
+            let expired = count - delivered;
+            if expired > 0 {
+                warn!(model = %model, count, delivered, expired,
+                    "Notified pending requests ({expired} already timed out)");
+            } else {
+                debug!(model = %model, count, "Notified pending requests");
+            }
+        }
+
+        // Wait for all delivered requests to acquire in-flight guards.
+        // Each request calls ReadySignal::settle() after acquiring its
+        // guard, which sends () on the channel. If a request drops its
+        // signal without settling (e.g. cancelled), its sender clone is
+        // dropped; once all senders are gone the channel closes and recv
+        // returns None.
+        if let Some((tx, mut rx)) = settle_tx {
+            // Drop the original sender — only the clones sent to requests
+            // should keep the channel alive.
+            drop(tx);
+
+            if delivered > 0 {
+                let settle_wait = async {
+                    for _ in 0..delivered {
+                        if rx.recv().await.is_none() {
+                            break; // all senders dropped
+                        }
+                    }
+                };
+
+                if tokio::time::timeout(Duration::from_secs(5), settle_wait)
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        model = %model,
+                        delivered,
+                        "Settle timeout — proceeding with switch lock release"
+                    );
                 }
             }
         }
