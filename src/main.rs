@@ -12,7 +12,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "llmux")]
+#[command(name = "llmux", version)]
 #[command(about = "Hook-driven LLM model multiplexer")]
 struct Args {
     /// Path to configuration file
