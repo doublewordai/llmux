@@ -107,15 +107,8 @@ setup mode="install":
     # --- cuda-checkpoint ---
     if command -v cuda-checkpoint &>/dev/null; then
         ok "cuda-checkpoint found"
-    elif [ "$CHECK" = "true" ]; then
-        fail "cuda-checkpoint not found in PATH"
-        echo "  Install from NVIDIA driver package or copy from a container image"
-        ERRORS=$((ERRORS + 1))
     else
-        fail "cuda-checkpoint not found in PATH"
-        echo "  This binary ships with the NVIDIA driver but may not be installed by default."
-        echo "  Find it in your driver package or extract from a container image:"
-        echo "    sudo docker cp \$(docker create --rm ghcr.io/doublewordai/llmux:latest):/usr/local/bin/cuda-checkpoint /usr/local/bin/"
+        fail "cuda-checkpoint not found in PATH (ships with NVIDIA driver 570+)"
         ERRORS=$((ERRORS + 1))
     fi
 
