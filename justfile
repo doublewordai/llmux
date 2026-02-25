@@ -32,7 +32,15 @@ setup mode="install":
     # --- NVIDIA driver ---
     if nvidia-smi &>/dev/null; then
         DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
-        ok "NVIDIA driver $DRIVER"
+        MAJOR=$(echo "$DRIVER" | cut -d. -f1)
+        if [ "$MAJOR" -ge 580 ] 2>/dev/null; then
+            ok "NVIDIA driver $DRIVER (CRIU plugin handles CUDA state automatically)"
+        elif [ "$MAJOR" -ge 570 ] 2>/dev/null; then
+            warn "NVIDIA driver $DRIVER (manual cuda-checkpoint --toggle required before CRIU dump)"
+        else
+            fail "NVIDIA driver $DRIVER (570+ required for cuda-checkpoint)"
+            ERRORS=$((ERRORS + 1))
+        fi
     else
         fail "NVIDIA driver not found"
         ERRORS=$((ERRORS + 1))
