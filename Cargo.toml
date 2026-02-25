@@ -29,6 +29,8 @@ serde_yaml = "0.9.34"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "time", "process", "io-util"] }
 tower = { version = "0.5", features = ["util"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

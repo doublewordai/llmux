@@ -194,7 +194,10 @@ impl ModelSwitcher {
         {
             let mut queue = model_state.pending.lock().await;
             queue.push(pending);
-            debug!(model = %model, queue_depth = queue.len(), "Request queued");
+            let depth = queue.len();
+            debug!(model = %model, queue_depth = depth, "Request queued");
+            metrics::gauge!("llmux_request_queue_depth", "model" => model.to_string())
+                .set(depth as f64);
         }
 
         self.maybe_trigger_switch(model).await;
@@ -204,7 +207,12 @@ impl ModelSwitcher {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => Err(SwitchError::Internal("channel closed".to_string())),
                 Err(_) => {
-                    warn!(model = %model, "Request timed out");
+                    warn!(
+                        event = "request_timeout",
+                        model = %model,
+                        timeout_secs = timeout.as_secs_f64(),
+                        "Request timed out waiting for model"
+                    );
                     Err(SwitchError::Timeout)
                 }
             },
@@ -222,7 +230,7 @@ impl ModelSwitcher {
     pub fn acquire_in_flight(&self, model: &str) -> Option<InFlightGuard> {
         let model_state = self.inner.model_states.get(model)?;
 
-        let _new_count = model_state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let new_count = model_state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
 
         if model_state.draining.load(Ordering::SeqCst) {
             model_state.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -230,8 +238,12 @@ impl ModelSwitcher {
             return None;
         }
 
+        metrics::gauge!("llmux_model_in_flight", "model" => model.to_string())
+            .set(new_count as f64);
+
         Some(InFlightGuard {
             model_state: Arc::clone(model_state),
+            model: model.to_string(),
         })
     }
 
@@ -397,6 +409,24 @@ impl ModelSwitcher {
             }
         };
 
+        let from_label = from_model.as_deref().unwrap_or("idle").to_string();
+
+        // Record how long the outgoing model was active
+        if from_model.is_some() {
+            let active_dur = self
+                .inner
+                .activated_at
+                .read()
+                .await
+                .map(|t| t.elapsed())
+                .unwrap_or(Duration::ZERO);
+            metrics::histogram!(
+                "llmux_model_active_duration_seconds",
+                "model" => from_label.clone()
+            )
+            .record(active_dur.as_secs_f64());
+        }
+
         // Update state to Switching
         {
             let mut state = self.inner.state.write().await;
@@ -406,7 +436,12 @@ impl ModelSwitcher {
             };
         }
 
-        info!(from = ?from_model, to = %target_model, "Starting model switch");
+        info!(
+            event = "switch_started",
+            from = %from_label,
+            to = %target_model,
+            "Starting model switch"
+        );
 
         // Phase 1: Cooldown — ensure the old model has been active long enough
         if from_model.is_some() {
@@ -423,6 +458,8 @@ impl ModelSwitcher {
         }
 
         // Phase 2: Drain — set draining flag and wait for in-flight to complete
+        let drain_start = Instant::now();
+
         if let Some(ref from) = from_model
             && let Some(from_state) = self.inner.model_states.get(from)
         {
@@ -445,13 +482,26 @@ impl ModelSwitcher {
             self.inner.policy.prepare_switch(&mut switch_ctx).await;
         }
 
+        if from_model.is_some() {
+            metrics::histogram!(
+                "llmux_switch_drain_duration_seconds",
+                "from" => from_label.clone(),
+                "to" => target_model.to_string()
+            )
+            .record(drain_start.elapsed().as_secs_f64());
+        }
+
         // Phase 3: Sleep old model via hook
         if let Some(ref from) = from_model {
             debug!(model = %from, "Running sleep hook");
             if let Err(e) = self.inner.hooks.run_sleep(from).await {
-                error!(model = %from, error = %e, "Sleep hook failed");
-                // Continue anyway — wake script is idempotent and will
-                // handle whatever state the old model is in.
+                error!(
+                    event = "sleep_hook_failed",
+                    model = %from,
+                    to = %target_model,
+                    error = %e,
+                    "Sleep hook failed, continuing with wake (idempotent)"
+                );
             }
         }
 
@@ -467,11 +517,6 @@ impl ModelSwitcher {
         match self.inner.hooks.run_wake(target_model).await {
             Ok(()) => {
                 let total_dur = switch_start.elapsed();
-                info!(
-                    model = %target_model,
-                    duration = ?total_dur,
-                    "Model is now active"
-                );
 
                 {
                     let mut state = self.inner.state.write().await;
@@ -486,6 +531,43 @@ impl ModelSwitcher {
                     .cost_tracker
                     .record(from_model.as_deref(), target_model, total_dur);
 
+                // Structured log event for timeline reconstruction
+                info!(
+                    event = "model_activated",
+                    model = %target_model,
+                    from = %from_label,
+                    duration_secs = total_dur.as_secs_f64(),
+                    "Model is now active"
+                );
+
+                // Metrics
+                metrics::counter!(
+                    "llmux_switch_total",
+                    "from" => from_label.clone(),
+                    "to" => target_model.to_string(),
+                    "result" => "success"
+                )
+                .increment(1);
+                metrics::histogram!(
+                    "llmux_switch_duration_seconds",
+                    "from" => from_label.clone(),
+                    "to" => target_model.to_string()
+                )
+                .record(total_dur.as_secs_f64());
+
+                if let Some(ema) = self
+                    .inner
+                    .cost_tracker
+                    .estimate(from_model.as_deref(), target_model)
+                {
+                    metrics::gauge!(
+                        "llmux_switch_cost_ema_seconds",
+                        "from" => from_label,
+                        "to" => target_model.to_string()
+                    )
+                    .set(ema.as_secs_f64());
+                }
+
                 let from_str = from_model.as_deref().unwrap_or("");
                 self.inner
                     .policy
@@ -494,7 +576,22 @@ impl ModelSwitcher {
                 self.notify_pending(target_model, Ok(())).await;
             }
             Err(e) => {
-                error!(model = %target_model, error = %e, "Wake hook failed");
+                // Structured log event for timeline reconstruction
+                info!(
+                    event = "switch_failed",
+                    model = %target_model,
+                    from = %from_label,
+                    error = %e,
+                    "Switch failed, returning to idle"
+                );
+
+                metrics::counter!(
+                    "llmux_switch_total",
+                    "from" => from_label,
+                    "to" => target_model.to_string(),
+                    "result" => "failure"
+                )
+                .increment(1);
 
                 // Try to clean up the partially-woken model
                 let _ = self.inner.hooks.run_sleep(target_model).await;
@@ -563,6 +660,8 @@ impl ModelSwitcher {
                 }
             }
 
+            metrics::gauge!("llmux_request_queue_depth", "model" => model.to_string()).set(0.0);
+
             if count > 0 {
                 let expired = count - delivered;
                 if expired > 0 {
@@ -580,11 +679,14 @@ impl ModelSwitcher {
 /// and notifies the drain waiter.
 pub struct InFlightGuard {
     model_state: Arc<ModelState>,
+    model: String,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         let prev = self.model_state.in_flight.fetch_sub(1, Ordering::SeqCst);
+        metrics::gauge!("llmux_model_in_flight", "model" => self.model.clone())
+            .set((prev - 1) as f64);
         if prev == 1 {
             self.model_state.in_flight_changed.notify_waiters();
         }

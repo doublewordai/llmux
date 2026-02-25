@@ -411,7 +411,11 @@ async fn test_switch_cost_tracking() {
     );
 
     // b→a not yet observed
-    assert!(switcher.estimated_switch_cost(Some("model-b"), "model-a").is_none());
+    assert!(
+        switcher
+            .estimated_switch_cost(Some("model-b"), "model-a")
+            .is_none()
+    );
 
     // Switch b → a
     let (status, _) = chat_request(&app, "model-a").await;

@@ -10,7 +10,7 @@
 use crate::config::ModelConfig;
 use std::collections::HashMap;
 use tokio::process::Command;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Errors from hook script execution
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +93,8 @@ impl HookRunner {
 async fn run_hook(script: &str, model: &str, hook_name: &str) -> Result<(), HookError> {
     debug!(model = %model, hook = %hook_name, "Running hook");
 
+    let start = std::time::Instant::now();
+
     let output = Command::new("sh")
         .arg("-c")
         .arg(script)
@@ -100,6 +102,14 @@ async fn run_hook(script: &str, model: &str, hook_name: &str) -> Result<(), Hook
         .output()
         .await
         .map_err(HookError::Io)?;
+
+    let duration = start.elapsed();
+    metrics::histogram!(
+        "llmux_hook_duration_seconds",
+        "model" => model.to_string(),
+        "hook" => hook_name.to_string()
+    )
+    .record(duration.as_secs_f64());
 
     if !output.stdout.is_empty() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -116,8 +126,24 @@ async fn run_hook(script: &str, model: &str, hook_name: &str) -> Result<(), Hook
     }
 
     if !output.status.success() {
+        metrics::counter!(
+            "llmux_hook_failures_total",
+            "model" => model.to_string(),
+            "hook" => hook_name.to_string()
+        )
+        .increment(1);
+
         let code = output.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        info!(
+            event = "hook_failed",
+            model = %model,
+            hook = %hook_name,
+            exit_code = code,
+            duration_secs = duration.as_secs_f64(),
+            stderr = %stderr.trim_end(),
+            "Hook failed"
+        );
         return Err(HookError::Failed {
             model: model.to_string(),
             hook: hook_name.to_string(),
@@ -126,6 +152,12 @@ async fn run_hook(script: &str, model: &str, hook_name: &str) -> Result<(), Hook
         });
     }
 
-    debug!(model = %model, hook = %hook_name, "Hook completed successfully");
+    info!(
+        event = "hook_completed",
+        model = %model,
+        hook = %hook_name,
+        duration_secs = duration.as_secs_f64(),
+        "Hook completed"
+    );
     Ok(())
 }

@@ -73,7 +73,10 @@ mod tests {
     fn first_observation_is_exact() {
         let tracker = SwitchCostTracker::new(0.3);
         tracker.record(Some("a"), "b", Duration::from_secs(10));
-        assert_eq!(tracker.estimate(Some("a"), "b"), Some(Duration::from_secs(10)));
+        assert_eq!(
+            tracker.estimate(Some("a"), "b"),
+            Some(Duration::from_secs(10))
+        );
     }
 
     #[test]
@@ -93,7 +96,10 @@ mod tests {
         tracker.record(Some("b"), "a", Duration::from_secs(15));
 
         assert_eq!(tracker.estimate(None, "a"), Some(Duration::from_secs(5)));
-        assert_eq!(tracker.estimate(Some("b"), "a"), Some(Duration::from_secs(15)));
+        assert_eq!(
+            tracker.estimate(Some("b"), "a"),
+            Some(Duration::from_secs(15))
+        );
     }
 
     #[test]

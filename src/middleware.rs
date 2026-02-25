@@ -15,6 +15,7 @@ use http_body::Frame;
 use http_body_util::BodyExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tower::{Layer, Service};
 use tracing::{debug, error, trace, warn};
 
@@ -66,6 +67,7 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
+            let request_start = Instant::now();
             let (parts, body) = req.into_parts();
 
             // Collect body bytes so we can inspect the model field
@@ -93,6 +95,7 @@ where
 
             if !switcher.is_registered(&model) {
                 warn!(model = %model, "Model not registered");
+                record_request_metrics(&model, 404, request_start);
                 return Ok(error_response(
                     StatusCode::NOT_FOUND,
                     &format!("Model not found: {}", model),
@@ -106,7 +109,9 @@ where
             let guard = loop {
                 if let Err(e) = switcher.ensure_model_ready(&model).await {
                     error!(model = %model, error = %e, "Failed to ensure model ready");
-                    return Ok(switch_error_response(e));
+                    let resp = switch_error_response(e);
+                    record_request_metrics(&model, resp.status().as_u16(), request_start);
+                    return Ok(resp);
                 }
 
                 match switcher.acquire_in_flight(&model) {
@@ -117,6 +122,12 @@ where
                     }
                 }
             };
+
+            metrics::histogram!(
+                "llmux_request_queue_wait_seconds",
+                "model" => model.clone()
+            )
+            .record(request_start.elapsed().as_secs_f64());
 
             // Set proxy target so the proxy handler knows where to forward
             let port = switcher.model_port(&model).unwrap();
@@ -130,6 +141,9 @@ where
             // streamed body) is consumed.
             let response = inner.call(req).await?;
             let (resp_parts, body) = response.into_parts();
+
+            record_request_metrics(&model, resp_parts.status.as_u16(), request_start);
+
             let guarded = GuardedBody {
                 inner: body,
                 _guard: Some(guard),
@@ -137,6 +151,22 @@ where
             Ok(Response::from_parts(resp_parts, Body::new(guarded)))
         })
     }
+}
+
+fn record_request_metrics(model: &str, status: u16, start: Instant) {
+    let status_str = status.to_string();
+    metrics::counter!(
+        "llmux_requests_total",
+        "model" => model.to_owned(),
+        "status" => status_str.clone()
+    )
+    .increment(1);
+    metrics::histogram!(
+        "llmux_request_duration_seconds",
+        "model" => model.to_owned(),
+        "status" => status_str
+    )
+    .record(start.elapsed().as_secs_f64());
 }
 
 /// Extract model name from the JSON request body.

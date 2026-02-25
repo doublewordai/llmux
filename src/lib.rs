@@ -44,6 +44,7 @@ mod middleware;
 pub mod policy;
 mod proxy;
 mod switcher;
+mod telemetry;
 pub(crate) mod types;
 
 pub use config::{Config, ModelConfig, PolicyConfig};
@@ -79,6 +80,9 @@ pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     // Build proxy
     let proxy_state = ProxyState::new();
 
+    // Install Prometheus metrics recorder (may fail in tests; that's fine)
+    let metrics_handle = telemetry::install();
+
     // Pre-compute /v1/models response from config
     let models_response = {
         let mut data: Vec<_> = config
@@ -101,14 +105,33 @@ pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     };
 
     // Main app: proxy with model switcher middleware
-    let app = Router::new()
-        .route(
-            "/v1/models",
+    let mut app = Router::new().route(
+        "/v1/models",
+        get(move || {
+            let resp = models_response.clone();
+            async move { Json(resp) }
+        }),
+    );
+
+    if let Some(handle) = metrics_handle {
+        app = app.route(
+            "/metrics",
             get(move || {
-                let resp = models_response.clone();
-                async move { Json(resp) }
+                let output = handle.render();
+                async move {
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4; charset=utf-8",
+                        )],
+                        output,
+                    )
+                }
             }),
-        )
+        );
+    }
+
+    let app = app
         .fallback(proxy_handler)
         .with_state(proxy_state)
         .layer(ModelSwitcherLayer::new(switcher.clone()));
