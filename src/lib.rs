@@ -56,7 +56,8 @@ pub use switcher::{InFlightGuard, ModelSwitcher};
 pub use types::{SwitchError, SwitcherState};
 
 use anyhow::Result;
-use axum::Router;
+use axum::routing::get;
+use axum::{Json, Router};
 use std::sync::Arc;
 use tracing::info;
 
@@ -78,8 +79,36 @@ pub async fn build_app(config: Config) -> Result<(Router, ModelSwitcher)> {
     // Build proxy
     let proxy_state = ProxyState::new();
 
+    // Pre-compute /v1/models response from config
+    let models_response = {
+        let mut data: Vec<_> = config
+            .models
+            .keys()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "llmux"
+                })
+            })
+            .collect::<Vec<_>>();
+        data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        serde_json::json!({
+            "object": "list",
+            "data": data
+        })
+    };
+
     // Main app: proxy with model switcher middleware
     let app = Router::new()
+        .route(
+            "/v1/models",
+            get(move || {
+                let resp = models_response.clone();
+                async move { Json(resp) }
+            }),
+        )
         .fallback(proxy_handler)
         .with_state(proxy_state)
         .layer(ModelSwitcherLayer::new(switcher.clone()));

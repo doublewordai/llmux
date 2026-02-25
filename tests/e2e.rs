@@ -329,6 +329,45 @@ async fn test_concurrent_different_models() {
     assert_eq!(total, 6);
 }
 
+/// GET /v1/models returns the list of configured models.
+#[tokio::test]
+async fn test_list_models() {
+    let hooks_a = MockHooks::new(0, 0);
+    let hooks_b = MockHooks::new(0, 0);
+
+    let (addr_a, _) = spawn_mock_backend(0).await;
+    let (addr_b, _) = spawn_mock_backend(0).await;
+
+    let config = test_config(addr_a.port(), addr_b.port(), &hooks_a, &hooks_b);
+    let (app, _) = llmux::build_app(config).await.unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/models")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    assert_eq!(body["object"], "list");
+
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+
+    // Models should be sorted by id
+    let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["model-a", "model-b"]);
+
+    for model in data {
+        assert_eq!(model["object"], "model");
+        assert_eq!(model["owned_by"], "llmux");
+    }
+}
+
 /// Switch cost tracker records empirical costs after switches.
 #[tokio::test]
 async fn test_switch_cost_tracking() {
