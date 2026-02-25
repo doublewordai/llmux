@@ -424,6 +424,21 @@ impl ModelSwitcher {
             }
         }
 
+        // Skip if there are no pending requests for the target model.
+        // This happens when a stale do_switch task grabs the lock after
+        // the target model's requests were already served by an earlier
+        // activation.
+        if let Some(target_state) = self.inner.model_states.get(target_model) {
+            let queue = target_state.pending.lock().await;
+            if queue.is_empty() {
+                debug!(
+                    model = %target_model,
+                    "No pending requests, skipping stale switch"
+                );
+                return;
+            }
+        }
+
         let from_model = {
             let state = self.inner.state.read().await;
             match &*state {
